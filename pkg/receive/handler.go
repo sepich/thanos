@@ -369,7 +369,7 @@ func (h *Handler) fanoutForward(ctx context.Context, tenant string, replicas map
 				defer wg.Done()
 				var err error
 				tracing.DoInSpan(ctx, "receive_tsdb_write", func(ctx context.Context) {
-					err = h.writer.Write(tenant, wreqs[endpoint])
+					err = h.writer.Write(wreqs[endpoint])
 				})
 				if err != nil {
 					// When a MultiError is added to another MultiError, the error slices are concatenated, not nested.
@@ -566,6 +566,12 @@ func isConflict(err error) bool {
 		err == storage.ErrOutOfBounds ||
 		err.Error() == strconv.Itoa(http.StatusConflict) ||
 		status.Code(err) == codes.AlreadyExists
+}
+
+// isNotReady returns whether or not the given error represents a not ready error.
+func isNotReady(err error) bool {
+	return err == tsdb.ErrNotReady ||
+		status.Code(err) == codes.Unavailable
 }
 
 func newPeerGroup(dialOpts ...grpc.DialOption) *peerGroup {
