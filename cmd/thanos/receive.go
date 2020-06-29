@@ -76,6 +76,8 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 
 	replicationFactor := cmd.Flag("receive.replication-factor", "How many times to replicate incoming write requests.").Default("1").Uint64()
 
+	forwardTimeout := modelDuration(cmd.Flag("receive-forward-timeout", "Timeout for forward requests.").Default("5s").Hidden())
+
 	tsdbMinBlockDuration := modelDuration(cmd.Flag("tsdb.min-block-duration", "Min duration for local TSDB blocks").Default("2h").Hidden())
 	tsdbMaxBlockDuration := modelDuration(cmd.Flag("tsdb.max-block-duration", "Max duration for local TSDB blocks").Default("2h").Hidden())
 	ignoreBlockSize := cmd.Flag("shipper.ignore-unequal-block-size", "If true receive will not require min and max block size flags to be set to the same value. Only use this if you want to keep long retention and compaction enabled, as in the worst case it can result in ~2h data loss for your Thanos bucket storage.").Default("false").Hidden().Bool()
@@ -146,6 +148,7 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 			*tenantHeader,
 			*replicaHeader,
 			*replicationFactor,
+			time.Duration(*forwardTimeout),
 			comp,
 		)
 	}
@@ -181,6 +184,7 @@ func runReceive(
 	tenantHeader string,
 	replicaHeader string,
 	replicationFactor uint64,
+	forwardTimeout time.Duration,
 	comp component.SourceStoreAPI,
 ) error {
 	logger = log.With(logger, "component", "receive")
@@ -206,6 +210,7 @@ func runReceive(
 		Tracer:            tracer,
 		TLSConfig:         rwTLSConfig,
 		DialOpts:          dialOpts,
+		ForwardTimeout:    forwardTimeout,
 	})
 
 	grpcProbe := prober.NewGRPC()
