@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/fortytw2/leaktest"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/gogo/protobuf/proto"
@@ -163,6 +165,7 @@ func newHandlerHashring(appendables []*fakeAppendable, replicationFactor uint64)
 			TenantHeader:      DefaultTenantHeader,
 			ReplicaHeader:     DefaultReplicaHeader,
 			ReplicationFactor: replicationFactor,
+			ForwardTimeout:    5 * time.Second,
 			Writer:            NewWriter(log.NewNopLogger(), appendables[i]),
 		})
 		handlers = append(handlers, h)
@@ -179,7 +182,9 @@ func newHandlerHashring(appendables []*fakeAppendable, replicationFactor uint64)
 	return handlers, hashring
 }
 
-func TestReceive(t *testing.T) {
+func TestReceiveQuorum(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 10*time.Second)
+
 	appenderErrFn := func() error { return errors.New("failed to get appender") }
 	conflictErrFn := func() error { return storage.ErrOutOfBounds }
 	commitErrFn := func() error { return errors.New("failed to commit") }
@@ -222,7 +227,7 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 1,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
 			},
@@ -233,7 +238,7 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 1,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
 			},
@@ -244,7 +249,7 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 1,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
 				},
 			},
@@ -255,10 +260,10 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 1,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
 			},
@@ -269,13 +274,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 1,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
 			},
@@ -286,13 +291,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
 			},
@@ -303,13 +308,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 1,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
 			},
@@ -320,13 +325,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
 			},
@@ -337,15 +342,15 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender:    newFakeAppender(nil, nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
-				&fakeAppendable{
+				{
 					appender:    newFakeAppender(nil, nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
-				&fakeAppendable{
+				{
 					appender:    newFakeAppender(nil, nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
@@ -357,13 +362,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
 				},
 			},
@@ -374,13 +379,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
 				},
 			},
@@ -391,13 +396,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
 			},
@@ -408,13 +413,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
 			},
@@ -425,13 +430,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
 			},
@@ -442,13 +447,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
 			},
@@ -459,13 +464,13 @@ func TestReceive(t *testing.T) {
 			replicationFactor: 3,
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, commitErrFn, nil),
 				},
-				&fakeAppendable{
+				{
 					appender: newFakeAppender(nil, nil, nil, nil),
 				},
 			},
@@ -479,12 +484,12 @@ func TestReceive(t *testing.T) {
 			// on which node is erroring and which node is receiving.
 			for i, handler := range handlers {
 				// Test that the correct status is returned.
-				status, err := makeRequest(handler, tenant, tc.wreq)
+				rec, err := makeRequest(handler, tenant, tc.wreq)
 				if err != nil {
 					t.Fatalf("handler %d: unexpectedly failed making HTTP request: %v", tc.status, err)
 				}
-				if status != tc.status {
-					t.Errorf("handler %d: got unexpected HTTP status code: expected %d, got %d", i, tc.status, status)
+				if rec.Code != tc.status {
+					t.Errorf("handler %d: got unexpected HTTP status code: expected %d, got %d; body: %s", i, tc.status, rec.Code, rec.Body.String())
 				}
 			}
 			// Test that each time series is stored
@@ -498,16 +503,16 @@ func TestReceive(t *testing.T) {
 					}
 				}
 				for j, a := range tc.appendables {
-					var expected int
-					n := a.appender.(*fakeAppender).samples[lset.String()]
+					var expectedMin int
+					n := a.appender.(*fakeAppender).Get(lset)
 					got := uint64(len(n))
 					if a.appenderErr == nil && endpointHit(t, hashring, tc.replicationFactor, handlers[j].options.Endpoint, tenant, &ts) {
 						// We have len(handlers) copies of each sample because the test case
 						// is run once for each handler and they all use the same appender.
-						expected = len(handlers) * len(ts.Samples)
+						expectedMin = int((tc.replicationFactor/2)+1) * len(ts.Samples)
 					}
-					if uint64(expected) != got {
-						t.Errorf("handler: %d, labels %q: expected %d samples, got %d", j, lset.String(), expected, got)
+					if uint64(expectedMin) > got {
+						t.Errorf("handler: %d, labels %q: expected minimum of %d samples, got %d", j, lset.String(), expectedMin, got)
 					}
 				}
 			}
@@ -547,14 +552,14 @@ func cycleErrors(errs []error) func() error {
 }
 
 // makeRequest is a helper to make a correct request against a remote write endpoint given a request.
-func makeRequest(h *Handler, tenant string, wreq *prompb.WriteRequest) (int, error) {
+func makeRequest(h *Handler, tenant string, wreq *prompb.WriteRequest) (*httptest.ResponseRecorder, error) {
 	buf, err := proto.Marshal(wreq)
 	if err != nil {
-		return 0, errors.Wrap(err, "marshal request")
+		return nil, errors.Wrap(err, "marshal request")
 	}
 	req, err := http.NewRequest("POST", h.options.Endpoint, bytes.NewBuffer(snappy.Encode(nil, buf)))
 	if err != nil {
-		return 0, errors.Wrap(err, "create request")
+		return nil, errors.Wrap(err, "create request")
 	}
 	req.Header.Add(h.options.TenantHeader, tenant)
 
@@ -562,7 +567,7 @@ func makeRequest(h *Handler, tenant string, wreq *prompb.WriteRequest) (int, err
 	h.receiveHTTP(rec, req)
 	rec.Flush()
 
-	return rec.Code, nil
+	return rec, nil
 }
 
 func randomAddr() string {
