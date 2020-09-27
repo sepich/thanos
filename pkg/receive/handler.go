@@ -310,7 +310,18 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tenant := r.Header.Get(h.options.TenantHeader)
+	var tenant string
+	if h.options.Writer.tenantExtract {
+		// All metrics from same src should have same external_labels
+		for _, l := range wreq.Timeseries[0].Labels {
+			if l.Name == h.options.Writer.tenantLabelName {
+				tenant = l.Value
+				break
+			}
+		}
+	} else {
+		tenant = r.Header.Get(h.options.TenantHeader)
+	}
 	if len(tenant) == 0 {
 		tenant = h.options.DefaultTenantID
 	}
@@ -383,6 +394,9 @@ func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *p
 
 // writeQuorum returns minimum number of replicas that has to confirm write success before claiming replication success.
 func (h *Handler) writeQuorum() int {
+	if h.options.ReplicationFactor == 2 {
+		return 1
+	}
 	return int((h.options.ReplicationFactor / 2) + 1)
 }
 

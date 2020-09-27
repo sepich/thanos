@@ -166,7 +166,7 @@ func newHandlerHashring(appendables []*fakeAppendable, replicationFactor uint64)
 			ReplicaHeader:     DefaultReplicaHeader,
 			ReplicationFactor: replicationFactor,
 			ForwardTimeout:    5 * time.Second,
-			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i])),
+			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i]), false, DefaultTenantLabel,  map[string]struct{}{}),
 		})
 		handlers = append(handlers, h)
 		h.peers = peers

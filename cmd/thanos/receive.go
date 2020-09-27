@@ -77,6 +77,9 @@ func registerReceive(app *extkingpin.App) {
 
 	tenantLabelName := cmd.Flag("receive.tenant-label-name", "Label name through which the tenant will be announced.").Default(receive.DefaultTenantLabel).String()
 
+	tenantExtract := cmd.Flag("receive.extract-tenant", "Enables extraction of tenant value from metrics. (from label set in receive.tenant-label-name)").Default("true").Bool()
+	labelsExtract := cmd.Flag("receive.extract-label", "Extract prometheus external_labels from metrics. Only used with receive.extract-tenant. (repeated)").PlaceHolder("label").Strings()
+
 	replicaHeader := cmd.Flag("receive.replica-header", "HTTP header specifying the replica number of a write request.").Default(receive.DefaultReplicaHeader).String()
 
 	replicationFactor := cmd.Flag("receive.replication-factor", "How many times to replicate incoming write requests.").Default("1").Uint64()
@@ -159,6 +162,8 @@ func registerReceive(app *extkingpin.App) {
 			*tenantHeader,
 			*defaultTenantID,
 			*tenantLabelName,
+			*tenantExtract,
+			*labelsExtract,
 			*replicaHeader,
 			*replicationFactor,
 			time.Duration(*forwardTimeout),
@@ -198,6 +203,8 @@ func runReceive(
 	tenantHeader string,
 	defaultTenantID string,
 	tenantLabelName string,
+	tenantExtract bool,
+	labelsExtract []string,
 	replicaHeader string,
 	replicationFactor uint64,
 	forwardTimeout time.Duration,
@@ -245,6 +252,11 @@ func runReceive(
 		return errors.Wrapf(err, "migrate legacy storage in %v to default tenant %v", dataDir, defaultTenantID)
 	}
 
+	labelsToExtract := make(map[string]struct{})
+	for _, s := range labelsExtract {
+		labelsToExtract[s] = struct{}{}
+	}
+
 	dbs := receive.NewMultiTSDB(
 		dataDir,
 		logger,
@@ -255,7 +267,7 @@ func runReceive(
 		bkt,
 		allowOutOfOrderUpload,
 	)
-	writer := receive.NewWriter(log.With(logger, "component", "receive-writer"), dbs)
+	writer := receive.NewWriter(log.With(logger, "component", "receive-writer"), dbs, tenantExtract, tenantLabelName, labelsToExtract)
 	webHandler := receive.NewHandler(log.With(logger, "component", "receive-handler"), &receive.Options{
 		Writer:            writer,
 		ListenAddress:     rwAddress,
