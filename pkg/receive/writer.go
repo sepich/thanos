@@ -15,7 +15,6 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	terrors "github.com/prometheus/prometheus/tsdb/errors"
 
-	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 )
 
@@ -32,18 +31,18 @@ type Writer struct {
 	logger    log.Logger
 	multiTSDB TenantStorage
 
-	tenantExtract bool
+	tenantExtract   bool
 	tenantLabelName string
-	labelsExtract map[string]struct{}
+	extractorConfig ExtractorConfig
 }
 
-func NewWriter(logger log.Logger, multiTSDB TenantStorage, tenantExtract bool, tenantLabelName string, labelsExtract map[string]struct{}) *Writer {
+func NewWriter(logger log.Logger, multiTSDB TenantStorage, tenantExtract bool, tenantLabelName string, extractLabelsYaml []byte) *Writer {
 	return &Writer{
-		logger:    logger,
-		multiTSDB: multiTSDB,
-		tenantExtract: tenantExtract,
+		logger:          logger,
+		multiTSDB:       multiTSDB,
+		tenantExtract:   tenantExtract,
 		tenantLabelName: tenantLabelName,
-		labelsExtract: labelsExtract,
+		extractorConfig: ParseExtractorConfig(extractLabelsYaml, logger),
 	}
 }
 
@@ -54,7 +53,12 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		numOutOfBounds = 0
 	)
 
-	extLabels := getExtLabels(wreq.Timeseries[0].Labels, r.labelsExtract)
+	eset := r.extractorConfig.DefaultExternalLabels
+	if _, ok := r.extractorConfig.TenantExternalLabels[tenantID]; ok {
+		eset = r.extractorConfig.TenantExternalLabels[tenantID]
+	}
+	extLabels := getExtLabels(wreq.Timeseries[0].Labels, eset)
+
 	s, err := r.multiTSDB.TenantAppendable(tenantID, extLabels)
 	if err != nil {
 		return errors.Wrap(err, "get tenant appendable")
@@ -69,24 +73,15 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 	}
 
 	var errs terrors.MultiError
-	var k int
 	for _, t := range wreq.Timeseries {
-		lset := make(labels.Labels, len(t.Labels))
-		k = 0
+		lset := make(labels.Labels, 0, len(t.Labels))
 		for j := range t.Labels {
-			if r.tenantExtract {
-				// drop tenant-label and extract-labels from metrics, as these labels are external_labels now
-				if _, ok := r.labelsExtract[t.Labels[j].Name]; ok || t.Labels[j].Name == r.tenantLabelName {
-					continue
-				}
+			if r.tenantExtract && (t.Labels[j].Name == r.tenantLabelName || sliceContains(eset, t.Labels[j].Name)) {
+				// drop tenant-label and external_labels from metrics labels
+				continue
 			}
-			lset[k] = labels.Label{
-				Name:  t.Labels[j].Name,
-				Value: t.Labels[j].Value,
-			}
-			k++
+			lset = append(lset, labels.Label(t.Labels[j]))
 		}
-		lset = lset[:k]
 
 		// Append as many valid samples as possible, but keep track of the errors.
 		for _, s := range t.Samples {
@@ -222,14 +217,4 @@ func (f *fakeAppender) Commit() error {
 
 func (f *fakeAppender) Rollback() error {
 	return f.rollbackErr()
-}
-
-// getExtLabels returns subset from all labels with names in need map
-func getExtLabels(all []labelpb.Label, need map[string]struct{}) (res labels.Labels) {
-	for _, l := range all {
-		if _, ok := need[l.Name]; ok {
-			res = append(res, labels.Label{Name: l.Name, Value: l.Value})
-		}
-	}
-	return res
 }

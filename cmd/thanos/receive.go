@@ -76,9 +76,7 @@ func registerReceive(app *extkingpin.App) {
 	defaultTenantID := cmd.Flag("receive.default-tenant-id", "Default tenant ID to use when none is provided via a header.").Default(receive.DefaultTenant).String()
 
 	tenantLabelName := cmd.Flag("receive.tenant-label-name", "Label name through which the tenant will be announced.").Default(receive.DefaultTenantLabel).String()
-
-	tenantExtract := cmd.Flag("receive.extract-tenant", "Enables extraction of tenant value from metrics. (from label set in receive.tenant-label-name)").Default("true").Bool()
-	labelsExtract := cmd.Flag("receive.extract-label", "Extract prometheus external_labels from metrics. Only used with receive.extract-tenant. (repeated)").PlaceHolder("label").Strings()
+	extractLabels := regExtractLabelsFlags(cmd)
 
 	replicaHeader := cmd.Flag("receive.replica-header", "HTTP header specifying the replica number of a write request.").Default(receive.DefaultReplicaHeader).String()
 
@@ -162,8 +160,7 @@ func registerReceive(app *extkingpin.App) {
 			*tenantHeader,
 			*defaultTenantID,
 			*tenantLabelName,
-			*tenantExtract,
-			*labelsExtract,
+			extractLabels,
 			*replicaHeader,
 			*replicationFactor,
 			time.Duration(*forwardTimeout),
@@ -203,8 +200,7 @@ func runReceive(
 	tenantHeader string,
 	defaultTenantID string,
 	tenantLabelName string,
-	tenantExtract bool,
-	labelsExtract []string,
+	extractLabels *extflag.PathOrContent,
 	replicaHeader string,
 	replicationFactor uint64,
 	forwardTimeout time.Duration,
@@ -252,10 +248,11 @@ func runReceive(
 		return errors.Wrapf(err, "migrate legacy storage in %v to default tenant %v", dataDir, defaultTenantID)
 	}
 
-	labelsToExtract := make(map[string]struct{})
-	for _, s := range labelsExtract {
-		labelsToExtract[s] = struct{}{}
+	extractLabelsYaml, err := extractLabels.Content()
+	if err != nil {
+		return err
 	}
+	tenantExtract := len(extractLabelsYaml) > 0
 
 	dbs := receive.NewMultiTSDB(
 		dataDir,
@@ -267,7 +264,7 @@ func runReceive(
 		bkt,
 		allowOutOfOrderUpload,
 	)
-	writer := receive.NewWriter(log.With(logger, "component", "receive-writer"), dbs, tenantExtract, tenantLabelName, labelsToExtract)
+	writer := receive.NewWriter(log.With(logger, "component", "receive-writer"), dbs, tenantExtract, tenantLabelName, extractLabelsYaml)
 	webHandler := receive.NewHandler(log.With(logger, "component", "receive-handler"), &receive.Options{
 		Writer:            writer,
 		ListenAddress:     rwAddress,
