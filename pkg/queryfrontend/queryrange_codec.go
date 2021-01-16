@@ -4,6 +4,7 @@
 package queryfrontend
 
 import (
+	"bytes"
 	"context"
 	"math"
 	"net/http"
@@ -38,21 +39,23 @@ var (
 	errCannotParse    = "cannot parse parameter %s"
 )
 
-type codec struct {
+// queryRangeCodec is used to encode/decode Thanos query range requests and responses.
+type queryRangeCodec struct {
 	queryrange.Codec
 	partialResponse bool
 }
 
-func NewThanosCodec(partialResponse bool) *codec {
-	return &codec{
+// NewThanosQueryRangeCodec initializes a queryRangeCodec.
+func NewThanosQueryRangeCodec(partialResponse bool) *queryRangeCodec {
+	return &queryRangeCodec{
 		Codec:           queryrange.PrometheusCodec,
 		partialResponse: partialResponse,
 	}
 }
 
-func (c codec) DecodeRequest(_ context.Context, r *http.Request) (queryrange.Request, error) {
+func (c queryRangeCodec) DecodeRequest(_ context.Context, r *http.Request) (queryrange.Request, error) {
 	var (
-		result ThanosRequest
+		result ThanosQueryRangeRequest
 		err    error
 	)
 	result.Start, err = cortexutil.ParseTime(r.FormValue("start"))
@@ -89,7 +92,7 @@ func (c codec) DecodeRequest(_ context.Context, r *http.Request) (queryrange.Req
 		return nil, err
 	}
 
-	if r.FormValue("max_source_resolution") == "auto" {
+	if r.FormValue(queryv1.MaxSourceResolutionParam) == "auto" {
 		result.AutoDownsampling = true
 		result.MaxSourceResolution = result.Step / 5
 	} else {
@@ -108,7 +111,7 @@ func (c codec) DecodeRequest(_ context.Context, r *http.Request) (queryrange.Req
 		result.ReplicaLabels = r.Form[queryv1.ReplicaLabelsParam]
 	}
 
-	result.StoreMatchers, err = parseStoreMatchersParam(r.Form[queryv1.StoreMatcherParam])
+	result.StoreMatchers, err = parseMatchersParam(r.Form, queryv1.StoreMatcherParam)
 	if err != nil {
 		return nil, err
 	}
@@ -126,8 +129,8 @@ func (c codec) DecodeRequest(_ context.Context, r *http.Request) (queryrange.Req
 	return &result, nil
 }
 
-func (c codec) EncodeRequest(ctx context.Context, r queryrange.Request) (*http.Request, error) {
-	thanosReq, ok := r.(*ThanosRequest)
+func (c queryRangeCodec) EncodeRequest(ctx context.Context, r queryrange.Request) (*http.Request, error) {
+	thanosReq, ok := r.(*ThanosQueryRangeRequest)
 	if !ok {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, "invalid request format")
 	}
@@ -153,17 +156,11 @@ func (c codec) EncodeRequest(ctx context.Context, r queryrange.Request) (*http.R
 		params[queryv1.StoreMatcherParam] = matchersToStringSlice(thanosReq.StoreMatchers)
 	}
 
-	u := &url.URL{
-		Path:     thanosReq.Path,
-		RawQuery: params.Encode(),
+	req, err := http.NewRequest(http.MethodPost, thanosReq.Path, bytes.NewBufferString(params.Encode()))
+	if err != nil {
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "error creating request: %s", err.Error())
 	}
-	req := &http.Request{
-		Method:     "GET",
-		RequestURI: u.String(), // This is what the httpgrpc code looks at.
-		URL:        u,
-		Body:       http.NoBody,
-		Header:     http.Header{},
-	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	return req.WithContext(ctx), nil
 }
@@ -224,16 +221,16 @@ func parsePartialResponseParam(s string, defaultEnablePartialResponse bool) (boo
 	return defaultEnablePartialResponse, nil
 }
 
-func parseStoreMatchersParam(ss []string) ([][]*labels.Matcher, error) {
-	storeMatchers := make([][]*labels.Matcher, 0, len(ss))
-	for _, s := range ss {
-		matchers, err := parser.ParseMetricSelector(s)
+func parseMatchersParam(ss url.Values, matcherParam string) ([][]*labels.Matcher, error) {
+	matchers := make([][]*labels.Matcher, 0, len(ss[matcherParam]))
+	for _, s := range ss[matcherParam] {
+		ms, err := parser.ParseMetricSelector(s)
 		if err != nil {
-			return nil, httpgrpc.Errorf(http.StatusBadRequest, errCannotParse, queryv1.StoreMatcherParam)
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, errCannotParse, matcherParam)
 		}
-		storeMatchers = append(storeMatchers, matchers)
+		matchers = append(matchers, ms)
 	}
-	return storeMatchers, nil
+	return matchers, nil
 }
 
 func encodeTime(t int64) string {

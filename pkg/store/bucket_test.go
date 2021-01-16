@@ -33,6 +33,7 @@ import (
 	"github.com/prometheus/prometheus/pkg/relabel"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/encoding"
 	"go.uber.org/atomic"
 
@@ -45,6 +46,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/pool"
 	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/hintspb"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
@@ -205,7 +207,7 @@ func TestBucketBlock_matchLabels(t *testing.T) {
 		},
 	}
 
-	b, err := newBucketBlock(context.Background(), log.NewNopLogger(), newBucketStoreMetrics(nil), meta, bkt, path.Join(dir, blockID.String()), nil, nil, nil, nil, true)
+	b, err := newBucketBlock(context.Background(), log.NewNopLogger(), newBucketStoreMetrics(nil), meta, bkt, path.Join(dir, blockID.String()), nil, nil, nil, nil)
 	testutil.Ok(t, err)
 
 	cases := []struct {
@@ -576,11 +578,13 @@ func TestBucketStore_Info(t *testing.T) {
 		20,
 		allowAllFilterConf,
 		true,
-		true,
 		DefaultPostingOffsetInMemorySampling,
 		false,
+		false,
+		0,
 	)
 	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, bucketStore.Close()) }()
 
 	resp, err := bucketStore.Info(ctx, &storepb.InfoRequest{})
 	testutil.Ok(t, err)
@@ -588,8 +592,8 @@ func TestBucketStore_Info(t *testing.T) {
 	testutil.Equals(t, storepb.StoreType_STORE, resp.StoreType)
 	testutil.Equals(t, int64(math.MaxInt64), resp.MinTime)
 	testutil.Equals(t, int64(math.MinInt64), resp.MaxTime)
-	testutil.Equals(t, []storepb.LabelSet(nil), resp.LabelSets)
-	testutil.Equals(t, []storepb.Label(nil), resp.Labels)
+	testutil.Equals(t, []labelpb.ZLabelSet(nil), resp.LabelSets)
+	testutil.Equals(t, []labelpb.ZLabel(nil), resp.Labels)
 }
 
 type recorder struct {
@@ -666,32 +670,32 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
 		name              string
 		relabel           string
 		expectedIDs       []ulid.ULID
-		expectedAdvLabels []storepb.LabelSet
+		expectedAdvLabels []labelpb.ZLabelSet
 	}{
 		{
 			name:        "no sharding",
 			expectedIDs: all,
-			expectedAdvLabels: []storepb.LabelSet{
+			expectedAdvLabels: []labelpb.ZLabelSet{
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: "cluster", Value: "a"},
 						{Name: "region", Value: "r1"},
 					},
 				},
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: "cluster", Value: "a"},
 						{Name: "region", Value: "r2"},
 					},
 				},
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: "cluster", Value: "b"},
 						{Name: "region", Value: "r1"},
 					},
 				},
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: CompatibilityTypeLabelName, Value: "store"},
 					},
 				},
@@ -706,15 +710,15 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
               - cluster
             `,
 			expectedIDs: []ulid.ULID{all[2]},
-			expectedAdvLabels: []storepb.LabelSet{
+			expectedAdvLabels: []labelpb.ZLabelSet{
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: "cluster", Value: "b"},
 						{Name: "region", Value: "r1"},
 					},
 				},
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: CompatibilityTypeLabelName, Value: "store"},
 					},
 				},
@@ -729,21 +733,21 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
               - cluster
             `,
 			expectedIDs: []ulid.ULID{all[0], all[1], all[3]},
-			expectedAdvLabels: []storepb.LabelSet{
+			expectedAdvLabels: []labelpb.ZLabelSet{
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: "cluster", Value: "a"},
 						{Name: "region", Value: "r1"},
 					},
 				},
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: "cluster", Value: "a"},
 						{Name: "region", Value: "r2"},
 					},
 				},
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: CompatibilityTypeLabelName, Value: "store"},
 					},
 				},
@@ -762,15 +766,15 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
               - region
             `,
 			expectedIDs: []ulid.ULID{all[0], all[1]},
-			expectedAdvLabels: []storepb.LabelSet{
+			expectedAdvLabels: []labelpb.ZLabelSet{
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: "cluster", Value: "a"},
 						{Name: "region", Value: "r1"},
 					},
 				},
 				{
-					Labels: []storepb.Label{
+					Labels: []labelpb.ZLabel{
 						{Name: CompatibilityTypeLabelName, Value: "store"},
 					},
 				},
@@ -789,7 +793,7 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
               - region
             `,
 			expectedIDs:       []ulid.ULID{},
-			expectedAdvLabels: []storepb.LabelSet{},
+			expectedAdvLabels: []labelpb.ZLabelSet{},
 		},
 	} {
 		t.Run(sc.name, func(t *testing.T) {
@@ -825,11 +829,13 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
 				20,
 				allowAllFilterConf,
 				true,
-				true,
 				DefaultPostingOffsetInMemorySampling,
 				false,
+				false,
+				0,
 			)
 			testutil.Ok(t, err)
+			defer func() { testutil.Ok(t, bucketStore.Close()) }()
 
 			testutil.Ok(t, bucketStore.InitialSync(context.Background()))
 
@@ -848,7 +854,7 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
 			testutil.Ok(t, err)
 
 			testutil.Equals(t, storepb.StoreType_STORE, resp.StoreType)
-			testutil.Equals(t, []storepb.Label(nil), resp.Labels)
+			testutil.Equals(t, []labelpb.ZLabel(nil), resp.Labels)
 			testutil.Equals(t, sc.expectedAdvLabels, resp.LabelSets)
 
 			// Make sure we don't download files we did not expect to.
@@ -1149,7 +1155,14 @@ func benchmarkExpandedPostings(
 func TestBucketSeries(t *testing.T) {
 	tb := testutil.NewTB(t)
 	storetestutil.RunSeriesInterestingCases(tb, 200e3, 200e3, func(t testutil.TB, samplesPerSeries, series int) {
-		benchBucketSeries(t, samplesPerSeries, series, 1)
+		benchBucketSeries(t, false, samplesPerSeries, series, 1)
+	})
+}
+
+func TestBucketSkipChunksSeries(t *testing.T) {
+	tb := testutil.NewTB(t)
+	storetestutil.RunSeriesInterestingCases(tb, 200e3, 200e3, func(t testutil.TB, samplesPerSeries, series int) {
+		benchBucketSeries(t, true, samplesPerSeries, series, 1)
 	})
 }
 
@@ -1157,11 +1170,19 @@ func BenchmarkBucketSeries(b *testing.B) {
 	tb := testutil.NewTB(b)
 	// 10e6 samples = ~1736 days with 15s scrape
 	storetestutil.RunSeriesInterestingCases(tb, 10e6, 10e5, func(t testutil.TB, samplesPerSeries, series int) {
-		benchBucketSeries(t, samplesPerSeries, series, 1/100e6, 1/10e4, 1)
+		benchBucketSeries(t, false, samplesPerSeries, series, 1/100e6, 1/10e4, 1)
 	})
 }
 
-func benchBucketSeries(t testutil.TB, samplesPerSeries, totalSeries int, requestedRatios ...float64) {
+func BenchmarkBucketSkipChunksSeries(b *testing.B) {
+	tb := testutil.NewTB(b)
+	// 10e6 samples = ~1736 days with 15s scrape
+	storetestutil.RunSeriesInterestingCases(tb, 10e6, 10e5, func(t testutil.TB, samplesPerSeries, series int) {
+		benchBucketSeries(t, true, samplesPerSeries, series, 1/100e6, 1/10e4, 1)
+	})
+}
+
+func benchBucketSeries(t testutil.TB, skipChunk bool, samplesPerSeries, totalSeries int, requestedRatios ...float64) {
 	const numOfBlocks = 4
 
 	tmpDir, err := ioutil.TempDir("", "testorbench-bucketseries")
@@ -1215,7 +1236,7 @@ func benchBucketSeries(t testutil.TB, samplesPerSeries, totalSeries int, request
 			Series:           seriesPerBlock,
 			PrependLabels:    extLset,
 			Random:           random,
-			SkipChunks:       t.IsBenchmark(),
+			SkipChunks:       t.IsBenchmark() || skipChunk,
 		})
 		id := createBlockFromHead(t, blockDir, head)
 		testutil.Ok(t, head.Close())
@@ -1240,10 +1261,11 @@ func benchBucketSeries(t testutil.TB, samplesPerSeries, totalSeries int, request
 	}
 
 	store := &BucketStore{
-		bkt:        objstore.WithNoopInstr(bkt),
-		logger:     logger,
-		indexCache: noopCache{},
-		metrics:    newBucketStoreMetrics(nil),
+		bkt:             objstore.WithNoopInstr(bkt),
+		logger:          logger,
+		indexCache:      noopCache{},
+		indexReaderPool: indexheader.NewReaderPool(log.NewNopLogger(), false, 0, nil),
+		metrics:         newBucketStoreMetrics(nil),
 		blockSets: map[uint64]*bucketBlockSet{
 			labels.Labels{{Name: "ext1", Value: "1"}}.Hash(): {blocks: [][]*bucketBlock{blocks}},
 		},
@@ -1258,19 +1280,26 @@ func benchBucketSeries(t testutil.TB, samplesPerSeries, totalSeries int, request
 
 	var bCases []*storetestutil.SeriesCase
 	for _, p := range requestedRatios {
+		expectedSamples := int(p * float64(totalSeries*samplesPerSeries))
+		if expectedSamples == 0 {
+			expectedSamples = 1
+		}
 		seriesCut := int(p * float64(numOfBlocks*seriesPerBlock))
 		if seriesCut == 0 {
 			seriesCut = 1
+		} else if seriesCut == 1 {
+			seriesCut = expectedSamples / samplesPerSeriesPerBlock
 		}
-		allCut := int(p * float64(totalSeries*samplesPerSeries))
+
 		bCases = append(bCases, &storetestutil.SeriesCase{
-			Name: fmt.Sprintf("%dof%d", allCut, totalSeries*samplesPerSeries),
+			Name: fmt.Sprintf("%dof%d", expectedSamples, totalSeries*samplesPerSeries),
 			Req: &storepb.SeriesRequest{
 				MinTime: 0,
-				MaxTime: int64(allCut) - 1,
+				MaxTime: int64(expectedSamples) - 1,
 				Matchers: []storepb.LabelMatcher{
 					{Type: storepb.LabelMatcher_EQ, Name: "foo", Value: "bar"},
 				},
+				SkipChunks: skipChunk,
 			},
 			// This does not cut chunks properly, but those are assured against for non benchmarks only, where we use 100% case only.
 			ExpectedSeries: series[:seriesCut],
@@ -1279,11 +1308,13 @@ func benchBucketSeries(t testutil.TB, samplesPerSeries, totalSeries int, request
 	storetestutil.TestServerSeries(t, store, bCases...)
 
 	if !t.IsBenchmark() {
-		// Make sure the pool is correctly used. This is expected for 200k numbers.
-		testutil.Equals(t, numOfBlocks, int(chunkPool.(*mockedPool).gets.Load()))
-		// TODO(bwplotka): This is wrong negative for large number of samples (1mln). Investigate.
-		testutil.Equals(t, 0, int(chunkPool.(*mockedPool).balance.Load()))
-		chunkPool.(*mockedPool).gets.Store(0)
+		if !skipChunk {
+			// Make sure the pool is correctly used. This is expected for 200k numbers.
+			testutil.Equals(t, numOfBlocks, int(chunkPool.(*mockedPool).gets.Load()))
+			// TODO(bwplotka): This is wrong negative for large number of samples (1mln). Investigate.
+			testutil.Equals(t, 0, int(chunkPool.(*mockedPool).balance.Load()))
+			chunkPool.(*mockedPool).gets.Store(0)
+		}
 
 		for _, b := range blocks {
 			// NOTE(bwplotka): It is 4 x 1.0 for 100mln samples. Kind of make sense: long series.
@@ -1442,10 +1473,11 @@ func TestBucketSeries_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 	}
 
 	store := &BucketStore{
-		bkt:        objstore.WithNoopInstr(bkt),
-		logger:     logger,
-		indexCache: indexCache,
-		metrics:    newBucketStoreMetrics(nil),
+		bkt:             objstore.WithNoopInstr(bkt),
+		logger:          logger,
+		indexCache:      indexCache,
+		indexReaderPool: indexheader.NewReaderPool(log.NewNopLogger(), false, 0, nil),
+		metrics:         newBucketStoreMetrics(nil),
 		blockSets: map[uint64]*bucketBlockSet{
 			labels.Labels{{Name: "ext1", Value: "1"}}.Hash(): {blocks: [][]*bucketBlock{{b1, b2}}},
 		},
@@ -1578,11 +1610,14 @@ func TestSeries_RequestAndResponseHints(t *testing.T) {
 		10,
 		nil,
 		false,
-		true,
 		DefaultPostingOffsetInMemorySampling,
 		true,
+		false,
+		0,
 	)
 	testutil.Ok(tb, err)
+	defer func() { testutil.Ok(t, store.Close()) }()
+
 	testutil.Ok(tb, store.SyncBlocks(context.Background()))
 
 	testCases := []*storetestutil.SeriesCase{
@@ -1687,11 +1722,14 @@ func TestSeries_ErrorUnmarshallingRequestHints(t *testing.T) {
 		10,
 		nil,
 		false,
-		true,
 		DefaultPostingOffsetInMemorySampling,
 		true,
+		false,
+		0,
 	)
 	testutil.Ok(tb, err)
+	defer func() { testutil.Ok(t, store.Close()) }()
+
 	testutil.Ok(tb, store.SyncBlocks(context.Background()))
 
 	// Create a request with invalid hints (uses response hints instead of request hints).
@@ -1708,6 +1746,137 @@ func TestSeries_ErrorUnmarshallingRequestHints(t *testing.T) {
 	err = store.Series(req, srv)
 	testutil.NotOk(t, err)
 	testutil.Equals(t, true, regexp.MustCompile(".*unmarshal series request hints.*").MatchString(err.Error()))
+}
+
+func TestSeries_BlockWithMultipleChunks(t *testing.T) {
+	tb := testutil.NewTB(t)
+
+	tmpDir, err := ioutil.TempDir("", "test-block-with-multiple-chunks")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(tmpDir)) }()
+
+	// Create a block with 1 series but an high number of samples,
+	// so that they will span across multiple chunks.
+	blkDir := filepath.Join(tmpDir, "block")
+
+	h, err := tsdb.NewHead(nil, nil, nil, 10000000000, blkDir, nil, tsdb.DefaultStripeSize, nil)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, h.Close()) }()
+
+	series := labels.FromStrings("__name__", "test")
+	for ts := int64(0); ts < 10000; ts++ {
+		// Appending a single sample is very unoptimised, but guarantees each chunk is always MaxSamplesPerChunk
+		// (except the last one, which could be smaller).
+		app := h.Appender(context.Background())
+		_, err := app.Add(series, ts, float64(ts))
+		testutil.Ok(t, err)
+		testutil.Ok(t, app.Commit())
+	}
+
+	blk := createBlockFromHead(t, blkDir, h)
+
+	thanosMeta := metadata.Thanos{
+		Labels:     labels.Labels{{Name: "ext1", Value: "1"}}.Map(),
+		Downsample: metadata.ThanosDownsample{Resolution: 0},
+		Source:     metadata.TestSource,
+	}
+
+	_, err = metadata.InjectThanos(log.NewNopLogger(), filepath.Join(blkDir, blk.String()), thanosMeta, nil)
+	testutil.Ok(t, err)
+
+	// Create a bucket and upload the block there.
+	bktDir := filepath.Join(tmpDir, "bucket")
+	bkt, err := filesystem.NewBucket(bktDir)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, bkt.Close()) }()
+
+	instrBkt := objstore.WithNoopInstr(bkt)
+	logger := log.NewNopLogger()
+	testutil.Ok(t, block.Upload(context.Background(), logger, bkt, filepath.Join(blkDir, blk.String())))
+
+	// Instance a real bucket store we'll use to query the series.
+	fetcher, err := block.NewMetaFetcher(logger, 10, instrBkt, tmpDir, nil, nil, nil)
+	testutil.Ok(tb, err)
+
+	indexCache, err := storecache.NewInMemoryIndexCacheWithConfig(logger, nil, storecache.InMemoryIndexCacheConfig{})
+	testutil.Ok(tb, err)
+
+	store, err := NewBucketStore(
+		logger,
+		nil,
+		instrBkt,
+		fetcher,
+		tmpDir,
+		indexCache,
+		nil,
+		1000000,
+		NewChunksLimiterFactory(100000/MaxSamplesPerChunk),
+		false,
+		10,
+		nil,
+		false,
+		DefaultPostingOffsetInMemorySampling,
+		true,
+		false,
+		0,
+	)
+	testutil.Ok(tb, err)
+	testutil.Ok(tb, store.SyncBlocks(context.Background()))
+
+	tests := map[string]struct {
+		reqMinTime      int64
+		reqMaxTime      int64
+		expectedSamples int
+	}{
+		"query the entire block": {
+			reqMinTime:      math.MinInt64,
+			reqMaxTime:      math.MaxInt64,
+			expectedSamples: 10000,
+		},
+		"query the beginning of the block": {
+			reqMinTime:      0,
+			reqMaxTime:      100,
+			expectedSamples: MaxSamplesPerChunk,
+		},
+		"query the middle of the block": {
+			reqMinTime:      4000,
+			reqMaxTime:      4050,
+			expectedSamples: MaxSamplesPerChunk,
+		},
+		"query the end of the block": {
+			reqMinTime:      9800,
+			reqMaxTime:      10000,
+			expectedSamples: (MaxSamplesPerChunk * 2) + (10000 % MaxSamplesPerChunk),
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			req := &storepb.SeriesRequest{
+				MinTime: testData.reqMinTime,
+				MaxTime: testData.reqMaxTime,
+				Matchers: []storepb.LabelMatcher{
+					{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "test"},
+				},
+			}
+
+			srv := newStoreSeriesServer(context.Background())
+			err = store.Series(req, srv)
+			testutil.Ok(t, err)
+			testutil.Assert(t, len(srv.SeriesSet) == 1)
+
+			// Count the number of samples in the returned chunks.
+			numSamples := 0
+			for _, rawChunk := range srv.SeriesSet[0].Chunks {
+				decodedChunk, err := chunkenc.FromData(chunkenc.EncXOR, rawChunk.Raw.Data)
+				testutil.Ok(t, err)
+
+				numSamples += decodedChunk.NumSamples()
+			}
+
+			testutil.Assert(t, testData.expectedSamples == numSamples, "expected: %d, actual: %d", testData.expectedSamples, numSamples)
+		})
+	}
 }
 
 func mustMarshalAny(pb proto.Message) *types.Any {
@@ -1790,11 +1959,14 @@ func TestBlockWithLargeChunks(t *testing.T) {
 		10,
 		nil,
 		false,
-		true,
 		DefaultPostingOffsetInMemorySampling,
 		true,
+		false,
+		0,
 	)
 	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, store.Close()) }()
+
 	testutil.Ok(t, store.SyncBlocks(context.Background()))
 
 	req := &storepb.SeriesRequest{

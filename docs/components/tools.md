@@ -37,7 +37,9 @@ Flags:
 
 Subcommands:
   tools bucket verify [<flags>]
-    Verify all blocks in the bucket against specified issues
+    Verify all blocks in the bucket against specified issues. NOTE: Depending on
+    issue this might take time and will need downloading all specified blocks to
+    disk.
 
   tools bucket ls [<flags>]
     List all blocks in the bucket
@@ -57,6 +59,11 @@ Subcommands:
 
   tools bucket cleanup [<flags>]
     Cleans up all blocks marked for deletion
+
+  tools bucket mark --id=ID --marker=MARKER --details=DETAILS
+    Mark block for deletion or no-compact in a safe way. NOTE: If the compactor
+    is currently running compacting same block, this operation would be
+    potentially a noop.
 
   tools rules-check --rules=RULES
     Check if the rule files are valid or not.
@@ -119,7 +126,9 @@ Flags:
 
 Subcommands:
   tools bucket verify [<flags>]
-    Verify all blocks in the bucket against specified issues
+    Verify all blocks in the bucket against specified issues. NOTE: Depending on
+    issue this might take time and will need downloading all specified blocks to
+    disk.
 
   tools bucket ls [<flags>]
     List all blocks in the bucket
@@ -139,6 +148,11 @@ Subcommands:
 
   tools bucket cleanup [<flags>]
     Cleans up all blocks marked for deletion
+
+  tools bucket mark --id=ID --marker=MARKER --details=DETAILS
+    Mark block for deletion or no-compact in a safe way. NOTE: If the compactor
+    is currently running compacting same block, this operation would be
+    potentially a noop.
 
 
 ```
@@ -235,7 +249,9 @@ When using the `--repair` option, make sure that the compactor job is disabled f
 ```$
 usage: thanos tools bucket verify [<flags>]
 
-Verify all blocks in the bucket against specified issues
+Verify all blocks in the bucket against specified issues. NOTE: Depending on
+issue this might take time and will need downloading all specified blocks to
+disk.
 
 Flags:
   -h, --help               Show context-sensitive help (also try --help-long and
@@ -277,10 +293,11 @@ Flags:
                            removal.
   -r, --repair             Attempt to repair blocks for which issues were
                            detected
-  -i, --issues=index_issue... ...
+  -i, --issues=index_known_issues... ...
                            Issues to verify (and optionally repair). Possible
-                           values: [duplicated_compaction index_issue
-                           overlapped_blocks]
+                           issue to verify, without repair: [overlapped_blocks];
+                           Possible issue to verify and repair:
+                           [index_known_issues duplicated_compaction]
       --id=ID ...          Block IDs to verify (and optionally repair) only. If
                            none is specified, all blocks will be verified.
                            Repeated field
@@ -465,12 +482,28 @@ Flags:
       --matcher=key="value" ...  Only blocks whose external labels exactly match
                                  this matcher will be replicated.
       --single-run               Run replication only one time, then exit.
+      --min-time=0000-01-01T00:00:00Z
+                                 Start of time range limit to replicate. Thanos
+                                 Replicate will replicate only metrics, which
+                                 happened later than this value. Option can be a
+                                 constant time in RFC3339 format or time
+                                 duration relative to current time, such as -1d
+                                 or 2h45m. Valid duration units are ms, s, m, h,
+                                 d, w, y.
+      --max-time=9999-12-31T23:59:59Z
+                                 End of time range limit to replicate. Thanos
+                                 Replicate will replicate only metrics, which
+                                 happened earlier than this value. Option can be
+                                 a constant time in RFC3339 format or time
+                                 duration relative to current time, such as -1d
+                                 or 2h45m. Valid duration units are ms, s, m, h,
+                                 d, w, y.
 
 ```
 
 ### Bucket downsample
 
-`tools bucket downsample` is used to continuously downsample blocks in an object store bucket as a service.
+`tools bucket downsample` is used to downsample blocks in an object store bucket as a service.
 It implements the downsample API on top of historical data in an object storage bucket.
 
 ```bash
@@ -526,13 +559,73 @@ Flags:
                               process downsamplings.
 
 ```
+
+### Bucket mark
+
+`tools bucket mark` can be used to manually mark block for deletion.
+
+NOTE: If the [Compactor](compact.md) is currently running and compacting exactly same block, this operation would be potentially a noop."
+
+```bash
+thanos tools bucket mark \
+    --id "01C8320GCGEWBZF51Q46TTQEH9" --id "01C8J352831FXGZQMN2NTJ08DY"
+    --objstore.config-file "bucket.yml"
+```
+
+The example content of `bucket.yml`:
+
+```yaml
+type: GCS
+config:
+  bucket: example-bucket
+```
+
+[embedmd]:# (flags/tools_bucket_mark.txt $)
+```$
+usage: thanos tools bucket mark --id=ID --marker=MARKER --details=DETAILS
+
+Mark block for deletion or no-compact in a safe way. NOTE: If the compactor is
+currently running compacting same block, this operation would be potentially a
+noop.
+
+Flags:
+  -h, --help               Show context-sensitive help (also try --help-long and
+                           --help-man).
+      --version            Show application version.
+      --log.level=info     Log filtering level.
+      --log.format=logfmt  Log format to use. Possible options: logfmt or json.
+      --tracing.config-file=<file-path>
+                           Path to YAML file with tracing configuration. See
+                           format details:
+                           https://thanos.io/tip/thanos/tracing.md/#configuration
+      --tracing.config=<content>
+                           Alternative to 'tracing.config-file' flag (lower
+                           priority). Content of YAML file with tracing
+                           configuration. See format details:
+                           https://thanos.io/tip/thanos/tracing.md/#configuration
+      --objstore.config-file=<file-path>
+                           Path to YAML file that contains object store
+                           configuration. See format details:
+                           https://thanos.io/tip/thanos/storage.md/#configuration
+      --objstore.config=<content>
+                           Alternative to 'objstore.config-file' flag (lower
+                           priority). Content of YAML file that contains object
+                           store configuration. See format details:
+                           https://thanos.io/tip/thanos/storage.md/#configuration
+      --id=ID ...          ID (ULID) of the blocks to be marked for deletion
+                           (repeated flag)
+      --marker=MARKER      Marker to be put.
+      --details=DETAILS    Human readable details to be put into marker.
+
+```
+
 ## Rules-check
 
 The `tools rules-check` subcommand contains tools for validation of Prometheus rules.
 
-This is allowing to check the rules with the same validation as is used by the Thanos rule node.
+This is allowing to check the rules with the same validation as is used by the Thanos Ruler node.
 
-NOTE: The check is equivalent to the `promtool check rules` with addition of Thanos rule extended rules file syntax,
+NOTE: The check is equivalent to the `promtool check rules` with addition of Thanos Ruler extended rules file syntax,
 which includes `partial_response_strategy` field which `promtool` does not allow.
 
 If the check fails the command fails with exit code `1`, otherwise `0`.

@@ -41,8 +41,8 @@ import (
 func registerReceive(app *extkingpin.App) {
 	cmd := app.Command(component.Receive.String(), "Accept Prometheus remote write API requests and write to local tsdb.")
 
-	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
-	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := regGRPCFlags(cmd)
+	httpBindAddr, httpGracePeriod := extkingpin.RegisterHTTPFlags(cmd)
+	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := extkingpin.RegisterGRPCFlags(cmd)
 
 	rwAddress := cmd.Flag("remote-write.address", "Address to listen on for remote write requests.").
 		Default("0.0.0.0:19291").String()
@@ -59,14 +59,14 @@ func registerReceive(app *extkingpin.App) {
 
 	labelStrs := cmd.Flag("label", "External labels to announce. This flag will be removed in the future when handling multiple tsdb instances is added.").PlaceHolder("key=\"value\"").Strings()
 
-	objStoreConfig := regCommonObjStoreFlags(cmd, "", false)
+	objStoreConfig := extkingpin.RegisterCommonObjStoreFlags(cmd, "", false)
 
-	retention := modelDuration(cmd.Flag("tsdb.retention", "How long to retain raw samples on local storage. 0d - disables this retention.").Default("15d"))
+	retention := extkingpin.ModelDuration(cmd.Flag("tsdb.retention", "How long to retain raw samples on local storage. 0d - disables this retention.").Default("15d"))
 
 	hashringsFile := cmd.Flag("receive.hashrings-file", "Path to file that contains the hashring configuration.").
 		PlaceHolder("<path>").String()
 
-	refreshInterval := modelDuration(cmd.Flag("receive.hashrings-file-refresh-interval", "Refresh interval to re-read the hashring configuration file. (used as a fallback)").
+	refreshInterval := extkingpin.ModelDuration(cmd.Flag("receive.hashrings-file-refresh-interval", "Refresh interval to re-read the hashring configuration file. (used as a fallback)").
 		Default("5m"))
 
 	localEndpoint := cmd.Flag("receive.local-endpoint", "Endpoint of local receive node. Used to identify the local node in the hashring configuration.").String()
@@ -76,16 +76,16 @@ func registerReceive(app *extkingpin.App) {
 	defaultTenantID := cmd.Flag("receive.default-tenant-id", "Default tenant ID to use when none is provided via a header.").Default(receive.DefaultTenant).String()
 
 	tenantLabelName := cmd.Flag("receive.tenant-label-name", "Label name through which the tenant will be announced.").Default(receive.DefaultTenantLabel).String()
-	extractLabels := regExtractLabelsFlags(cmd)
+	extractLabels := extkingpin.RegisterExtractLabelsFlags(cmd)
 
 	replicaHeader := cmd.Flag("receive.replica-header", "HTTP header specifying the replica number of a write request.").Default(receive.DefaultReplicaHeader).String()
 
 	replicationFactor := cmd.Flag("receive.replication-factor", "How many times to replicate incoming write requests.").Default("1").Uint64()
 
-	forwardTimeout := modelDuration(cmd.Flag("receive-forward-timeout", "Timeout for each forward request.").Default("5s").Hidden())
+	forwardTimeout := extkingpin.ModelDuration(cmd.Flag("receive-forward-timeout", "Timeout for each forward request.").Default("5s").Hidden())
 
-	tsdbMinBlockDuration := modelDuration(cmd.Flag("tsdb.min-block-duration", "Min duration for local TSDB blocks").Default("2h").Hidden())
-	tsdbMaxBlockDuration := modelDuration(cmd.Flag("tsdb.max-block-duration", "Max duration for local TSDB blocks").Default("2h").Hidden())
+	tsdbMinBlockDuration := extkingpin.ModelDuration(cmd.Flag("tsdb.min-block-duration", "Min duration for local TSDB blocks").Default("2h").Hidden())
+	tsdbMaxBlockDuration := extkingpin.ModelDuration(cmd.Flag("tsdb.max-block-duration", "Max duration for local TSDB blocks").Default("2h").Hidden())
 	walCompression := cmd.Flag("tsdb.wal-compression", "Compress the tsdb WAL.").Default("true").Bool()
 	noLockFile := cmd.Flag("tsdb.no-lockfile", "Do not create lockfile in TSDB data directory. In any case, the lockfiles will be deleted on next startup.").Default("false").Bool()
 

@@ -20,11 +20,11 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
-	terrors "github.com/prometheus/prometheus/tsdb/errors"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
@@ -147,7 +147,7 @@ func (t *MultiTSDB) Flush() error {
 	defer t.mtx.RUnlock()
 
 	errmtx := &sync.Mutex{}
-	merr := terrors.MultiError{}
+	merr := errutil.MultiError{}
 	wg := &sync.WaitGroup{}
 	for id, tenant := range t.tenants {
 		db := tenant.readyStorage().Get()
@@ -176,7 +176,7 @@ func (t *MultiTSDB) Close() error {
 	t.mtx.Lock()
 	defer t.mtx.Unlock()
 
-	merr := terrors.MultiError{}
+	merr := errutil.MultiError{}
 	for id, tenant := range t.tenants {
 		db := tenant.readyStorage().Get()
 		if db == nil {
@@ -198,7 +198,7 @@ func (t *MultiTSDB) Sync(ctx context.Context) error {
 	defer t.mtx.RUnlock()
 
 	errmtx := &sync.Mutex{}
-	merr := terrors.MultiError{}
+	merr := errutil.MultiError{}
 	wg := &sync.WaitGroup{}
 	for tenantID, tenant := range t.tenants {
 		level.Debug(t.logger).Log("msg", "uploading block for tenant", "tenant", tenantID)
@@ -229,7 +229,7 @@ func (t *MultiTSDB) RemoveLockFilesIfAny() error {
 		return err
 	}
 
-	merr := terrors.MultiError{}
+	merr := errutil.MultiError{}
 	for _, fi := range fis {
 		if !fi.IsDir() {
 			continue
@@ -286,14 +286,9 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 			s, err = tsdb.Open(dataDir, logger, &UnRegisterer{Registerer: reg}, &opts)
 		}
 	}
-	if err != nil {
-		level.Error(t.logger).Log("msg", err, "startTSDB", "error2")
-		t.mtx.Lock()
-		delete(t.tenants, tenantID)
-		t.mtx.Unlock()
-		return err
+	if err == nil {
+		err = t.saveExtLabels(dataDir, extLabels)
 	}
-	err = t.saveExtLabels(dataDir, extLabels)
 	if err != nil {
 		t.mtx.Lock()
 		delete(t.tenants, tenantID)
@@ -384,7 +379,7 @@ func (t *MultiTSDB) saveExtLabels(dir string, extLabels labels.Labels) error {
 		lbls[i.Name] = i.Value
 	}
 	meta := metadata.Meta{Thanos: metadata.Thanos{Labels: lbls}, BlockMeta: tsdb.BlockMeta{Version: 1}}
-	return metadata.Write(t.logger, dir, &meta)
+	return meta.WriteToDir(t.logger, dir)
 }
 
 // ErrNotReady is returned if the underlying storage is not ready yet.

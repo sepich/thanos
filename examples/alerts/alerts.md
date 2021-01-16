@@ -21,7 +21,7 @@ rules:
   annotations:
     description: Thanos Compact {{$labels.job}} has failed to run and now is halted.
     summary: Thanos Compact has failed to run ans is now halted.
-  expr: thanos_compactor_halted{job=~"thanos-compact.*"} == 1
+  expr: thanos_compact_halted{job=~"thanos-compact.*"} == 1
   for: 5m
   labels:
     severity: warning
@@ -67,7 +67,7 @@ rules:
 
 ## Ruler
 
-For Thanos ruler we run some alerts in local Prometheus, to make sure that Thanos Rule is working:
+For Thanos Ruler we run some alerts in local Prometheus, to make sure that Thanos Ruler is working:
 
 [embedmd]:# (../tmp/thanos-rule.rules.yaml yaml)
 ```yaml
@@ -162,9 +162,9 @@ rules:
     summary: Thanos Rule is having high number of DNS failures.
   expr: |
     (
-      sum by (job) (rate(thanos_ruler_query_apis_dns_failures_total{job=~"thanos-rule.*"}[5m]))
+      sum by (job) (rate(thanos_rule_query_apis_dns_failures_total{job=~"thanos-rule.*"}[5m]))
     /
-      sum by (job) (rate(thanos_ruler_query_apis_dns_lookups_total{job=~"thanos-rule.*"}[5m]))
+      sum by (job) (rate(thanos_rule_query_apis_dns_lookups_total{job=~"thanos-rule.*"}[5m]))
     * 100 > 1
     )
   for: 15m
@@ -177,9 +177,9 @@ rules:
     summary: Thanos Rule is having high number of DNS failures.
   expr: |
     (
-      sum by (job) (rate(thanos_ruler_alertmanagers_dns_failures_total{job=~"thanos-rule.*"}[5m]))
+      sum by (job) (rate(thanos_rule_alertmanagers_dns_failures_total{job=~"thanos-rule.*"}[5m]))
     /
-      sum by (job) (rate(thanos_ruler_alertmanagers_dns_lookups_total{job=~"thanos-rule.*"}[5m]))
+      sum by (job) (rate(thanos_rule_alertmanagers_dns_lookups_total{job=~"thanos-rule.*"}[5m]))
     * 100 > 1
     )
   for: 15m
@@ -239,7 +239,7 @@ rules:
     summary: Thanos Store has high latency for store series gate requests.
   expr: |
     (
-      histogram_quantile(0.9, sum by (job, le) (rate(thanos_bucket_store_series_gate_duration_seconds_bucket{job=~"thanos-store.*"}[5m]))) > 2
+      histogram_quantile(0.99, sum by (job, le) (rate(thanos_bucket_store_series_gate_duration_seconds_bucket{job=~"thanos-store.*"}[5m]))) > 2
     and
       sum by (job) (rate(thanos_bucket_store_series_gate_duration_seconds_count{job=~"thanos-store.*"}[5m])) > 0
     )
@@ -268,7 +268,7 @@ rules:
     summary: Thanos Store is having high latency for bucket operations.
   expr: |
     (
-      histogram_quantile(0.9, sum by (job, le) (rate(thanos_objstore_bucket_operation_duration_seconds_bucket{job=~"thanos-store.*"}[5m]))) > 2
+      histogram_quantile(0.99, sum by (job, le) (rate(thanos_objstore_bucket_operation_duration_seconds_bucket{job=~"thanos-store.*"}[5m]))) > 2
     and
       sum by (job) (rate(thanos_objstore_bucket_operation_duration_seconds_count{job=~"thanos-store.*"}[5m])) > 0
     )
@@ -374,9 +374,9 @@ rules:
     summary: Thanos Query is having high number of DNS failures.
   expr: |
     (
-      sum by (job) (rate(thanos_querier_store_apis_dns_failures_total{job=~"thanos-query.*"}[5m]))
+      sum by (job) (rate(thanos_query_store_apis_dns_failures_total{job=~"thanos-query.*"}[5m]))
     /
-      sum by (job) (rate(thanos_querier_store_apis_dns_lookups_total{job=~"thanos-query.*"}[5m]))
+      sum by (job) (rate(thanos_query_store_apis_dns_lookups_total{job=~"thanos-query.*"}[5m]))
     ) * 100 > 1
   for: 15m
   labels:
@@ -558,7 +558,7 @@ rules:
     summary: Thanos Replicate has a high latency for replicate operations.
   expr: |
     (
-      histogram_quantile(0.9, sum by (job, le) (rate(thanos_replicate_replication_run_duration_seconds_bucket{job=~"thanos-bucket-replicate.*"}[5m]))) > 20
+      histogram_quantile(0.99, sum by (job, le) (rate(thanos_replicate_replication_run_duration_seconds_bucket{job=~"thanos-bucket-replicate.*"}[5m]))) > 20
     and
       sum by (job) (rate(thanos_replicate_replication_run_duration_seconds_bucket{job=~"thanos-bucket-replicate.*"}[5m])) > 0
     )
@@ -575,6 +575,15 @@ rules:
 ```yaml
 name: thanos-component-absent.rules
 rules:
+- alert: ThanosBucketReplicateIsDown
+  annotations:
+    description: ThanosBucketReplicate has disappeared from Prometheus target discovery.
+    summary: thanos component has disappeared from Prometheus target discovery.
+  expr: |
+    absent(up{job=~"thanos-bucket-replicate.*"} == 1)
+  for: 5m
+  labels:
+    severity: critical
 - alert: ThanosCompactIsDown
   annotations:
     description: ThanosCompact has disappeared from Prometheus target discovery.

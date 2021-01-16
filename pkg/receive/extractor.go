@@ -29,7 +29,7 @@ func ParseExtractorConfig(content []byte, logger log.Logger) ExtractorConfig {
 }
 
 // getExtLabels returns subset of external_labels from all labels
-func getExtLabels(all []labelpb.Label, extLabels []string) (res labels.Labels) {
+func getExtLabels(all []labelpb.ZLabel, extLabels []string) (res labels.Labels) {
 	for _, l := range all {
 		// https://www.darkcoding.net/software/go-slice-search-vs-map-lookup/ slice lookup is faster than map for len()<5
 		for _, e := range extLabels {
