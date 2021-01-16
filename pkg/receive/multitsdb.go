@@ -5,10 +5,12 @@ package receive
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sync"
 
 	"github.com/go-kit/kit/log"
@@ -260,7 +262,7 @@ func (t *MultiTSDB) TSDBStores() map[string]storepb.StoreServer {
 
 func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant, extLabels labels.Labels) error {
 	reg := prometheus.WrapRegistererWith(prometheus.Labels{"tenant": tenantID}, t.reg)
-	lbls := append(t.labels, append(extLabels, labels.Label{Name: t.tenantLabelName, Value: tenantID})... )
+	lbls := append(t.labels, append(extLabels, labels.Label{Name: t.tenantLabelName, Value: tenantID})...)
 	dataDir := t.defaultTenantDataDir(tenantID)
 
 	level.Info(logger).Log("extLabels", lbls, "msg", "opening TSDB")
@@ -271,7 +273,21 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 		&UnRegisterer{Registerer: reg},
 		&opts,
 	)
+	// check if error relates to mmap
 	if err != nil {
+		errText := fmt.Sprintf("%+v", err)
+		level.Error(t.logger).Log("msg", errText, "startTSDB", "error")
+		r := *regexp.MustCompile(`mmap files, file: ([^:]+): mmap`)
+		res := r.FindStringSubmatch(errText)
+		if len(res) > 0 {
+			level.Error(t.logger).Log("msg", fmt.Sprintf("drop mmap data: %s", res[1]))
+			_ = os.Remove(res[1])
+			_ = os.Remove(path.Join(dataDir, "lock"))
+			s, err = tsdb.Open(dataDir, logger, &UnRegisterer{Registerer: reg}, &opts)
+		}
+	}
+	if err != nil {
+		level.Error(t.logger).Log("msg", err, "startTSDB", "error2")
 		t.mtx.Lock()
 		delete(t.tenants, tenantID)
 		t.mtx.Unlock()
