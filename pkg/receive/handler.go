@@ -315,13 +315,12 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 		if len(wreq.Timeseries) == 0 {
 			// Empty request with no timeseries
 			return
-		} else {
-			// All metrics from same src should have same external_labels
-			for _, l := range wreq.Timeseries[0].Labels {
-				if l.Name == h.options.Writer.tenantLabelName {
-					tenant = l.Value
-					break
-				}
+		}
+		// All metrics from same src should have same external_labels
+		for _, l := range wreq.Timeseries[0].Labels {
+			if l.Name == h.options.Writer.tenantLabelName {
+				tenant = zLabelToLabel(l).Value
+				break
 			}
 		}
 	} else {

@@ -34,7 +34,7 @@ func getExtLabels(all []labelpb.ZLabel, extLabels []string) (res labels.Labels) 
 		// https://www.darkcoding.net/software/go-slice-search-vs-map-lookup/ slice lookup is faster than map for len()<5
 		for _, e := range extLabels {
 			if l.Name == e {
-				res = append(res, labels.Label(l))
+				res = append(res, zLabelToLabel(l))
 			}
 		}
 	}
@@ -49,4 +49,13 @@ func sliceContains(a []string, x string) bool {
 		}
 	}
 	return false
+}
+
+// copy ZLabel to make protobuf deallocatable
+func zLabelToLabel(z labelpb.ZLabel) labels.Label {
+	var n = make([]byte, len(z.Name))
+	var v = make([]byte, len(z.Value))
+	copy(n, z.Name)
+	copy(v, z.Value)
+	return labels.Label{Name: string(n), Value: string(v)}
 }

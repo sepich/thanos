@@ -11,10 +11,10 @@ arch = $(shell uname -m)
 # Update at 2020.07.06
 ifeq ($(arch), x86_64)
     # amd64
-    SHA="fca3819d670cdaee0d785499fda202ea01c0640ca0803d26ae6dbf2a1c8c041c"
+    SHA="248b7ec76e03e6b4fbb796fc3cdd2f91dad45546a6d7dee61c322475e0e8a08f"
 else ifeq ($(arch), armv8)
     # arm64
-    SHA="5478a46f1eb37ebe414c399766f8088bc8353345602053485dd429b9a87097e5"
+    SHA="69508e8fdc516eacbacc0379c03c971e3043706cc8211e6bddb35d903edc3628"
 else
     echo >&2 "only support amd64 or arm64 arch" && exit 1
 endif
