@@ -267,6 +267,7 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 
 	level.Info(logger).Log("extLabels", lbls, "msg", "opening TSDB")
 	opts := *t.tsdbOpts
+	opts.AllowOverlappingBlocks = true
 	s, err := tsdb.Open(
 		dataDir,
 		logger,
