@@ -45,12 +45,3 @@ func sliceContains(a []string, x string) bool {
 	}
 	return false
 }
-
-// copy ZLabel to make protobuf deallocatable
-func zLabelToLabel(z labelpb.ZLabel) labels.Label {
-	var n = make([]byte, len(z.Name))
-	var v = make([]byte, len(z.Value))
-	copy(n, z.Name)
-	copy(v, z.Value)
-	return labels.Label{Name: string(n), Value: string(v)}
-}

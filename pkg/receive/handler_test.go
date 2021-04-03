@@ -210,7 +210,7 @@ func newTestHandlerHashring(appendables []*fakeAppendable, replicationFactor uin
 			ReplicaHeader:     DefaultReplicaHeader,
 			ReplicationFactor: replicationFactor,
 			ForwardTimeout:    5 * time.Second,
-			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i]), false, DefaultTenantLabel,  map[string]struct{}{}),
+			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i]), false, DefaultTenantLabel, []byte{}),
 		})
 		handlers = append(handlers, h)
 		h.peers = peers
@@ -1294,8 +1294,8 @@ type tsOverrideTenantStorage struct {
 	interval int64
 }
 
-func (s *tsOverrideTenantStorage) TenantAppendable(tenant string) (Appendable, error) {
-	a, err := s.TenantStorage.TenantAppendable(tenant)
+func (s *tsOverrideTenantStorage) TenantAppendable(tenant string, extLabels labels.Labels) (Appendable, error) {
+	a, err := s.TenantStorage.TenantAppendable(tenant, extLabels)
 	return &tsOverrideAppendable{Appendable: a, interval: s.interval}, err
 }
 
@@ -1372,7 +1372,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 		metadata.NoneFunc,
 	)
 	defer func() { testutil.Ok(b, m.Close()) }()
-	handler.writer = NewWriter(logger, m)
+	handler.writer = NewWriter(logger, m, false, DefaultTenantLabel, []byte{})
 
 	testutil.Ok(b, m.Flush())
 	testutil.Ok(b, m.Open())
@@ -1434,7 +1434,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 
 			// It takes time to create new tenant, wait for it.
 			{
-				app, err := m.TenantAppendable(handler.options.DefaultTenantID)
+				app, err := m.TenantAppendable(handler.options.DefaultTenantID, labels.Labels{})
 				testutil.Ok(b, err)
 
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1461,7 +1461,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 
 			// It takes time to create new tenant, wait for it.
 			{
-				app, err := m.TenantAppendable(handler.options.DefaultTenantID)
+				app, err := m.TenantAppendable(handler.options.DefaultTenantID, labels.Labels{})
 				testutil.Ok(b, err)
 
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1507,4 +1507,135 @@ func Heap(dir string) (err error) {
 	}
 	defer runutil.CloseWithErrCapture(&err, f, "close")
 	return pprof.WriteHeapProfile(f)
+}
+
+func TestExtractLabels(t *testing.T) {
+	wreq1 := &prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []labelpb.ZLabel{},
+				Samples: []prompb.Sample{
+					{Value: 1, Timestamp: 1},
+					{Value: 2, Timestamp: 2},
+					{Value: 3, Timestamp: 3},
+				},
+			},
+		},
+	}
+	for _, tc := range []struct {
+		name         string
+		sentLabels   []labelpb.ZLabel
+		lookupLabels labels.Labels
+		found        bool
+	}{
+		{
+			name:         "basic",
+			sentLabels:   []labelpb.ZLabel{{Name: "foo", Value: "bar"}},
+			lookupLabels: labels.Labels{{Name: "foo", Value: "bar"}},
+			found:        true,
+		},
+		{
+			name: "with ext-lables",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "site", Value: "dev"},
+				{Name: "location", Value: "dc1"},
+			},
+			lookupLabels: labels.Labels{{Name: "foo", Value: "bar"}},
+			found:        true,
+		},
+		{
+			name: "with ext-lables",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "prometheus", Value: "dev"},
+				{Name: "location", Value: "dc1"},
+			},
+			lookupLabels: labels.Labels{{Name: "location", Value: "dc1"}},
+			found:        false,
+		},
+		{
+			name: "with ext-lables",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "site", Value: "dev"},
+				{Name: "location", Value: "dc1"},
+			},
+			lookupLabels: labels.Labels{{Name: "foo", Value: "bar"}, {Name: "site", Value: "dev"}},
+			found:        false,
+		},
+		{
+			name: "with tenant-id",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "prometheus", Value: "dev"},
+				{Name: "baz", Value: "b1"},
+			},
+			lookupLabels: labels.Labels{{Name: "baz", Value: "b1"}, {Name: "foo", Value: "bar"}},
+			found:        true,
+		},
+		{
+			name: "with tenant-id negate",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "prometheus", Value: "dev"},
+				{Name: "baz", Value: "b1"},
+			},
+			lookupLabels: labels.Labels{{Name: "prometheus", Value: "dev"}},
+			found:        false,
+		},
+		{
+			name: "extra tenant-id",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "prometheus", Value: "extra"},
+				{Name: "location", Value: "dc1"},
+			},
+			lookupLabels: labels.Labels{{Name: "foo", Value: "bar"}, {Name: "location", Value: "dc1"}},
+			found:        true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tenant := "test"
+			cfg := []HashringConfig{{Hashring: "test"}}
+			appender := fakeAppendable{appender: newFakeAppender(nil, nil, nil, nil)}
+			peers := &peerGroup{
+				dialOpts: nil,
+				m:        sync.RWMutex{},
+				cache:    map[string]storepb.WriteableStoreClient{},
+				dialer: func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error) {
+					return nil, errors.New("unexpected dial called in testing")
+				},
+			}
+			h := NewHandler(nil, &Options{
+				TenantHeader:      DefaultTenantHeader,
+				ReplicaHeader:     DefaultReplicaHeader,
+				ReplicationFactor: 1,
+				ForwardTimeout:    5 * time.Second,
+				Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(&appender), true, "prometheus", []byte("defaultExternalLabels: [site, location]\ntenantExternalLabels: {extra: [site]}")),
+			})
+			h.peers = peers
+			addr := randomAddr()
+			h.options.Endpoint = addr
+			peers.cache[addr] = &fakeRemoteWriteGRPCServer{h: h}
+			cfg[0].Endpoints = append(cfg[0].Endpoints, h.options.Endpoint)
+			hashring := newMultiHashring(cfg)
+			h.Hashring(hashring)
+			wreq1.Timeseries[0].Labels = tc.sentLabels
+
+			rec, err := makeRequest(h, tenant, wreq1)
+			if err != nil {
+				t.Fatalf("handler unexpectedly failed making HTTP request: %v", err)
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("handler got unexpected HTTP status code: %d; body: %s", rec.Code, rec.Body.String())
+			}
+
+			n := appender.appender.(*fakeAppender).Get(tc.lookupLabels)
+			if len(n) == 3 != tc.found {
+				t.Errorf("Labels: %v found: %v, expected: %v", tc.lookupLabels, len(n) == 3, tc.found)
+			}
+
+		})
+	}
 }

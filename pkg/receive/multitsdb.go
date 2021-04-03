@@ -379,20 +379,14 @@ func (t *MultiTSDB) TenantAppendable(tenantID string, extLabels labels.Labels) (
 func (t *MultiTSDB) loadExtLabels(dir string) (extLabels labels.Labels, err error) {
 	m, err := metadata.ReadFromDir(dir)
 	if err == nil {
-		for k, v := range m.Thanos.Labels {
-			extLabels = labelpb.ExtendSortedLabels(extLabels, labels.FromStrings(k, v))
-		}
+		extLabels = labelpb.ExtendSortedLabels(extLabels, labels.FromMap(m.Thanos.Labels))
 	}
 	return extLabels, err
 }
 
 // saveExtLabels saves Labels provided to dir/meta.json
 func (t *MultiTSDB) saveExtLabels(dir string, extLabels labels.Labels) error {
-	lbls := make(map[string]string, len(extLabels))
-	for _, i := range extLabels {
-		lbls[i.Name] = i.Value
-	}
-	meta := metadata.Meta{Thanos: metadata.Thanos{Labels: lbls}, BlockMeta: tsdb.BlockMeta{Version: 1}}
+	meta := metadata.Meta{Thanos: metadata.Thanos{Labels: extLabels.Map()}, BlockMeta: tsdb.BlockMeta{Version: 1}}
 	return meta.WriteToDir(t.logger, dir)
 }
 

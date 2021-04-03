@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"io/ioutil"
 	stdlog "log"
 	"net"
@@ -315,10 +316,11 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 			// Empty request with no timeseries
 			return
 		}
+		labelpb.ReAllocZLabelsStrings(&wreq.Timeseries[0].Labels)
 		// All metrics from same src should have same external_labels
 		for _, l := range wreq.Timeseries[0].Labels {
 			if l.Name == h.options.Writer.tenantLabelName {
-				tenant = zLabelToLabel(l).Value
+				tenant = l.Value
 				break
 			}
 		}
