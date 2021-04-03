@@ -2,6 +2,7 @@ package receive
 
 import (
 	"os"
+	"sort"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -30,15 +31,9 @@ func ParseExtractorConfig(content []byte, logger log.Logger) ExtractorConfig {
 
 // getExtLabels returns subset of external_labels from all labels
 func getExtLabels(all []labelpb.ZLabel, extLabels []string) (res labels.Labels) {
-	for _, l := range all {
-		// https://www.darkcoding.net/software/go-slice-search-vs-map-lookup/ slice lookup is faster than map for len()<5
-		for _, e := range extLabels {
-			if l.Name == e {
-				res = append(res, zLabelToLabel(l))
-			}
-		}
-	}
-	return res
+	lset := labelpb.ZLabelsToPromLabels(labelpb.DeepCopy(all))
+	sort.Strings(extLabels)
+	return lset.WithLabels(extLabels...)
 }
 
 // sliceContains returns true if strings contain the string

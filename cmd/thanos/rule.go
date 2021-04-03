@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -60,7 +61,7 @@ import (
 // registerRule registers a rule command.
 func registerRule(app *extkingpin.App) {
 	comp := component.Rule
-	cmd := app.Command(comp.String(), "ruler evaluating Prometheus rules against given Query nodes, exposing Store API and storing old blocks in bucket")
+	cmd := app.Command(comp.String(), "Ruler evaluating Prometheus rules against given Query nodes, exposing Store API and storing old blocks in bucket.")
 
 	httpBindAddr, httpGracePeriod := extkingpin.RegisterHTTPFlags(cmd)
 	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := extkingpin.RegisterGRPCFlags(cmd)
@@ -127,6 +128,9 @@ func registerRule(app *extkingpin.App) {
 			"This can trigger compaction without those blocks and as a result will create an overlap situation. Set it to true if you have vertical compaction enabled and wish to upload blocks as soon as possible without caring"+
 			"about order.").
 		Default("false").Hidden().Bool()
+
+	hashFunc := cmd.Flag("hash-func", "Specify which hash function to use when calculating the hashes of produced files. If no function has been specified, it does not happen. This permits avoiding downloading some files twice albeit at some performance cost. Possible values are: \"\", \"SHA256\".").
+		Default("").Enum("SHA256", "")
 
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, reload <-chan struct{}, _ bool) error {
 		lset, err := parseFlagLabels(*labelStrs)
@@ -215,6 +219,7 @@ func registerRule(app *extkingpin.App) {
 			*allowOutOfOrderUpload,
 			*httpMethod,
 			getFlagsMap(cmd.Flags()),
+			metadata.HashFunc(*hashFunc),
 		)
 	})
 }
@@ -305,6 +310,7 @@ func runRule(
 	allowOutOfOrderUpload bool,
 	httpMethod string,
 	flagsMap map[string]string,
+	hashFunc metadata.HashFunc,
 ) error {
 	metrics := newRuleMetrics(reg)
 
@@ -547,7 +553,7 @@ func runRule(
 
 	// Start gRPC server.
 	{
-		tsdbStore := store.NewTSDBStore(logger, reg, db, component.Rule, lset)
+		tsdbStore := store.NewTSDBStore(logger, db, component.Rule, lset)
 
 		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcCert, grpcKey, grpcClientCA)
 		if err != nil {
@@ -646,7 +652,7 @@ func runRule(
 			}
 		}()
 
-		s := shipper.New(logger, reg, dataDir, bkt, func() labels.Labels { return lset }, metadata.RulerSource, false, allowOutOfOrderUpload)
+		s := shipper.New(logger, reg, dataDir, bkt, func() labels.Labels { return lset }, metadata.RulerSource, false, allowOutOfOrderUpload, hashFunc)
 
 		ctx, cancel := context.WithCancel(context.Background())
 
@@ -701,6 +707,7 @@ func parseFlagLabels(s []string) (labels.Labels, error) {
 		}
 		lset = append(lset, labels.Label{Name: parts[0], Value: val})
 	}
+	sort.Sort(lset)
 	return lset, nil
 }
 
@@ -719,7 +726,7 @@ func removeDuplicateQueryEndpoints(logger log.Logger, duplicatedQueriers prometh
 	deduplicated := make([]*url.URL, 0, len(urls))
 	for _, u := range urls {
 		if _, ok := set[u.String()]; ok {
-			level.Warn(logger).Log("msg", "duplicate query address is provided - %v", u.String())
+			level.Warn(logger).Log("msg", "duplicate query address is provided", "addr", u.String())
 			duplicatedQueriers.Inc()
 			continue
 		}

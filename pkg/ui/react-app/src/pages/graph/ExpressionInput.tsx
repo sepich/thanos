@@ -14,7 +14,7 @@ interface ExpressionInputProps {
   autocompleteSections: { [key: string]: string[] };
   executeQuery: () => void;
   loading: boolean;
-  enableMetricAutocomplete: boolean;
+  enableAutocomplete: boolean;
 }
 
 interface ExpressionInputState {
@@ -45,9 +45,9 @@ class ExpressionInput extends Component<ExpressionInputProps, ExpressionInputSta
     this.setValue(this.exprInputRef.current!.value);
   };
 
-  setValue = (value: string) => {
+  setValue = (value: string | null) => {
     const { onExpressionChange } = this.props;
-    onExpressionChange(value);
+    onExpressionChange(value as string);
     this.setState({ height: 'auto' }, this.setHeight);
   };
 
@@ -78,7 +78,7 @@ class ExpressionInput extends Component<ExpressionInputProps, ExpressionInputSta
     const { autocompleteSections } = this.props;
     let index = 0;
     const sections =
-      inputValue!.length && this.props.enableMetricAutocomplete
+      inputValue!.length && this.props.enableAutocomplete
         ? Object.entries(autocompleteSections).reduce((acc, [title, items]) => {
             const matches = this.getSearchMatches(inputValue!, items);
             return !matches.length
@@ -130,7 +130,7 @@ class ExpressionInput extends Component<ExpressionInputProps, ExpressionInputSta
     const { height } = this.state;
     return (
       <Downshift onSelect={this.setValue}>
-        {downshift => (
+        {(downshift) => (
           <div>
             <InputGroup className="expression-input">
               <InputGroupAddon addonType="prepend">

@@ -81,6 +81,7 @@ type Shipper struct {
 
 	uploadCompacted        bool
 	allowOutOfOrderUploads bool
+	hashFunc               metadata.HashFunc
 }
 
 // New creates a new shipper that detects new TSDB blocks in dir and uploads them to
@@ -95,6 +96,7 @@ func New(
 	source metadata.SourceType,
 	uploadCompacted bool,
 	allowOutOfOrderUploads bool,
+	hashFunc metadata.HashFunc,
 ) *Shipper {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -112,6 +114,7 @@ func New(
 		source:                 source,
 		allowOutOfOrderUploads: allowOutOfOrderUploads,
 		uploadCompacted:        uploadCompacted,
+		hashFunc:               hashFunc,
 	}
 }
 
@@ -363,7 +366,7 @@ func (s *Shipper) upload(ctx context.Context, meta *metadata.Meta) error {
 	if err := meta.WriteToDir(s.logger, updir); err != nil {
 		return errors.Wrap(err, "write meta file")
 	}
-	return block.Upload(ctx, s.logger, s.bucket, updir)
+	return block.Upload(ctx, s.logger, s.bucket, updir, s.hashFunc)
 }
 
 // blockMetasFromOldest returns the block meta of each block found in dir
@@ -390,7 +393,7 @@ func (s *Shipper) blockMetasFromOldest() (metas []*metadata.Meta, _ error) {
 		if !fi.IsDir() {
 			continue
 		}
-		m, err := metadata.Read(dir)
+		m, err := metadata.ReadFromDir(dir)
 		if err != nil {
 			return nil, errors.Wrapf(err, "read metadata for block %v", dir)
 		}

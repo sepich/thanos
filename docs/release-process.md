@@ -20,7 +20,7 @@ into being within release (except bug fixes).
 
 No feature should block release.
 
-Additionally we (obviously) aim for `master` branch being stable.
+Additionally we (obviously) aim for `main` branch being stable.
 
 We are assigning a release shepherd for each minor release.
 
@@ -31,8 +31,11 @@ Release shepherd responsibilities:
 
 | Release   | Time of first RC         | Shepherd (GitHub handle) |
 |-----------|--------------------------|--------------------------|
-| v0.17.0   | (planned) 2020.11.04     | `@metalmatze`            |
-| v0.16.0   | (planned) 2020.09.23     | `@bwplotka`              |
+| v0.20.0   | (planned) 2021.03.31     | `@kakkoyun`              |
+| v0.19.0   | (planned) 2021.02.17     | `@bwplotka`              |
+| v0.18.0   | 2021.01.06               | `@squat`                 |
+| v0.17.0   | 2020.11.18               | `@metalmatze`            |
+| v0.16.0   | 2020.10.26               | `@bwplotka`              |
 | v0.15.0   | 2020.08.12               | `@kakkoyun`              |
 | v0.14.0   | 2020.07.10               | `@kakkoyun`              |
 | v0.13.0   | 2020.05.13               | `@bwplotka`              |
@@ -51,7 +54,7 @@ Process of releasing a *minor* Thanos version:
 1. Release `v<major>.<minor+1>.0-rc.0`
 1. If after 3 work days there is no major bug, release `v<major>.<minor>.0`
 1. If within 3 work days there is major bug, let's triage it to fix it and then release `v<major>.<minor>.0-rc.++` Go to step 2.
-1. Do patch release if needed for any bugs afterwards. Use same `release-xxx` branch and migrate fixes to master.
+1. Do patch release if needed for any bugs afterwards. Use same `release-xxx` branch and migrate fixes to main.
 
 ## How to release a version
 
@@ -67,7 +70,7 @@ Release is happening on separate `release-<major>.<minor>` branch.
 
   For release candidate just reuse same branch and rebase it on every candidate until the actual release happens.
 
-1. Create small PR to master (!) to cut CHANGELOG. This helps to maintain new changelog on master. For example: https://github.com/thanos-io/thanos/pull/2627
+1. Create small PR to main (!) to cut CHANGELOG. This helps to maintain new changelog on main. For example: https://github.com/thanos-io/thanos/pull/2627
 
 1. Update [CHANGELOG file](/CHANGELOG.md)
 
@@ -86,6 +89,8 @@ Release is happening on separate `release-<major>.<minor>` branch.
 
     1. Note any changes in the changelog
     1. If there were any changes then update the relevant alerting rules and/or dashboards since `thanos-mixin` is part of the repository now
+
+1. Update website's [hugo.yaml](../website/hugo.yaml) to have correct links for new release (add `0.y.z: "/:sections/:filename.md"`).
 
 1. Update tutorials:
 
@@ -116,7 +121,7 @@ Release is happening on separate `release-<major>.<minor>` branch.
 
  1. Announce `#thanos` slack channel.
 
- 1. Pull commits from release branch to master branch for non `rc` releases.
+ 1. Pull commits from release branch to main branch for non `rc` releases.
 
 ## Pre-releases (release candidates)
 

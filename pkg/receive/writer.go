@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 
 	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
@@ -74,13 +75,18 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 
 	var errs errutil.MultiError
 	for _, t := range wreq.Timeseries {
+		// Copy labels so we allocate memory only for labels, nothing else.
+		labelpb.ReAllocZLabelsStrings(&t.Labels)
+
+		// TODO(bwplotka): Use improvement https://github.com/prometheus/prometheus/pull/8600, so we do that only when
+		// we need it (when we store labels for longer).
 		lset := make(labels.Labels, 0, len(t.Labels))
-		for j := range t.Labels {
-			if r.tenantExtract && (t.Labels[j].Name == r.tenantLabelName || sliceContains(eset, t.Labels[j].Name)) {
-				// drop tenant-label and external_labels from metrics labels
-				continue
+		for _, l := range labelpb.ZLabelsToPromLabels(t.Labels) {
+			if r.tenantExtract && (l.Name == r.tenantLabelName || sliceContains(eset, l.Name)) {
+		    	// drop tenant-label and external_labels from metrics labels
+			    continue
 			}
-			lset = append(lset, labels.Label(t.Labels[j]))
+			lset = labelpb.ExtendSortedLabels(lset, labels.New(l))
 		}
 
 		// Append as many valid samples as possible, but keep track of the errors.

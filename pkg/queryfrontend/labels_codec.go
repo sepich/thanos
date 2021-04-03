@@ -84,11 +84,8 @@ func (c labelsCodec) MergeResponse(responses ...queryrange.Response) (queryrange
 			Data:   lbls,
 		}, nil
 	case *ThanosSeriesResponse:
-		if len(responses) == 1 {
-			return responses[0], nil
-		}
-
 		seriesData := make(labelpb.ZLabelSets, 0)
+
 		uniqueSeries := make(map[string]struct{})
 		for _, res := range responses {
 			for _, series := range res.(*ThanosSeriesResponse).Data {
@@ -146,8 +143,7 @@ func (c labelsCodec) EncodeRequest(ctx context.Context, r queryrange.Request) (*
 			params[queryv1.StoreMatcherParam] = matchersToStringSlice(thanosReq.StoreMatchers)
 		}
 
-		// If label is not empty, then it is a label values query.
-		if thanosReq.Label != "" {
+		if strings.Contains(thanosReq.Path, "/api/v1/label/") {
 			u := &url.URL{
 				Path:     thanosReq.Path,
 				RawQuery: params.Encode(),

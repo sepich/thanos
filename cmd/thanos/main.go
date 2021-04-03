@@ -38,7 +38,7 @@ func main() {
 		runtime.SetBlockProfileRate(10)
 	}
 
-	app := extkingpin.NewApp(kingpin.New(filepath.Base(os.Args[0]), "A block storage based long-term storage for Prometheus").Version(version.Print("thanos")))
+	app := extkingpin.NewApp(kingpin.New(filepath.Base(os.Args[0]), "A block storage based long-term storage for Prometheus.").Version(version.Print("thanos")))
 	debugName := app.Flag("debug.name", "Name to add as prefix to log lines.").Hidden().String()
 	logLevel := app.Flag("log.level", "Log filtering level.").
 		Default("info").Enum("error", "warn", "info", "debug")
@@ -95,7 +95,6 @@ func main() {
 		}
 
 		if len(confContentYaml) == 0 {
-			level.Info(logger).Log("msg", "Tracing will be disabled")
 			tracer = client.NoopTracer()
 		} else {
 			tracer, closer, err = client.NewTracer(ctx, logger, metrics, confContentYaml)
