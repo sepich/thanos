@@ -407,6 +407,7 @@ func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *p
 
 // writeQuorum returns minimum number of replicas that has to confirm write success before claiming replication success.
 func (h *Handler) writeQuorum() int {
+	// special case for 2 replicas: to be available when one replica down (#3194)
 	if h.options.ReplicationFactor == 2 {
 		return 1
 	}
