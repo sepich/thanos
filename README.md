@@ -4,8 +4,7 @@ This is a fork of [Thanos](https://github.com/thanos-io/thanos) with some patche
  - Receive: fix for broken mmap file startup error
  - Receive: fix for compaction failed due to `invalid block sequence: block time ranges overlap` 
 
-Compiled images available at: https://hub.docker.com/repository/docker/sepa/thanos/tags  
-Please note that due to [#3726](https://github.com/thanos-io/thanos/issues/3726) only `v0.16.0` image is recommended now for high load `receive`. It has all the patches above. You can run vanilla thanos `v0.18.0` for the rest of components.
+Compiled images available at: https://hub.docker.com/repository/docker/sepa/thanos/tags
 
 ## Why Extract Tenants from Metrics?
 
@@ -182,5 +181,5 @@ metric{env="dev", instance="b"} 1
 metric{instance="c"} 1
 ```
 
-So, now you can push metrics via both "`sidecar`>S3", and "`remote_write`>`receive`" for better availablity. These metrics would be correctly deduplicated on S3 side. And produced blobs-per-tenant are better suited for `store` sharding.   
+So, now you can push metrics via both "`sidecar`>S3", and "`remote_write`>`receive`" for better availability. These metrics would be correctly deduplicated on S3 side. And produced blobs-per-tenant are better suited for `store` sharding.   
 Obviously this only makes sense in trusted environments, where you control both Thanos and Prometheus sides.
