@@ -83,10 +83,10 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		lset := make(labels.Labels, 0, len(t.Labels))
 		for _, l := range labelpb.ZLabelsToPromLabels(t.Labels) {
 			if r.tenantExtract && (l.Name == r.tenantLabelName || sliceContains(eset, l.Name)) {
-		    	// drop tenant-label and external_labels from metrics labels
-			    continue
+				// drop tenant-label and external_labels from metrics labels
+				continue
 			}
-			lset = labelpb.ExtendSortedLabels(lset, labels.New(l))
+			lset = append(lset, l)
 		}
 
 		// Append as many valid samples as possible, but keep track of the errors.
@@ -113,7 +113,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		errs.Add(errors.Wrapf(storage.ErrOutOfOrderSample, "failed to non-fast add %d samples", numOutOfOrder))
 	}
 	if numDuplicates > 0 {
-		level.Warn(r.logger).Log("msg", "Error on ingesting samples with different value but same timestamp", "num_dropped", numDuplicates)
+		level.Debug(r.logger).Log("msg", "Error on ingesting samples with different value but same timestamp", "num_dropped", numDuplicates)
 		errs.Add(errors.Wrapf(storage.ErrDuplicateSampleForTimestamp, "failed to non-fast add %d samples", numDuplicates))
 	}
 	if numOutOfBounds > 0 {
