@@ -31,7 +31,7 @@ In general about 1MB of local disk space is required per TSDB block stored in th
 ```$
 usage: thanos store [<flags>]
 
-store node giving access to blocks in a bucket provider. Now supported GCS, S3,
+Store node giving access to blocks in a bucket provider. Now supported GCS, S3,
 Azure, Swift, Tencent COS and Aliyun OSS.
 
 Flags:
@@ -122,6 +122,9 @@ Flags:
       --block-sync-concurrency=20
                                  Number of goroutines to use when constructing
                                  index-cache.json blocks from object storage.
+      --block-meta-fetch-concurrency=32
+                                 Number of goroutines to use when fetching block
+                                 metadata from object storage.
       --min-time=0000-01-01T00:00:00Z
                                  Start of time range limit to serve. Thanos
                                  Store will serve only metrics, which happened
@@ -295,7 +298,7 @@ While the remaining settings are **optional**:
 
 Thanos Store Gateway supports a "caching bucket" with [chunks](../design.md/#chunk) and metadata caching to speed up loading of [chunks](../design.md/#chunk) from TSDB blocks. To configure caching, one needs to use `--store.caching-bucket.config=<yaml content>` or `--store.caching-bucket.config-file=<file.yaml>`.
 
-Currently only memcached "backend" is supported:
+Both memcached and in-memory cache "backend"s are supported:
 
 ```yaml
 type: MEMCACHED # Case-insensitive
@@ -331,7 +334,9 @@ Following options are used for metadata caching (meta.json files, deletion mark 
 - `metafile_content_ttl`: how long to cache content of meta.json and deletion mark files.
 - `metafile_max_size`: maximum size of cached meta.json and deletion mark file. Larger files are not cached.
 
-Note that [chunks](../design.md/#chunk) and metadata cache is an experimental feature, and these fields may be renamed or removed completely in the future.
+The yml structure for setting the in memory cache configs for caching bucket are the same as the [in-memory index cache](https://thanos.io/tip/components/store.md/#in-memory-index-cache) and all the options to configure Caching Buket mentioned above can be used.
+
+Note that chunks and metadata cache is an experimental feature, and these fields may be renamed or removed completely in the future.
 
 ## Index Header
 
