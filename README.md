@@ -92,7 +92,7 @@ Better! Now we could use `store` sharding, but data still would not be compacted
 
 The patch adds new argument:
 ```
-$ docker run sepa/thanos:v0.17.2 receive -h
+$ docker run sepa/thanos:v0.20.1 receive -h
 ...
       --receive.tenant-label-name="tenant_id"
                                  Label name through which the tenant will be
