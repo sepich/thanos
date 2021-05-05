@@ -310,12 +310,14 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Exit early if the request contained no data.
+	if len(wreq.Timeseries) == 0 {
+		level.Info(h.logger).Log("msg", "empty timeseries from client")
+		return
+	}
+
 	var tenant string
 	if h.options.Writer.tenantExtract {
-		if len(wreq.Timeseries) == 0 {
-			// Empty request with no timeseries
-			return
-		}
 		labelpb.ReAllocZLabelsStrings(&wreq.Timeseries[0].Labels)
 		// All metrics from same src should have same external_labels
 		for _, l := range wreq.Timeseries[0].Labels {
@@ -329,12 +331,6 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(tenant) == 0 {
 		tenant = h.options.DefaultTenantID
-	}
-
-	// Exit early if the request contained no data.
-	if len(wreq.Timeseries) == 0 {
-		level.Info(h.logger).Log("msg", "empty timeseries from client", "tenant", tenant)
-		return
 	}
 
 	err = h.handleRequest(ctx, rep, tenant, &wreq)
