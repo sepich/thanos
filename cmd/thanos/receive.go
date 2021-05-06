@@ -14,6 +14,8 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	grpc_logging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/tags"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -25,6 +27,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
 	"github.com/thanos-io/thanos/pkg/extkingpin"
+	"github.com/thanos-io/thanos/pkg/logging"
 
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/extflag"
@@ -103,6 +106,8 @@ func registerReceive(app *extkingpin.App) {
 			"about order.").
 		Default("false").Hidden().Bool()
 
+	reqLogConfig := extkingpin.RegisterRequestLoggingFlags(cmd)
+
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		lset, err := parseFlagLabels(*labelStrs)
 		if err != nil {
@@ -111,6 +116,11 @@ func registerReceive(app *extkingpin.App) {
 
 		if len(lset) == 0 {
 			return errors.New("no external labels configured for receive, uniquely identifying external labels must be configured (ideally with `receive_` prefix); see https://thanos.io/tip/thanos/storage.md#external-labels for details.")
+		}
+
+		tagOpts, grpcLogOpts, err := logging.ParsegRPCOptions("", reqLogConfig)
+		if err != nil {
+			return errors.Wrap(err, "error while parsing config for request logging")
 		}
 
 		tsdbOpts := &tsdb.Options{
@@ -139,6 +149,7 @@ func registerReceive(app *extkingpin.App) {
 			logger,
 			reg,
 			tracer,
+			grpcLogOpts, tagOpts,
 			*grpcBindAddr,
 			time.Duration(*grpcGracePeriod),
 			*grpcCert,
@@ -182,6 +193,8 @@ func runReceive(
 	logger log.Logger,
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
+	grpcLogOpts []grpc_logging.Option,
+	tagOpts []tags.Option,
 	grpcBindAddr string,
 	grpcGracePeriod time.Duration,
 	grpcCert string,
@@ -223,7 +236,17 @@ func runReceive(
 	if err != nil {
 		return err
 	}
-	dialOpts, err := extgrpc.StoreClientGRPCOpts(logger, reg, tracer, grpcCert != "", rwClientCert, rwClientKey, rwClientServerCA, rwClientServerName)
+	dialOpts, err := extgrpc.StoreClientGRPCOpts(
+		logger,
+		reg,
+		tracer,
+		rwServerCert != "",
+		rwServerClientCA == "",
+		rwClientCert,
+		rwClientKey,
+		rwClientServerCA,
+		rwClientServerName,
+	)
 	if err != nil {
 		return err
 	}
@@ -503,7 +526,7 @@ func runReceive(
 					WriteableStoreServer: webHandler,
 				}
 
-				s = grpcserver.New(logger, &receive.UnRegisterer{Registerer: reg}, tracer, comp, grpcProbe,
+				s = grpcserver.New(logger, &receive.UnRegisterer{Registerer: reg}, tracer, grpcLogOpts, tagOpts, comp, grpcProbe,
 					grpcserver.WithServer(store.RegisterStoreServer(rw)),
 					grpcserver.WithServer(store.RegisterWritableStoreServer(rw)),
 					grpcserver.WithListen(grpcBindAddr),

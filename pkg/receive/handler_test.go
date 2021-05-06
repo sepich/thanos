@@ -26,6 +26,7 @@ import (
 	"github.com/golang/snappy"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
@@ -185,6 +186,108 @@ func TestDetermineWriteErrorCause(t *testing.T) {
 	}
 }
 
+type fakeTenantAppendable struct {
+	f *fakeAppendable
+}
+
+func newFakeTenantAppendable(f *fakeAppendable) *fakeTenantAppendable {
+	return &fakeTenantAppendable{f: f}
+}
+
+func (t *fakeTenantAppendable) TenantAppendable(_ string, extLabels labels.Labels) (Appendable, error) {
+	return t.f, nil
+}
+
+type fakeAppendable struct {
+	appender    storage.Appender
+	appenderErr func() error
+}
+
+var _ Appendable = &fakeAppendable{}
+
+func nilErrFn() error {
+	return nil
+}
+
+func (f *fakeAppendable) Appender(_ context.Context) (storage.Appender, error) {
+	errf := f.appenderErr
+	if errf == nil {
+		errf = nilErrFn
+	}
+	return f.appender, errf()
+}
+
+type fakeAppender struct {
+	sync.Mutex
+	samples     map[uint64][]prompb.Sample
+	exemplars   map[uint64][]exemplar.Exemplar
+	appendErr   func() error
+	commitErr   func() error
+	rollbackErr func() error
+}
+
+var _ storage.Appender = &fakeAppender{}
+var _ storage.GetRef = &fakeAppender{}
+
+func newFakeAppender(appendErr, commitErr, rollbackErr func() error) *fakeAppender { //nolint:unparam
+	if appendErr == nil {
+		appendErr = nilErrFn
+	}
+	if commitErr == nil {
+		commitErr = nilErrFn
+	}
+	if rollbackErr == nil {
+		rollbackErr = nilErrFn
+	}
+	return &fakeAppender{
+		samples:     make(map[uint64][]prompb.Sample),
+		appendErr:   appendErr,
+		commitErr:   commitErr,
+		rollbackErr: rollbackErr,
+	}
+}
+
+func (f *fakeAppender) Get(l labels.Labels) []prompb.Sample {
+	f.Lock()
+	defer f.Unlock()
+	s := f.samples[l.Hash()]
+	res := make([]prompb.Sample, len(s))
+	copy(res, s)
+	return res
+}
+
+func (f *fakeAppender) Append(ref uint64, l labels.Labels, t int64, v float64) (uint64, error) {
+	f.Lock()
+	defer f.Unlock()
+	if ref == 0 {
+		ref = l.Hash()
+	}
+	f.samples[ref] = append(f.samples[ref], prompb.Sample{Timestamp: t, Value: v})
+	return ref, f.appendErr()
+}
+
+func (f *fakeAppender) AppendExemplar(ref uint64, l labels.Labels, e exemplar.Exemplar) (uint64, error) {
+	f.Lock()
+	defer f.Unlock()
+	if ref == 0 {
+		ref = l.Hash()
+	}
+	f.exemplars[ref] = append(f.exemplars[ref], e)
+	return ref, f.appendErr()
+}
+
+func (f *fakeAppender) GetRef(l labels.Labels) (uint64, labels.Labels) {
+	return l.Hash(), l
+}
+
+func (f *fakeAppender) Commit() error {
+	return f.commitErr()
+}
+
+func (f *fakeAppender) Rollback() error {
+	return f.rollbackErr()
+}
+
 func newTestHandlerHashring(appendables []*fakeAppendable, replicationFactor uint64) ([]*Handler, Hashring) {
 	var (
 		cfg      = []HashringConfig{{Hashring: "test"}}
@@ -270,7 +373,7 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -281,7 +384,7 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -292,7 +395,7 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 			},
 		},
@@ -303,10 +406,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -317,10 +420,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -331,10 +434,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -345,10 +448,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -359,11 +462,11 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 			},
@@ -375,10 +478,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 			},
 		},
@@ -389,10 +492,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 			},
 		},
@@ -403,10 +506,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -417,10 +520,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -431,10 +534,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 			},
 		},
@@ -445,10 +548,10 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -459,13 +562,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -476,13 +579,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -493,13 +596,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -510,13 +613,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -527,15 +630,15 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 			},
@@ -547,13 +650,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 			},
 		},
@@ -564,13 +667,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 			},
 		},
@@ -581,13 +684,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -598,13 +701,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -615,13 +718,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -632,13 +735,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -649,13 +752,13 @@ func TestReceiveQuorum(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -750,7 +853,7 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -761,7 +864,7 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -772,7 +875,7 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 			},
 		},
@@ -783,10 +886,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -797,10 +900,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -811,10 +914,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -825,10 +928,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -839,11 +942,11 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 			},
@@ -855,10 +958,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 			},
 		},
@@ -869,10 +972,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 			},
 		},
@@ -883,10 +986,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -897,10 +1000,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -911,10 +1014,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 			},
 		},
@@ -925,10 +1028,10 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -939,13 +1042,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -956,13 +1059,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -973,13 +1076,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -990,13 +1093,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -1007,15 +1110,15 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 				{
-					appender:    newFakeAppender(nil, nil, nil, nil),
+					appender:    newFakeAppender(nil, nil, nil),
 					appenderErr: appenderErrFn,
 				},
 			},
@@ -1027,13 +1130,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 			},
 		},
@@ -1044,13 +1147,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, commitErrFn, nil),
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
 				},
 			},
 		},
@@ -1061,13 +1164,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -1078,13 +1181,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -1095,13 +1198,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(conflictErrFn, nil, nil, nil),
+					appender: newFakeAppender(conflictErrFn, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -1112,13 +1215,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil, nil),
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -1129,13 +1232,13 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 			wreq:              wreq1,
 			appendables: []*fakeAppendable{
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, commitErrFn, nil),
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -1318,14 +1421,13 @@ type tsOverrideAppender struct {
 
 var cnt int64
 
-func (a *tsOverrideAppender) Add(l labels.Labels, _ int64, v float64) (uint64, error) {
+func (a *tsOverrideAppender) Append(ref uint64, l labels.Labels, _ int64, v float64) (uint64, error) {
 	cnt += a.interval
-	return a.Appender.Add(l, cnt, v)
+	return a.Appender.Append(ref, l, cnt, v)
 }
 
-func (a *tsOverrideAppender) AddFast(ref uint64, _ int64, v float64) error {
-	cnt += a.interval
-	return a.Appender.AddFast(ref, cnt, v)
+func (a *tsOverrideAppender) GetRef(lset labels.Labels) (uint64, labels.Labels) {
+	return a.Appender.(storage.GetRef).GetRef(lset)
 }
 
 // serializeSeriesWithOneSample returns marshaled and compressed remote write requests like it would
@@ -1484,7 +1586,10 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 				for i := 0; i < n; i++ {
 					r := httptest.NewRecorder()
 					handler.receiveHTTP(r, &http.Request{ContentLength: int64(len(tcase.writeRequest)), Body: ioutil.NopCloser(bytes.NewReader(tcase.writeRequest))})
-					testutil.Equals(b, http.StatusConflict, r.Code, "%v", i)
+					testutil.Equals(b, http.StatusConflict, r.Code, "%v-%s", i, func() string {
+						b, _ := ioutil.ReadAll(r.Body)
+						return string(b)
+					}())
 				}
 			})
 		})
@@ -1492,7 +1597,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 
 	runtime.GC()
 	// Take snapshot at the end to reveal how much memory we keep in TSDB.
-	testutil.Ok(b, Heap("../../"))
+	testutil.Ok(b, Heap("../../../_dev/thanos/2021/receive2"))
 
 }
 
@@ -1501,7 +1606,7 @@ func Heap(dir string) (err error) {
 		return err
 	}
 
-	f, err := os.Create(filepath.Join(dir, "mem.pprof"))
+	f, err := os.Create(filepath.Join(dir, "errimpr1-go1.16.3.pprof"))
 	if err != nil {
 		return err
 	}
@@ -1598,7 +1703,7 @@ func TestExtractLabels(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tenant := "test"
 			cfg := []HashringConfig{{Hashring: "test"}}
-			appender := fakeAppendable{appender: newFakeAppender(nil, nil, nil, nil)}
+			appender := fakeAppendable{appender: newFakeAppender(nil, nil, nil)}
 			peers := &peerGroup{
 				dialOpts: nil,
 				m:        sync.RWMutex{},

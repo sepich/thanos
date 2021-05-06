@@ -31,10 +31,12 @@ import (
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/thanos-io/thanos/pkg/exemplars/exemplarspb"
 	"github.com/thanos-io/thanos/pkg/metadata/metadatapb"
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/targets/targetspb"
 	"github.com/thanos-io/thanos/pkg/tracing"
 	"google.golang.org/grpc/codes"
 	yaml "gopkg.in/yaml.v2"
@@ -758,4 +760,43 @@ func (c *Client) MetricMetadataInGRPC(ctx context.Context, base *url.URL, metric
 		Data map[string][]metadatapb.Meta `json:"data"`
 	}
 	return v.Data, c.get2xxResultWithGRPCErrors(ctx, "/prom_metric_metadata HTTP[client]", &u, &v)
+}
+
+// ExemplarsInGRPC returns the exemplars from Prometheus exemplars API. It uses gRPC errors.
+// NOTE: This method is tested in pkg/store/prometheus_test.go against Prometheus.
+func (c *Client) ExemplarsInGRPC(ctx context.Context, base *url.URL, query string, startTime, endTime int64) ([]*exemplarspb.ExemplarData, error) {
+	u := *base
+	u.Path = path.Join(u.Path, "/api/v1/query_exemplars")
+	q := u.Query()
+
+	q.Add("query", query)
+	q.Add("start", formatTime(timestamp.Time(startTime)))
+	q.Add("end", formatTime(timestamp.Time(endTime)))
+	u.RawQuery = q.Encode()
+
+	var m struct {
+		Data []*exemplarspb.ExemplarData `json:"data"`
+	}
+
+	if err := c.get2xxResultWithGRPCErrors(ctx, "/prom_exemplars HTTP[client]", &u, &m); err != nil {
+		return nil, err
+	}
+
+	return m.Data, nil
+}
+
+func (c *Client) TargetsInGRPC(ctx context.Context, base *url.URL, stateTargets string) (*targetspb.TargetDiscovery, error) {
+	u := *base
+	u.Path = path.Join(u.Path, "/api/v1/targets")
+
+	if stateTargets != "" {
+		q := u.Query()
+		q.Add("state", stateTargets)
+		u.RawQuery = q.Encode()
+	}
+
+	var v struct {
+		Data *targetspb.TargetDiscovery `json:"data"`
+	}
+	return v.Data, c.get2xxResultWithGRPCErrors(ctx, "/prom_targets HTTP[client]", &u, &v)
 }

@@ -1,6 +1,7 @@
 package receive
 
 import (
+	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 	"os"
 	"sort"
 
@@ -44,4 +45,17 @@ func sliceContains(a []string, x string) bool {
 		}
 	}
 	return false
+}
+
+// extractLabels drops tenant-label and external_labels when tenantExtract is on
+func extractLabels(r *Writer, t prompb.TimeSeries, eset []string) labels.Labels {
+	lset := make(labels.Labels, 0, len(t.Labels))
+	for _, l := range labelpb.ZLabelsToPromLabels(t.Labels) {
+		if r.tenantExtract && (l.Name == r.tenantLabelName || sliceContains(eset, l.Name)) {
+			// drop tenant-label and external_labels from metrics labels
+			continue
+		}
+		lset = append(lset, l)
+	}
+	return lset
 }
