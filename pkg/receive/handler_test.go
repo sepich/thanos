@@ -1744,3 +1744,96 @@ func TestExtractLabels(t *testing.T) {
 		})
 	}
 }
+
+func TestTenantPrefix(t *testing.T) {
+	wreq1 := &prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []labelpb.ZLabel{{Name: "foo", Value: "bar"}},
+				Samples: []prompb.Sample{
+					{Value: 1, Timestamp: 1},
+					{Value: 2, Timestamp: 2},
+					{Value: 3, Timestamp: 3},
+				},
+			},
+		},
+	}
+	for _, tc := range []struct {
+		name              string
+		extractLabelsYaml string
+		headerUser        string
+		status            int
+	}{
+		{
+			name:              "no extract",
+			extractLabelsYaml: "",
+			headerUser:        "",
+			status:            http.StatusOK,
+		},
+		{
+			name:              "no prefix configured",
+			extractLabelsYaml: "defaultExternalLabels: [site]",
+			headerUser:        "foo",
+			status:            http.StatusOK,
+		},
+		{
+			name:              "prefix allow",
+			extractLabelsYaml: "tenantLabelPrefixes: {foo: ba}",
+			headerUser:        "foo",
+			status:            http.StatusOK,
+		},
+		{
+			name:              "full label allow",
+			extractLabelsYaml: "tenantLabelPrefixes: {foo: bar}",
+			headerUser:        "foo",
+			status:            http.StatusOK,
+		},
+		{
+			name:              "prefix deny",
+			extractLabelsYaml: "tenantLabelPrefixes: {foo: barr}",
+			headerUser:        "foo",
+			status:            http.StatusForbidden,
+		},
+		{
+			name:              "empty header",
+			extractLabelsYaml: "tenantLabelPrefixes: {foo: barr}",
+			headerUser:        "",
+			status:            http.StatusOK,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := []HashringConfig{{Hashring: "test"}}
+			appender := fakeAppendable{appender: newFakeAppender(nil, nil, nil)}
+			peers := &peerGroup{
+				dialOpts: nil,
+				m:        sync.RWMutex{},
+				cache:    map[string]storepb.WriteableStoreClient{},
+				dialer: func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error) {
+					return nil, errors.New("unexpected dial called in testing")
+				},
+			}
+			h := NewHandler(nil, &Options{
+				TenantHeader:      "X-Forwarded-User", // used in makeRequest
+				ReplicaHeader:     DefaultReplicaHeader,
+				ReplicationFactor: 1,
+				ForwardTimeout:    5 * time.Second,
+				Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(&appender), true, "foo", []byte(tc.extractLabelsYaml)),
+			})
+			h.peers = peers
+			addr := randomAddr()
+			h.options.Endpoint = addr
+			peers.cache[addr] = &fakeRemoteWriteGRPCServer{h: h}
+			cfg[0].Endpoints = append(cfg[0].Endpoints, h.options.Endpoint)
+			hashring := newMultiHashring(cfg)
+			h.Hashring(hashring)
+
+			rec, err := makeRequest(h, tc.headerUser, wreq1)
+			if err != nil {
+				t.Fatalf("handler unexpectedly failed making HTTP request: %v", err)
+			}
+			if rec.Code != tc.status {
+				t.Fatalf("handler got HTTP status code: %d; expect: %d", rec.Code, tc.status)
+			}
+		})
+	}
+}

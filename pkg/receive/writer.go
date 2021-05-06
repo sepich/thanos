@@ -78,7 +78,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		errs errutil.MultiError
 	)
 	for _, t := range wreq.Timeseries {
-		lset := extractLabels(r, t, eset)
+		lset := filterLabels(r, t, eset)
 
 		// Check if the TSDB has cached reference for those labels.
 		ref, lset = getRef.GetRef(lset)
@@ -86,7 +86,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 			// If not, copy labels, as TSDB will hold those strings long term. Given no
 			// copy unmarshal we don't want to keep memory for whole protobuf, only for labels.
 			labelpb.ReAllocZLabelsStrings(&t.Labels)
-			lset = extractLabels(r, t, eset)
+			lset = filterLabels(r, t, eset)
 		}
 
 		// Append as many valid samples as possible, but keep track of the errors.

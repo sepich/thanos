@@ -18,6 +18,7 @@ import (
 type ExtractorConfig struct {
 	DefaultExternalLabels []string            `yaml:"defaultExternalLabels"`
 	TenantExternalLabels  map[string][]string `yaml:"tenantExternalLabels"`
+	TenantLabelPrefixes   map[string]string   `yaml:"tenantLabelPrefixes"`
 }
 
 // ParseExtractorConfig parses the raw configuration content and returns a ExtractorConfig.
@@ -47,11 +48,15 @@ func sliceContains(a []string, x string) bool {
 	return false
 }
 
-// extractLabels drops tenant-label and external_labels when tenantExtract is on
-func extractLabels(r *Writer, t prompb.TimeSeries, eset []string) labels.Labels {
+// filterLabels drops tenant-label and external_labels when tenantExtract is on
+func filterLabels(r *Writer, t prompb.TimeSeries, eset []string) labels.Labels {
+	if !r.tenantExtract {
+		return labelpb.ZLabelsToPromLabels(t.Labels)
+	}
+
 	lset := make(labels.Labels, 0, len(t.Labels))
 	for _, l := range labelpb.ZLabelsToPromLabels(t.Labels) {
-		if r.tenantExtract && (l.Name == r.tenantLabelName || sliceContains(eset, l.Name)) {
+		if l.Name == r.tenantLabelName || sliceContains(eset, l.Name) {
 			// drop tenant-label and external_labels from metrics labels
 			continue
 		}

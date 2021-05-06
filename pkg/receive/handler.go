@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -335,6 +336,14 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 			if l.Name == h.options.Writer.tenantLabelName {
 				tenant = l.Value
 				break
+			}
+		}
+		u := r.Header.Get("X-Forwarded-User")
+		if prefix, ok := h.options.Writer.extractorConfig.TenantLabelPrefixes[u]; ok {
+			if !strings.HasPrefix(tenant, prefix) {
+				level.Debug(h.logger).Log("msg", "tenant label value has wrong prefix", "tenant", tenant, "prefix", prefix)
+				http.Error(w, "Wrong tenant label value", http.StatusForbidden)
+				return
 			}
 		}
 	} else {
