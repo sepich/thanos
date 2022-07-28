@@ -12,16 +12,17 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/thanos-io/objstore"
+
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
@@ -68,7 +69,7 @@ func TestPlanners_Plan_Compatibility(t *testing.T) {
 	}
 
 	// This mimics our default ExponentialBlockRanges with min block size equals to 20.
-	tsdbComp, err := tsdb.NewLeveledCompactor(context.Background(), nil, nil, ranges, nil)
+	tsdbComp, err := tsdb.NewLeveledCompactor(context.Background(), nil, nil, ranges, nil, nil)
 	testutil.Ok(t, err)
 	tsdbPlanner := &tsdbPlannerAdapter{comp: tsdbComp}
 	tsdbBasedPlanner := NewTSDBBasedPlanner(log.NewNopLogger(), ranges)
@@ -396,7 +397,7 @@ func TestRangeWithFailedCompactionWontGetSelected(t *testing.T) {
 	}
 
 	// This mimics our default ExponentialBlockRanges with min block size equals to 20.
-	tsdbComp, err := tsdb.NewLeveledCompactor(context.Background(), nil, nil, ranges, nil)
+	tsdbComp, err := tsdb.NewLeveledCompactor(context.Background(), nil, nil, ranges, nil, nil)
 	testutil.Ok(t, err)
 	tsdbPlanner := &tsdbPlannerAdapter{comp: tsdbComp}
 	tsdbBasedPlanner := NewTSDBBasedPlanner(log.NewNopLogger(), ranges)

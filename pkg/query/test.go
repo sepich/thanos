@@ -17,12 +17,13 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/teststorage"
+
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/testutil"
@@ -162,7 +163,7 @@ func parse(input string) (cmds []interface{}, err error) {
 	// Scan for steps line by line.
 	for i := 0; i < len(lines); i++ {
 		l := lines[i]
-		if len(l) == 0 {
+		if l == "" {
 			continue
 		}
 		var cmd interface{}
@@ -297,7 +298,7 @@ func ParseLoad(lines []string, i int) (int, *loadCmd, error) {
 	for i+1 < len(lines) {
 		i++
 		defLine := lines[i]
-		if len(defLine) == 0 {
+		if defLine == "" {
 			i--
 			break
 		}
@@ -353,7 +354,7 @@ func ParseEval(lines []string, i int) (int, *evalCmd, error) {
 	for j := 1; i+1 < len(lines); j++ {
 		i++
 		defLine := lines[i]
-		if len(defLine) == 0 {
+		if defLine == "" {
 			i--
 			break
 		}
@@ -559,7 +560,7 @@ func (ev *evalCmd) compareResult(result parser.Value) error {
 }
 
 func (ev *evalCmd) Eval(ctx context.Context, queryEngine *promql.Engine, queryable storage.Queryable) error {
-	q, err := queryEngine.NewInstantQuery(queryable, ev.expr, ev.start)
+	q, err := queryEngine.NewInstantQuery(queryable, &promql.QueryOpts{}, ev.expr, ev.start)
 	if err != nil {
 		return err
 	}
@@ -583,7 +584,7 @@ func (ev *evalCmd) Eval(ctx context.Context, queryEngine *promql.Engine, queryab
 
 	// Check query returns same result in range mode,
 	// by checking against the middle step.
-	q, err = queryEngine.NewRangeQuery(queryable, ev.expr, ev.start.Add(-time.Minute), ev.start.Add(time.Minute), time.Minute)
+	q, err = queryEngine.NewRangeQuery(queryable, &promql.QueryOpts{}, ev.expr, ev.start.Add(-time.Minute), ev.start.Add(time.Minute), time.Minute)
 	if err != nil {
 		return err
 	}
@@ -646,7 +647,7 @@ func (i inProcessClient) LabelSets() []labels.Labels {
 	return []labels.Labels{i.extLset}
 }
 
-func (i inProcessClient) TimeRange() (mint int64, maxt int64) {
+func (i inProcessClient) TimeRange() (mint, maxt int64) {
 	r, err := i.Info(context.TODO(), &storepb.InfoRequest{})
 	testutil.Ok(i.t, err)
 	return r.MinTime, r.MaxTime

@@ -9,26 +9,38 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"sync"
+	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"go.uber.org/atomic"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/thanos-io/thanos/pkg/api/status"
+
+	"github.com/thanos-io/objstore"
+
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/errutil"
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/thanos/pkg/exemplars"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"go.uber.org/atomic"
-	"golang.org/x/sync/errgroup"
 )
+
+type TSDBStats interface {
+	// TenantStats returns TSDB head stats for the given tenants.
+	// If no tenantIDs are provided, stats for all tenants are returned.
+	TenantStats(statsByLabelName string, tenantIDs ...string) []status.TenantStats
+}
 
 type MultiTSDB struct {
 	dataDir         string
@@ -78,9 +90,10 @@ func NewMultiTSDB(
 }
 
 type tenant struct {
-	readyS    *ReadyStorage
-	storeTSDB *store.TSDBStore
-	ship      *shipper.Shipper
+	readyS        *ReadyStorage
+	storeTSDB     *store.TSDBStore
+	exemplarsTSDB *exemplars.TSDB
+	ship          *shipper.Shipper
 
 	mtx *sync.RWMutex
 }
@@ -102,17 +115,24 @@ func (t *tenant) store() *store.TSDBStore {
 	return t.storeTSDB
 }
 
+func (t *tenant) exemplars() *exemplars.TSDB {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	return t.exemplarsTSDB
+}
+
 func (t *tenant) shipper() *shipper.Shipper {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 	return t.ship
 }
 
-func (t *tenant) set(storeTSDB *store.TSDBStore, tenantTSDB *tsdb.DB, ship *shipper.Shipper) {
+func (t *tenant) set(storeTSDB *store.TSDBStore, tenantTSDB *tsdb.DB, ship *shipper.Shipper, exemplarsTSDB *exemplars.TSDB) {
 	t.readyS.Set(tenantTSDB)
 	t.mtx.Lock()
 	t.storeTSDB = storeTSDB
 	t.ship = ship
+	t.exemplarsTSDB = exemplarsTSDB
 	t.mtx.Unlock()
 }
 
@@ -189,6 +209,98 @@ func (t *MultiTSDB) Close() error {
 	return merr.Err()
 }
 
+// Prune flushes and closes the TSDB for tenants that haven't received
+// any new samples for longer than the TSDB retention period.
+func (t *MultiTSDB) Prune(ctx context.Context) error {
+	// Retention of 0 means infinite retention.
+	if t.tsdbOpts.RetentionDuration == 0 {
+		return nil
+	}
+
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+
+	var (
+		wg   sync.WaitGroup
+		merr errutil.SyncMultiError
+
+		prunedTenants []string
+		pmtx          sync.Mutex
+	)
+
+	for tenantID, tenantInstance := range t.tenants {
+		wg.Add(1)
+		go func(tenantID string, tenantInstance *tenant) {
+			defer wg.Done()
+			tlog := log.With(t.logger, "tenant", tenantID)
+			pruned, err := t.pruneTSDB(ctx, tlog, tenantInstance)
+			if err != nil {
+				merr.Add(err)
+				return
+			}
+
+			if pruned {
+				pmtx.Lock()
+				defer pmtx.Unlock()
+				prunedTenants = append(prunedTenants, tenantID)
+			}
+		}(tenantID, tenantInstance)
+	}
+	wg.Wait()
+
+	for _, tenantID := range prunedTenants {
+		level.Info(t.logger).Log("msg", "Pruned tenant", "tenant", tenantID)
+		delete(t.tenants, tenantID)
+	}
+
+	return merr.Err()
+}
+
+// pruneTSDB removes a TSDB if its past the retention period.
+// It compacts the TSDB head, sends all remaining blocks to S3 and removes the TSDB from disk.
+func (t *MultiTSDB) pruneTSDB(ctx context.Context, logger log.Logger, tenantInstance *tenant) (bool, error) {
+	tenantTSDB := tenantInstance.readyStorage().get()
+	if tenantTSDB == nil {
+		return false, nil
+	}
+	tdb := tenantTSDB.db
+	head := tdb.Head()
+	if head.MaxTime() < 0 {
+		return false, nil
+	}
+
+	sinceLastAppend := time.Since(time.UnixMilli(head.MaxTime()))
+	if sinceLastAppend.Milliseconds() <= t.tsdbOpts.RetentionDuration {
+		return false, nil
+	}
+
+	level.Info(logger).Log("msg", "Pruning tenant")
+	if err := tdb.CompactHead(tsdb.NewRangeHead(head, head.MinTime(), head.MaxTime())); err != nil {
+		return false, err
+	}
+
+	if tenantInstance.shipper() != nil {
+		uploaded, err := tenantInstance.shipper().Sync(ctx)
+		if err != nil {
+			return false, err
+		}
+
+		if uploaded > 0 {
+			level.Info(logger).Log("msg", "Uploaded head block")
+		}
+	}
+
+	if err := tdb.Close(); err != nil {
+		return false, err
+	}
+
+	if err := os.RemoveAll(tenantTSDB.db.Dir()); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 func (t *MultiTSDB) Sync(ctx context.Context) (int, error) {
 	if t.bucket == nil {
 		return 0, errors.New("bucket is not specified, Sync should not be invoked")
@@ -252,11 +364,11 @@ func (t *MultiTSDB) RemoveLockFilesIfAny() error {
 	return merr.Err()
 }
 
-func (t *MultiTSDB) TSDBStores() map[string]storepb.StoreServer {
+func (t *MultiTSDB) TSDBStores() map[string]store.InfoStoreServer {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 
-	res := make(map[string]storepb.StoreServer, len(t.tenants))
+	res := make(map[string]store.InfoStoreServer, len(t.tenants))
 	for k, tenant := range t.tenants {
 		s := tenant.store()
 		if s != nil {
@@ -264,6 +376,65 @@ func (t *MultiTSDB) TSDBStores() map[string]storepb.StoreServer {
 		}
 	}
 	return res
+}
+
+func (t *MultiTSDB) TSDBExemplars() map[string]*exemplars.TSDB {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+
+	res := make(map[string]*exemplars.TSDB, len(t.tenants))
+	for k, tenant := range t.tenants {
+		e := tenant.exemplars()
+		if e != nil {
+			res[k] = e
+		}
+	}
+	return res
+}
+
+func (t *MultiTSDB) TenantStats(statsByLabelName string, tenantIDs ...string) []status.TenantStats {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	if len(tenantIDs) == 0 {
+		for tenantID := range t.tenants {
+			tenantIDs = append(tenantIDs, tenantID)
+		}
+	}
+
+	var (
+		mu     sync.Mutex
+		wg     sync.WaitGroup
+		result = make([]status.TenantStats, 0, len(t.tenants))
+	)
+	for _, tenantID := range tenantIDs {
+		tenantInstance, ok := t.tenants[tenantID]
+		if !ok {
+			continue
+		}
+
+		wg.Add(1)
+		go func(tenantID string, tenantInstance *tenant) {
+			defer wg.Done()
+			db := tenantInstance.readyS.Get()
+			if db == nil {
+				return
+			}
+			stats := db.Head().Stats(statsByLabelName)
+
+			mu.Lock()
+			defer mu.Unlock()
+			result = append(result, status.TenantStats{
+				Tenant: tenantID,
+				Stats:  stats,
+			})
+		}(tenantID, tenantInstance)
+	}
+	wg.Wait()
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Tenant < result[j].Tenant
+	})
+	return result
 }
 
 func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant) error {
@@ -278,6 +449,7 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 		logger,
 		&UnRegisterer{Registerer: reg},
 		&opts,
+		nil,
 	)
 	if err != nil {
 		t.mtx.Lock()
@@ -299,7 +471,7 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 			t.hashFunc,
 		)
 	}
-	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset), s, ship)
+	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset), s, ship, exemplars.NewTSDB(s, lset))
 	level.Info(logger).Log("msg", "TSDB is now ready")
 	return nil
 }
@@ -398,6 +570,14 @@ func (s *ReadyStorage) Querier(ctx context.Context, mint, maxt int64) (storage.Q
 	return nil, ErrNotReady
 }
 
+// ExemplarQuerier implements the Storage interface.
+func (s *ReadyStorage) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	if x := s.get(); x != nil {
+		return x.ExemplarQuerier(ctx)
+	}
+	return nil, ErrNotReady
+}
+
 // Appender implements the Storage interface.
 func (s *ReadyStorage) Appender(ctx context.Context) (storage.Appender, error) {
 	if x := s.get(); x != nil {
@@ -425,11 +605,11 @@ func (a adapter) StartTime() (int64, error) {
 }
 
 func (a adapter) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-	q, err := a.db.Querier(ctx, mint, maxt)
-	if err != nil {
-		return nil, err
-	}
-	return q, nil
+	return a.db.Querier(ctx, mint, maxt)
+}
+
+func (a adapter) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	return a.db.ExemplarQuerier(ctx)
 }
 
 // Appender returns a new appender against the storage.

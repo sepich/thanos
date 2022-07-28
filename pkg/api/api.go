@@ -28,8 +28,8 @@ import (
 	"time"
 
 	"github.com/NYTimes/gziphandler"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/common/version"
@@ -195,7 +195,7 @@ func GetRuntimeInfoFunc(logger log.Logger) RuntimeInfoFn {
 
 type InstrFunc func(name string, f ApiFunc) http.HandlerFunc
 
-// Instr returns a http HandlerFunc with the instrumentation middleware.
+// GetInstr returns a http HandlerFunc with the instrumentation middleware.
 func GetInstr(
 	tracer opentracing.Tracer,
 	logger log.Logger,
@@ -219,9 +219,9 @@ func GetInstr(
 
 		return tracing.HTTPMiddleware(tracer, name, logger,
 			ins.NewHandler(name,
-				logMiddleware.HTTPMiddleware(name,
-					gziphandler.GzipHandler(
-						middleware.RequestID(hf),
+				gziphandler.GzipHandler(
+					middleware.RequestID(
+						logMiddleware.HTTPMiddleware(name, hf),
 					),
 				),
 			),

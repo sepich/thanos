@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
@@ -64,7 +64,7 @@ func testPrometheusStoreSeriesE2e(t *testing.T, prefix string) {
 	limitMinT := int64(0)
 	proxy, err := NewPrometheusStore(nil, nil, promclient.NewDefaultClient(), u, component.Sidecar,
 		func() labels.Labels { return labels.FromStrings("region", "eu-west") },
-		func() (int64, int64) { return limitMinT, -1 }) // Maxt does not matter.
+		func() (int64, int64) { return limitMinT, -1 }, nil) // Maxt does not matter.
 	testutil.Ok(t, err)
 
 	// Query all three samples except for the first one. Since we round up queried data
@@ -161,15 +161,7 @@ func expandChunk(cit chunkenc.Iterator) (res []sample) {
 	return res
 }
 
-func getExternalLabels() labels.Labels {
-	return labels.Labels{
-		{Name: "ext_a", Value: "a"},
-		{Name: "ext_b", Value: "a"}}
-}
-
 func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
-	t.Helper()
-
 	defer testutil.TolerantVerifyLeak(t)
 
 	p, err := e2eutil.NewPrometheus()
@@ -199,7 +191,7 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 
 	promStore, err := NewPrometheusStore(nil, nil, promclient.NewDefaultClient(), u, component.Sidecar,
 		func() labels.Labels { return labels.FromStrings("region", "eu-west") },
-		func() (int64, int64) { return math.MinInt64/1000 + 62135596801, math.MaxInt64/1000 - 62135596801 })
+		func() (int64, int64) { return math.MinInt64/1000 + 62135596801, math.MaxInt64/1000 - 62135596801 }, nil)
 	testutil.Ok(t, err)
 
 	for _, tcase := range []struct {
@@ -225,7 +217,7 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 				MinTime: baseT - 10000000000,
 				MaxTime: baseT + 10000000000,
 			},
-			expectedErr: errors.New("rpc error: code = InvalidArgument desc = expected 2xx response, got 400. Body: {\"status\":\"error\",\"errorType\":\"bad_data\",\"error\":\"1:7: parse error: unexpected character inside braces: '-'\"}"),
+			expectedErr: errors.New("rpc error: code = InvalidArgument desc = expected 2xx response, got 400. Body: {\"status\":\"error\",\"errorType\":\"bad_data\",\"error\":\"invalid parameter \\\"match[]\\\": 1:7: parse error: unexpected character inside braces: '-'\"}"),
 		},
 		{
 			req: &storepb.SeriesRequest{
@@ -351,140 +343,32 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 	}
 }
 
-func TestPrometheusStore_LabelNames_e2e(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
+func TestPrometheusStore_LabelAPIs(t *testing.T) {
+	t.Cleanup(func() { testutil.TolerantVerifyLeak(t) })
+	testLabelAPIs(t, func(extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+		p, err := e2eutil.NewPrometheus()
+		testutil.Ok(t, err)
+		t.Cleanup(func() { testutil.Ok(t, p.Stop()) })
 
-	p, err := e2eutil.NewPrometheus()
-	testutil.Ok(t, err)
-	defer func() { testutil.Ok(t, p.Stop()) }()
+		appendFn(p.Appender())
 
-	a := p.Appender()
-	_, err = a.Append(0, labels.FromStrings("a", "b"), 0, 1)
-	testutil.Ok(t, err)
-	_, err = a.Append(0, labels.FromStrings("a", "c"), 0, 1)
-	testutil.Ok(t, err)
-	_, err = a.Append(0, labels.FromStrings("a", "a"), 0, 1)
-	testutil.Ok(t, err)
-	testutil.Ok(t, a.Commit())
+		testutil.Ok(t, p.Start())
+		u, err := url.Parse(fmt.Sprintf("http://%s", p.Addr()))
+		testutil.Ok(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		version, err := promclient.NewDefaultClient().BuildVersion(context.Background(), u)
+		testutil.Ok(t, err)
 
-	testutil.Ok(t, p.Start())
+		promStore, err := NewPrometheusStore(nil, nil, promclient.NewDefaultClient(), u, component.Sidecar, func() labels.Labels {
+			return extLset
+		}, nil, func() string { return version })
+		testutil.Ok(t, err)
 
-	u, err := url.Parse(fmt.Sprintf("http://%s", p.Addr()))
-	testutil.Ok(t, err)
-
-	proxy, err := NewPrometheusStore(nil, nil, promclient.NewDefaultClient(), u, component.Sidecar, getExternalLabels, nil)
-	testutil.Ok(t, err)
-
-	resp, err := proxy.LabelNames(ctx, &storepb.LabelNamesRequest{
-		Start: timestamp.FromTime(minTime),
-		End:   timestamp.FromTime(maxTime),
+		return promStore
 	})
-	testutil.Ok(t, err)
-	testutil.Equals(t, []string(nil), resp.Warnings)
-	testutil.Equals(t, []string{"a"}, resp.Names)
-
-	// Outside time range.
-	resp, err = proxy.LabelNames(ctx, &storepb.LabelNamesRequest{
-		Start: timestamp.FromTime(maxTime.Add(-time.Second)),
-		End:   timestamp.FromTime(maxTime),
-	})
-	testutil.Ok(t, err)
-	testutil.Equals(t, []string(nil), resp.Warnings)
-	testutil.Equals(t, []string{}, resp.Names)
 }
 
-func TestPrometheusStore_LabelValues_e2e(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
-
-	p, err := e2eutil.NewPrometheus()
-	testutil.Ok(t, err)
-	defer func() { testutil.Ok(t, p.Stop()) }()
-
-	a := p.Appender()
-	_, err = a.Append(0, labels.FromStrings("a", "b"), 0, 1)
-	testutil.Ok(t, err)
-	_, err = a.Append(0, labels.FromStrings("a", "c"), 0, 1)
-	testutil.Ok(t, err)
-	_, err = a.Append(0, labels.FromStrings("a", "a"), 0, 1)
-	testutil.Ok(t, err)
-	testutil.Ok(t, a.Commit())
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	testutil.Ok(t, p.Start())
-
-	u, err := url.Parse(fmt.Sprintf("http://%s", p.Addr()))
-	testutil.Ok(t, err)
-
-	proxy, err := NewPrometheusStore(nil, nil, promclient.NewDefaultClient(), u, component.Sidecar, getExternalLabels, nil)
-	testutil.Ok(t, err)
-
-	resp, err := proxy.LabelValues(ctx, &storepb.LabelValuesRequest{
-		Label: "a",
-		Start: timestamp.FromTime(minTime),
-		End:   timestamp.FromTime(maxTime),
-	})
-	testutil.Ok(t, err)
-	testutil.Equals(t, []string(nil), resp.Warnings)
-	testutil.Equals(t, []string{"a", "b", "c"}, resp.Values)
-
-	// Outside time range.
-	resp, err = proxy.LabelValues(ctx, &storepb.LabelValuesRequest{
-		Label: "a",
-		Start: timestamp.FromTime(maxTime.Add(-time.Second)),
-		End:   timestamp.FromTime(maxTime),
-	})
-	testutil.Ok(t, err)
-	testutil.Equals(t, []string(nil), resp.Warnings)
-	testutil.Equals(t, []string{}, resp.Values)
-}
-
-// Test to check external label values retrieve.
-func TestPrometheusStore_ExternalLabelValues_e2e(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
-
-	p, err := e2eutil.NewPrometheus()
-	testutil.Ok(t, err)
-	defer func() { testutil.Ok(t, p.Stop()) }()
-
-	a := p.Appender()
-	_, err = a.Append(0, labels.FromStrings("ext_a", "b"), 0, 1)
-	testutil.Ok(t, err)
-	_, err = a.Append(0, labels.FromStrings("a", "b"), 0, 1)
-	testutil.Ok(t, err)
-	testutil.Ok(t, a.Commit())
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	testutil.Ok(t, p.Start())
-
-	u, err := url.Parse(fmt.Sprintf("http://%s", p.Addr()))
-	testutil.Ok(t, err)
-
-	proxy, err := NewPrometheusStore(nil, nil, promclient.NewDefaultClient(), u, component.Sidecar, getExternalLabels, nil)
-	testutil.Ok(t, err)
-
-	resp, err := proxy.LabelValues(ctx, &storepb.LabelValuesRequest{
-		Label: "ext_a",
-	})
-	testutil.Ok(t, err)
-
-	testutil.Equals(t, []string{"a"}, resp.Values)
-
-	resp, err = proxy.LabelValues(ctx, &storepb.LabelValuesRequest{
-		Label: "a",
-	})
-	testutil.Ok(t, err)
-
-	testutil.Equals(t, []string{"b"}, resp.Values)
-}
-
-func TestPrometheusStore_Series_MatchExternalLabel_e2e(t *testing.T) {
+func TestPrometheusStore_Series_MatchExternalLabel(t *testing.T) {
 	defer testutil.TolerantVerifyLeak(t)
 
 	p, err := e2eutil.NewPrometheus()
@@ -512,20 +396,18 @@ func TestPrometheusStore_Series_MatchExternalLabel_e2e(t *testing.T) {
 
 	proxy, err := NewPrometheusStore(nil, nil, promclient.NewDefaultClient(), u, component.Sidecar,
 		func() labels.Labels { return labels.FromStrings("region", "eu-west") },
-		func() (int64, int64) { return 0, math.MaxInt64 })
+		func() (int64, int64) { return 0, math.MaxInt64 }, nil)
 	testutil.Ok(t, err)
 	srv := newStoreSeriesServer(ctx)
 
-	err = proxy.Series(&storepb.SeriesRequest{
+	testutil.Ok(t, proxy.Series(&storepb.SeriesRequest{
 		MinTime: baseT + 101,
 		MaxTime: baseT + 300,
 		Matchers: []storepb.LabelMatcher{
 			{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "b"},
 			{Type: storepb.LabelMatcher_EQ, Name: "region", Value: "eu-west"},
 		},
-	}, srv)
-	testutil.Ok(t, err)
-
+	}, srv))
 	testutil.Equals(t, 1, len(srv.SeriesSet))
 
 	testutil.Equals(t, []labelpb.ZLabel{
@@ -534,16 +416,15 @@ func TestPrometheusStore_Series_MatchExternalLabel_e2e(t *testing.T) {
 	}, srv.SeriesSet[0].Labels)
 
 	srv = newStoreSeriesServer(ctx)
-	// However it should not match wrong external label.
-	err = proxy.Series(&storepb.SeriesRequest{
+	// However, it should not match wrong external label.
+	testutil.Ok(t, proxy.Series(&storepb.SeriesRequest{
 		MinTime: baseT + 101,
 		MaxTime: baseT + 300,
 		Matchers: []storepb.LabelMatcher{
 			{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "b"},
 			{Type: storepb.LabelMatcher_EQ, Name: "region", Value: "eu-west2"}, // Non existing label value.
 		},
-	}, srv)
-	testutil.Ok(t, err)
+	}, srv))
 
 	// No series.
 	testutil.Equals(t, 0, len(srv.SeriesSet))
@@ -557,7 +438,7 @@ func TestPrometheusStore_Info(t *testing.T) {
 
 	proxy, err := NewPrometheusStore(nil, nil, promclient.NewDefaultClient(), nil, component.Sidecar,
 		func() labels.Labels { return labels.FromStrings("region", "eu-west") },
-		func() (int64, int64) { return 123, 456 })
+		func() (int64, int64) { return 123, 456 }, nil)
 	testutil.Ok(t, err)
 
 	resp, err := proxy.Info(ctx, &storepb.InfoRequest{})
@@ -635,7 +516,7 @@ func TestPrometheusStore_Series_SplitSamplesIntoChunksWithMaxSizeOf120(t *testin
 
 		proxy, err := NewPrometheusStore(nil, nil, promclient.NewDefaultClient(), u, component.Sidecar,
 			func() labels.Labels { return labels.FromStrings("region", "eu-west") },
-			func() (int64, int64) { return 0, math.MaxInt64 })
+			func() (int64, int64) { return 0, math.MaxInt64 }, nil)
 		testutil.Ok(t, err)
 
 		// We build chunks only for SAMPLES method. Make sure we ask for SAMPLES only.

@@ -7,12 +7,13 @@ import (
 	"context"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/thanos-io/objstore"
+
 	"github.com/thanos-io/thanos/pkg/block"
-	"github.com/thanos-io/thanos/pkg/objstore"
 )
 
 // BlocksCleaner is a struct that deletes blocks from bucket which are marked for deletion.
@@ -26,7 +27,7 @@ type BlocksCleaner struct {
 }
 
 // NewBlocksCleaner creates a new BlocksCleaner.
-func NewBlocksCleaner(logger log.Logger, bkt objstore.Bucket, ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter, deleteDelay time.Duration, blocksCleaned prometheus.Counter, blockCleanupFailures prometheus.Counter) *BlocksCleaner {
+func NewBlocksCleaner(logger log.Logger, bkt objstore.Bucket, ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter, deleteDelay time.Duration, blocksCleaned, blockCleanupFailures prometheus.Counter) *BlocksCleaner {
 	return &BlocksCleaner{
 		logger:                   logger,
 		ignoreDeletionMarkFilter: ignoreDeletionMarkFilter,

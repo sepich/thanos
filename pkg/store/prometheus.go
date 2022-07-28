@@ -6,7 +6,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -17,28 +16,31 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/timestamp"
+
+	"github.com/blang/semver/v4"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
-	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	"github.com/thanos-io/thanos/pkg/store/labelpb"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	"github.com/thanos-io/thanos/pkg/component"
-	thanoshttp "github.com/thanos-io/thanos/pkg/http"
+	"github.com/thanos-io/thanos/pkg/dedup"
+	"github.com/thanos-io/thanos/pkg/httpconfig"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 	"github.com/thanos-io/thanos/pkg/tracing"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // PrometheusStore implements the store node API on top of the Prometheus remote read API.
@@ -49,12 +51,17 @@ type PrometheusStore struct {
 	buffers          sync.Pool
 	component        component.StoreAPI
 	externalLabelsFn func() labels.Labels
+	promVersion      func() string
 	timestamps       func() (mint int64, maxt int64)
 
 	remoteReadAcceptableResponses []prompb.ReadRequest_ResponseType
 
 	framesRead prometheus.Histogram
 }
+
+// Label{Values,Names} call with matchers is supported for Prometheus versions >= 2.24.0.
+// https://github.com/prometheus/prometheus/commit/caa173d2aac4c390546b1f78302104b1ccae0878.
+var baseVer, _ = semver.Make("2.24.0")
 
 const initialBufSize = 32 * 1024 // 32KB seems like a good minimum starting size for sync pool size.
 
@@ -69,6 +76,7 @@ func NewPrometheusStore(
 	component component.StoreAPI,
 	externalLabelsFn func() labels.Labels,
 	timestamps func() (mint int64, maxt int64),
+	promVersion func() string,
 ) (*PrometheusStore, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -79,6 +87,7 @@ func NewPrometheusStore(
 		client:                        client,
 		component:                     component,
 		externalLabelsFn:              externalLabelsFn,
+		promVersion:                   promVersion,
 		timestamps:                    timestamps,
 		remoteReadAcceptableResponses: []prompb.ReadRequest_ResponseType{prompb.ReadRequest_STREAMED_XOR_CHUNKS, prompb.ReadRequest_SAMPLES},
 		buffers: sync.Pool{New: func() interface{} {
@@ -149,7 +158,20 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, s storepb.Store_Serie
 	// Don't ask for more than available time. This includes potential `minTime` flag limit.
 	availableMinTime, _ := p.timestamps()
 	if r.MinTime < availableMinTime {
-		r.MinTime = availableMinTime
+		// If pushdown is enabled then align min time with the step to avoid missing data
+		// when it gets retrieved by the upper layer's PromQL engine.
+		// This also is necessary when Sidecar uploads a block and then availableMinTime
+		// becomes a fixed timestamp.
+		if r.QueryHints != nil && r.QueryHints.StepMillis != 0 {
+			diff := availableMinTime - r.MinTime
+			r.MinTime += (diff / r.QueryHints.StepMillis) * r.QueryHints.StepMillis
+			// Add one more to strictly fit within --min-time -> infinity.
+			if r.MinTime != availableMinTime {
+				r.MinTime += r.QueryHints.StepMillis
+			}
+		} else {
+			r.MinTime = availableMinTime
+		}
 	}
 
 	if r.SkipChunks {
@@ -173,6 +195,10 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, s storepb.Store_Serie
 		return nil
 	}
 
+	if r.QueryHints != nil && r.QueryHints.IsSafeToExecute() {
+		return p.queryPrometheus(s, r)
+	}
+
 	q := &prompb.Query{StartTimestampMs: r.MinTime, EndTimestampMs: r.MaxTime}
 	for _, m := range matchers {
 		pm := &prompb.LabelMatcher{Name: m.Name, Value: m.Value}
@@ -193,6 +219,7 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, s storepb.Store_Serie
 	}
 
 	queryPrometheusSpan, ctx := tracing.StartSpan(s.Context(), "query_prometheus")
+	queryPrometheusSpan.SetTag("query.request", q.String())
 
 	httpResp, err := p.startPromRemoteRead(ctx, q)
 	if err != nil {
@@ -213,18 +240,83 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, s storepb.Store_Serie
 	return p.handleStreamedPrometheusResponse(s, httpResp, queryPrometheusSpan, extLset)
 }
 
-func (p *PrometheusStore) handleSampledPrometheusResponse(s storepb.Store_SeriesServer, httpResp *http.Response, querySpan opentracing.Span, extLset labels.Labels) error {
-	ctx := s.Context()
+func (p *PrometheusStore) queryPrometheus(s storepb.Store_SeriesServer, r *storepb.SeriesRequest) error {
+	var matrix model.Matrix
 
+	opts := promclient.QueryOptions{}
+	step := r.QueryHints.StepMillis / 1000
+	if step != 0 {
+		result, _, err := p.client.QueryRange(s.Context(), p.base, r.ToPromQL(), r.MinTime, r.MaxTime, step, opts)
+		if err != nil {
+			return err
+		}
+		matrix = result
+	} else {
+		vector, _, err := p.client.QueryInstant(s.Context(), p.base, r.ToPromQL(), timestamp.Time(r.MaxTime), opts)
+		if err != nil {
+			return err
+		}
+
+		matrix = make(model.Matrix, 0, len(vector))
+		for _, sample := range vector {
+			matrix = append(matrix, &model.SampleStream{
+				Metric: sample.Metric,
+				Values: []model.SamplePair{
+					{
+						Timestamp: sample.Timestamp,
+						Value:     sample.Value,
+					},
+				},
+			})
+		}
+	}
+
+	externalLbls := p.externalLabelsFn()
+	for _, vector := range matrix {
+		seriesLbls := labels.Labels(make([]labels.Label, 0, len(vector.Metric)))
+
+		// Attach labels from samples.
+		for k, v := range vector.Metric {
+			seriesLbls = append(seriesLbls, labels.FromStrings(string(k), string(v))...)
+		}
+		sort.Slice(seriesLbls, func(i, j int) bool {
+			return seriesLbls.Less(i, j)
+		})
+		// Attach external labels for compatibility with remote read.
+		finalLbls := labelpb.ExtendSortedLabels(seriesLbls, externalLbls)
+		finalLbls = append(finalLbls, dedup.PushdownMarker)
+
+		series := &prompb.TimeSeries{
+			Labels:  labelpb.ZLabelsFromPromLabels(finalLbls),
+			Samples: prompb.SamplesFromSamplePairs(vector.Values),
+		}
+
+		chks, err := p.chunkSamples(series, MaxSamplesPerChunk)
+		if err != nil {
+			return err
+		}
+
+		if err := s.Send(storepb.NewSeriesResponse(&storepb.Series{
+			Labels: series.Labels,
+			Chunks: chks,
+		})); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p *PrometheusStore) handleSampledPrometheusResponse(s storepb.Store_SeriesServer, httpResp *http.Response, querySpan tracing.Span, extLset labels.Labels) error {
 	level.Debug(p.logger).Log("msg", "started handling ReadRequest_SAMPLED response type.")
 
-	resp, err := p.fetchSampledResponse(ctx, httpResp)
+	resp, err := p.fetchSampledResponse(s.Context(), httpResp)
 	querySpan.Finish()
 	if err != nil {
 		return err
 	}
 
-	span, _ := tracing.StartSpan(ctx, "transform_and_respond")
+	span, _ := tracing.StartSpan(s.Context(), "transform_and_respond")
 	defer span.Finish()
 	span.SetTag("series_count", len(resp.Results[0].Timeseries))
 
@@ -259,7 +351,7 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(s storepb.Store_Series
 	return nil
 }
 
-func (p *PrometheusStore) handleStreamedPrometheusResponse(s storepb.Store_SeriesServer, httpResp *http.Response, querySpan opentracing.Span, extLset labels.Labels) error {
+func (p *PrometheusStore) handleStreamedPrometheusResponse(s storepb.Store_SeriesServer, httpResp *http.Response, querySpan tracing.Span, extLset labels.Labels) error {
 	level.Debug(p.logger).Log("msg", "started handling ReadRequest_STREAMED_XOR_CHUNKS streamed read response.")
 
 	framesNum := 0
@@ -271,13 +363,14 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(s storepb.Store_Serie
 	}()
 	defer runutil.CloseWithLogOnErr(p.logger, httpResp.Body, "prom series request body")
 
-	var (
-		data = p.getBuffer()
-	)
+	var data = p.getBuffer()
 	defer p.putBuffer(data)
 
+	bodySizer := NewBytesRead(httpResp.Body)
+	seriesStats := &storepb.SeriesStatsCounter{}
+
 	// TODO(bwplotka): Put read limit as a flag.
-	stream := remote.NewChunkedReader(httpResp.Body, remote.DefaultChunkedReadLimit, *data)
+	stream := remote.NewChunkedReader(bodySizer, remote.DefaultChunkedReadLimit, *data)
 	for {
 		res := &prompb.ChunkedReadResponse{}
 		err := stream.NextProto(res)
@@ -294,6 +387,7 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(s storepb.Store_Serie
 
 		framesNum++
 		for _, series := range res.ChunkedSeries {
+			seriesStats.CountSeries(series.Labels)
 			thanosChks := make([]storepb.AggrChunk, len(series.Chunks))
 			for i, chk := range series.Chunks {
 				thanosChks[i] = storepb.AggrChunk{
@@ -307,6 +401,9 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(s storepb.Store_Serie
 						Type: storepb.Chunk_Encoding(chk.Type - 1),
 					},
 				}
+				seriesStats.Samples += thanosChks[i].Raw.XORNumSamples()
+				seriesStats.Chunks++
+
 				// Drop the reference to data from non protobuf for GC.
 				series.Chunks[i].Data = nil
 			}
@@ -321,8 +418,32 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(s storepb.Store_Serie
 			}
 		}
 	}
+
+	querySpan.SetTag("processed.series", seriesStats.Series)
+	querySpan.SetTag("processed.chunks", seriesStats.Chunks)
+	querySpan.SetTag("processed.samples", seriesStats.Samples)
+	querySpan.SetTag("processed.bytes", bodySizer.BytesCount())
 	level.Debug(p.logger).Log("msg", "handled ReadRequest_STREAMED_XOR_CHUNKS request.", "frames", framesNum)
 	return nil
+}
+
+type BytesCounter struct {
+	io.ReadCloser
+	bytesCount int
+}
+
+func NewBytesRead(rc io.ReadCloser) *BytesCounter {
+	return &BytesCounter{ReadCloser: rc}
+}
+
+func (s *BytesCounter) Read(p []byte) (n int, err error) {
+	n, err = s.ReadCloser.Read(p)
+	s.bytesCount += n
+	return n, err
+}
+
+func (s *BytesCounter) BytesCount() int {
+	return s.bytesCount
 }
 
 func (p *PrometheusStore) fetchSampledResponse(ctx context.Context, resp *http.Response) (_ *prompb.ReadResponse, err error) {
@@ -385,18 +506,13 @@ func (p *PrometheusStore) chunkSamples(series *prompb.TimeSeries, maxSamplesPerC
 	return chks, nil
 }
 
-func (p *PrometheusStore) startPromRemoteRead(ctx context.Context, q *prompb.Query) (presp *http.Response, _ error) {
+func (p *PrometheusStore) startPromRemoteRead(ctx context.Context, q *prompb.Query) (presp *http.Response, err error) {
 	reqb, err := proto.Marshal(&prompb.ReadRequest{
 		Queries:               []*prompb.Query{q},
 		AcceptedResponseTypes: p.remoteReadAcceptableResponses,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "marshal read request")
-	}
-
-	qjson, err := json.Marshal(q)
-	if err != nil {
-		return nil, errors.Wrap(err, "json encode query for tracing")
 	}
 
 	u := *p.base
@@ -410,11 +526,8 @@ func (p *PrometheusStore) startPromRemoteRead(ctx context.Context, q *prompb.Que
 	preq.Header.Set("Content-Type", "application/x-stream-protobuf")
 	preq.Header.Set("X-Prometheus-Remote-Read-Version", "0.1.0")
 
-	preq.Header.Set("User-Agent", thanoshttp.ThanosUserAgent)
-	tracing.DoInSpan(ctx, "query_prometheus_request", func(ctx context.Context) {
-		preq = preq.WithContext(ctx)
-		presp, err = p.client.Do(preq)
-	}, opentracing.Tag{Key: "prometheus.query", Value: string(qjson)})
+	preq.Header.Set("User-Agent", httpconfig.ThanosUserAgent)
+	presp, err = p.client.Do(preq.WithContext(ctx))
 	if err != nil {
 		return nil, errors.Wrap(err, "send request")
 	}
@@ -478,28 +591,124 @@ func (p *PrometheusStore) encodeChunk(ss []prompb.Sample) (storepb.Chunk_Encodin
 	return storepb.Chunk_XOR, c.Bytes(), nil
 }
 
-// LabelNames returns all known label names.
+// LabelNames returns all known label names of series that match the given matchers.
 func (p *PrometheusStore) LabelNames(ctx context.Context, r *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
-	lbls, err := p.client.LabelNamesInGRPC(ctx, p.base, nil, r.Start, r.End)
+	extLset := p.externalLabelsFn()
+
+	match, matchers, err := matchesExternalLabels(r.Matchers, extLset)
 	if err != nil {
-		return nil, err
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	if !match {
+		return &storepb.LabelNamesResponse{Names: nil}, nil
+	}
+
+	var lbls []string
+	version, parseErr := semver.Parse(p.promVersion())
+	if len(matchers) == 0 || (parseErr == nil && version.GTE(baseVer)) {
+		lbls, err = p.client.LabelNamesInGRPC(ctx, p.base, matchers, r.Start, r.End)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		sers, err := p.client.SeriesInGRPC(ctx, p.base, matchers, r.Start, r.End)
+		if err != nil {
+			return nil, err
+		}
+
+		// Using set to handle duplicate values.
+		labelNamesSet := make(map[string]struct{})
+		for _, s := range sers {
+			for labelName := range s {
+				labelNamesSet[labelName] = struct{}{}
+			}
+		}
+
+		for key := range labelNamesSet {
+			lbls = append(lbls, key)
+		}
+	}
+
+	if len(lbls) > 0 {
+		for _, extLbl := range extLset {
+			lbls = append(lbls, extLbl.Name)
+		}
+		sort.Strings(lbls)
+	}
+
 	return &storepb.LabelNamesResponse{Names: lbls}, nil
 }
 
 // LabelValues returns all known label values for a given label name.
 func (p *PrometheusStore) LabelValues(ctx context.Context, r *storepb.LabelValuesRequest) (*storepb.LabelValuesResponse, error) {
-	externalLset := p.externalLabelsFn()
+	if r.Label == "" {
+		return nil, status.Error(codes.InvalidArgument, "label name parameter cannot be empty")
+	}
+
+	extLset := p.externalLabelsFn()
 
 	// First check for matching external label which has priority.
-	if l := externalLset.Get(r.Label); l != "" {
+	if l := extLset.Get(r.Label); l != "" {
 		return &storepb.LabelValuesResponse{Values: []string{l}}, nil
 	}
 
-	vals, err := p.client.LabelValuesInGRPC(ctx, p.base, r.Label, nil, r.Start, r.End)
+	match, matchers, err := matchesExternalLabels(r.Matchers, extLset)
 	if err != nil {
-		return nil, err
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	if !match {
+		return &storepb.LabelValuesResponse{Values: nil}, nil
+	}
+
+	var (
+		sers []map[string]string
+		vals []string
+	)
+
+	version, parseErr := semver.Parse(p.promVersion())
+	if len(matchers) == 0 || (parseErr == nil && version.GTE(baseVer)) {
+		vals, err = p.client.LabelValuesInGRPC(ctx, p.base, r.Label, matchers, r.Start, r.End)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		sers, err = p.client.SeriesInGRPC(ctx, p.base, matchers, r.Start, r.End)
+		if err != nil {
+			return nil, err
+		}
+
+		// Using set to handle duplicate values.
+		labelValuesSet := make(map[string]struct{})
+		for _, s := range sers {
+			if val, exists := s[r.Label]; exists {
+				labelValuesSet[val] = struct{}{}
+			}
+		}
+		for key := range labelValuesSet {
+			vals = append(vals, key)
+		}
+	}
+
 	sort.Strings(vals)
 	return &storepb.LabelValuesResponse{Values: vals}, nil
+}
+
+func (p *PrometheusStore) LabelSet() []labelpb.ZLabelSet {
+	lset := p.externalLabelsFn()
+
+	labels := make([]labelpb.ZLabel, 0, len(lset))
+	labels = append(labels, labelpb.ZLabelsFromPromLabels(lset)...)
+
+	labelset := []labelpb.ZLabelSet{}
+	if len(labels) > 0 {
+		labelset = append(labelset, labelpb.ZLabelSet{
+			Labels: labels,
+		})
+	}
+
+	return labelset
+}
+
+func (p *PrometheusStore) Timestamps() (mint int64, maxt int64) {
+	return p.timestamps()
 }

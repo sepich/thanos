@@ -1,8 +1,8 @@
 This is a fork of [Thanos](https://github.com/thanos-io/thanos) with some patches for `receive` component denied in upstream:
- - Receive: quorum for 2 nodes is `1` [#3231](https://github.com/thanos-io/thanos/pull/3231) 
- - Receive: Ability to populate tenant_id from metric labels (`--receive.extract-labels-config`), see [below](#why-extract-tenants-from-metrics)
- - Receive: fix for broken mmap file startup error
- - Receive: fix for compaction failed due to `invalid block sequence: block time ranges overlap` 
+- Receive: quorum for 2 nodes is `1` [#3231](https://github.com/thanos-io/thanos/pull/3231)
+- Receive: Ability to populate tenant_id from metric labels (`--receive.extract-labels-config`), see [below](#why-extract-tenants-from-metrics)
+- Receive: fix for broken mmap file startup error
+- Receive: fix for compaction failed due to `invalid block sequence: block time ranges overlap`
 
 Compiled images available at: https://hub.docker.com/repository/docker/sepa/thanos/tags
 
@@ -26,8 +26,8 @@ And you want to have all metrics available in one single place, let's say `dc3`.
 
 ### Pull based
 
-Classical one is per https://github.com/thanos-io/thanos#architecture-overview, you are adding `thanos-sidecar` component to each prometheus. 
-- For current metrics `thanos-query` connects to `thanos-sidecar` and pulls the data right from prometheus remote-read API. 
+Classical one is per https://github.com/thanos-io/thanos#architecture-overview, you are adding `thanos-sidecar` component to each prometheus.
+- For current metrics `thanos-query` connects to `thanos-sidecar` and pulls the data right from prometheus remote-read API.
 - Data older than 2h is uploaded to S3 and available via `thanos-store` component like so:
 ```bash
 # thanos tools bucket inspect
@@ -36,13 +36,13 @@ Classical one is per https://github.com/thanos-io/thanos#architecture-overview, 
 | 0HAXEM | 01-01-2021 00:00:00 | 2h    | prometheus=A,location=dc1 | sidecar |
 | 0WTQQF | 01-01-2021 00:00:00 | 2h    | prometheus=B,location=dc2 | sidecar |
 ```
-So, on S3 side each of your prometheus data is available independently and marked by same labels. You can use `store` [sharding based on labels](https://thanos.io/tip/components/store.md/#external-label-partitioning-sharding) to scale queries. Or you can drop only `prometheus=A` data, and leave `prometheus=B` to be available. 
+So, on S3 side each of your prometheus data is available independently and marked by same labels. You can use `store` [sharding based on labels](https://thanos.io/tip/components/store.md/#external-label-partitioning-sharding) to scale queries. Or you can drop only `prometheus=A` data, and leave `prometheus=B` to be available.
 
 Cool! But what to do if you do not have connectivity from `thanos-query` directly to you prometheuses (i.e. NAT)?
 
 ### Push based
 
-[Receive](https://thanos.io/tip/components/receive.md/#receiver) component was created to solve the problem for "air-gapped, or egress only environments". We're setting up `receive` in `dc3`, and targeting `remote_write` section of each prometheus to push metrics to `dc3`. 
+[Receive](https://thanos.io/tip/components/receive.md/#receiver) component was created to solve the problem for "air-gapped, or egress only environments". We're setting up `receive` in `dc3`, and targeting `remote_write` section of each prometheus to push metrics to `dc3`.
 In this case `receive` writes data to S3 like this:
 ```bash
 # thanos tools bucket inspect
@@ -157,8 +157,8 @@ tenantExternalLabels:
   - site
 ```
 Where:
- - `defaultExternalLabels` list of labels to extract to `external_labels`
- - `tenantExternalLabels` list of overrides if needed, per-tenant.
+- `defaultExternalLabels` list of labels to extract to `external_labels`
+- `tenantExternalLabels` list of overrides if needed, per-tenant.
 
 Given the metrics:
 ```ini

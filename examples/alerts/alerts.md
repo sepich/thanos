@@ -4,14 +4,12 @@ Here are some example alerts configured for Kubernetes environment.
 
 ## Compaction
 
-[embedmd]:# (../tmp/thanos-compact.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-compact.yaml"
 name: thanos-compact
 rules:
 - alert: ThanosCompactMultipleRunning
   annotations:
-    description: No more than one Thanos Compact instance should be running at once.
-      There are {{$value}} instances running.
+    description: No more than one Thanos Compact instance should be running at once. There are {{$value}} instances running.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanoscompactmultiplerunning
     summary: Thanos Compact has multiple instances running.
   expr: sum by (job) (up{job=~".*thanos-compact.*"}) > 1
@@ -22,15 +20,14 @@ rules:
   annotations:
     description: Thanos Compact {{$labels.job}} has failed to run and now is halted.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanoscompacthalted
-    summary: Thanos Compact has failed to run ans is now halted.
+    summary: Thanos Compact has failed to run and is now halted.
   expr: thanos_compact_halted{job=~".*thanos-compact.*"} == 1
   for: 5m
   labels:
     severity: warning
 - alert: ThanosCompactHighCompactionFailures
   annotations:
-    description: Thanos Compact {{$labels.job}} is failing to execute {{$value | humanize}}%
-      of compactions.
+    description: Thanos Compact {{$labels.job}} is failing to execute {{$value | humanize}}% of compactions.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanoscompacthighcompactionfailures
     summary: Thanos Compact is failing to execute compactions.
   expr: |
@@ -45,8 +42,7 @@ rules:
     severity: warning
 - alert: ThanosCompactBucketHighOperationFailures
   annotations:
-    description: Thanos Compact {{$labels.job}} Bucket is failing to execute {{$value
-      | humanize}}% of operations.
+    description: Thanos Compact {{$labels.job}} Bucket is failing to execute {{$value | humanize}}% of operations.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanoscompactbuckethighoperationfailures
     summary: Thanos Compact Bucket is having a high number of operation failures.
   expr: |
@@ -64,8 +60,7 @@ rules:
     description: Thanos Compact {{$labels.job}} has not uploaded anything for 24 hours.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanoscompacthasnotrun
     summary: Thanos Compact has not uploaded anything for last 24 hours.
-  expr: (time() - max by (job) (max_over_time(thanos_objstore_bucket_last_successful_upload_time{job=~".*thanos-compact.*"}[24h])))
-    / 60 / 60 > 24
+  expr: (time() - max by (job) (max_over_time(thanos_objstore_bucket_last_successful_upload_time{job=~".*thanos-compact.*"}[24h]))) / 60 / 60 > 24
   labels:
     severity: warning
 ```
@@ -74,8 +69,7 @@ rules:
 
 For Thanos Ruler we run some alerts in local Prometheus, to make sure that Thanos Ruler is working:
 
-[embedmd]:# (../tmp/thanos-rule.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-rule.yaml"
 name: thanos-rule
 rules:
 - alert: ThanosRuleQueueIsDroppingAlerts
@@ -125,8 +119,7 @@ rules:
     severity: info
 - alert: ThanosRuleRuleEvaluationLatencyHigh
   annotations:
-    description: Thanos Rule {{$labels.instance}} has higher evaluation latency than
-      interval for {{$labels.rule_group}}.
+    description: Thanos Rule {{$labels.instance}} has higher evaluation latency than interval for {{$labels.rule_group}}.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosruleruleevaluationlatencyhigh
     summary: Thanos Rule has high rule evaluation latency.
   expr: |
@@ -140,8 +133,7 @@ rules:
     severity: warning
 - alert: ThanosRuleGrpcErrorRate
   annotations:
-    description: Thanos Rule {{$labels.job}} is failing to handle {{$value | humanize}}%
-      of requests.
+    description: Thanos Rule {{$labels.job}} is failing to handle {{$value | humanize}}% of requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosrulegrpcerrorrate
     summary: Thanos Rule is failing to handle grpc requests.
   expr: |
@@ -159,15 +151,13 @@ rules:
     description: Thanos Rule {{$labels.job}} has not been able to reload its configuration.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosruleconfigreloadfailure
     summary: Thanos Rule has not been able to reload configuration.
-  expr: avg by (job, instance) (thanos_rule_config_last_reload_successful{job=~".*thanos-rule.*"})
-    != 1
+  expr: avg by (job, instance) (thanos_rule_config_last_reload_successful{job=~".*thanos-rule.*"}) != 1
   for: 5m
   labels:
     severity: info
 - alert: ThanosRuleQueryHighDNSFailures
   annotations:
-    description: Thanos Rule {{$labels.job}} has {{$value | humanize}}% of failing
-      DNS queries for query endpoints.
+    description: Thanos Rule {{$labels.job}} has {{$value | humanize}}% of failing DNS queries for query endpoints.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosrulequeryhighdnsfailures
     summary: Thanos Rule is having high number of DNS failures.
   expr: |
@@ -182,8 +172,7 @@ rules:
     severity: warning
 - alert: ThanosRuleAlertmanagerHighDNSFailures
   annotations:
-    description: Thanos Rule {{$labels.instance}} has {{$value | humanize}}% of failing
-      DNS queries for Alertmanager endpoints.
+    description: Thanos Rule {{$labels.instance}} has {{$value | humanize}}% of failing DNS queries for Alertmanager endpoints.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosrulealertmanagerhighdnsfailures
     summary: Thanos Rule is having high number of DNS failures.
   expr: |
@@ -198,8 +187,7 @@ rules:
     severity: warning
 - alert: ThanosRuleNoEvaluationFor10Intervals
   annotations:
-    description: Thanos Rule {{$labels.job}} has {{$value | humanize}}% rule groups
-      that did not evaluate for at least 10x of their expected interval.
+    description: Thanos Rule {{$labels.job}} has rule groups that did not evaluate for at least 10x of their expected interval.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosrulenoevaluationfor10intervals
     summary: Thanos Rule has rule groups that did not evaluate for 10 intervals.
   expr: |
@@ -211,8 +199,7 @@ rules:
     severity: info
 - alert: ThanosNoRuleEvaluations
   annotations:
-    description: Thanos Rule {{$labels.instance}} did not perform any rule evaluations
-      in the past 10 minutes.
+    description: Thanos Rule {{$labels.instance}} did not perform any rule evaluations in the past 10 minutes.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosnoruleevaluations
     summary: Thanos Rule did not perform any rule evaluations.
   expr: |
@@ -226,14 +213,12 @@ rules:
 
 ## Store Gateway
 
-[embedmd]:# (../tmp/thanos-store.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-store.yaml"
 name: thanos-store
 rules:
 - alert: ThanosStoreGrpcErrorRate
   annotations:
-    description: Thanos Store {{$labels.job}} is failing to handle {{$value | humanize}}%
-      of requests.
+    description: Thanos Store {{$labels.job}} is failing to handle {{$value | humanize}}% of requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosstoregrpcerrorrate
     summary: Thanos Store is failing to handle qrpcd requests.
   expr: |
@@ -248,8 +233,7 @@ rules:
     severity: warning
 - alert: ThanosStoreSeriesGateLatencyHigh
   annotations:
-    description: Thanos Store {{$labels.job}} has a 99th percentile latency of {{$value}}
-      seconds for store series gate requests.
+    description: Thanos Store {{$labels.job}} has a 99th percentile latency of {{$value}} seconds for store series gate requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosstoreseriesgatelatencyhigh
     summary: Thanos Store has high latency for store series gate requests.
   expr: |
@@ -263,8 +247,7 @@ rules:
     severity: warning
 - alert: ThanosStoreBucketHighOperationFailures
   annotations:
-    description: Thanos Store {{$labels.job}} Bucket is failing to execute {{$value
-      | humanize}}% of operations.
+    description: Thanos Store {{$labels.job}} Bucket is failing to execute {{$value | humanize}}% of operations.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosstorebuckethighoperationfailures
     summary: Thanos Store Bucket is failing to execute operations.
   expr: |
@@ -279,8 +262,7 @@ rules:
     severity: warning
 - alert: ThanosStoreObjstoreOperationLatencyHigh
   annotations:
-    description: Thanos Store {{$labels.job}} Bucket has a 99th percentile latency
-      of {{$value}} seconds for the bucket operations.
+    description: Thanos Store {{$labels.job}} Bucket has a 99th percentile latency of {{$value}} seconds for the bucket operations.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosstoreobjstoreoperationlatencyhigh
     summary: Thanos Store is having high latency for bucket operations.
   expr: |
@@ -296,20 +278,9 @@ rules:
 
 ## Sidecar
 
-[embedmd]:# (../tmp/thanos-sidecar.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-sidecar.yaml"
 name: thanos-sidecar
 rules:
-- alert: ThanosSidecarPrometheusDown
-  annotations:
-    description: Thanos Sidecar {{$labels.instance}} cannot connect to Prometheus.
-    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanossidecarprometheusdown
-    summary: Thanos Sidecar cannot connect to Prometheus
-  expr: |
-    thanos_sidecar_prometheus_up{job=~".*thanos-sidecar.*"} == 0
-  for: 5m
-  labels:
-    severity: critical
 - alert: ThanosSidecarBucketOperationsFailed
   annotations:
     description: Thanos Sidecar {{$labels.instance}} bucket operations are failing
@@ -320,28 +291,28 @@ rules:
   for: 5m
   labels:
     severity: critical
-- alert: ThanosSidecarUnhealthy
+- alert: ThanosSidecarNoConnectionToStartedPrometheus
   annotations:
-    description: Thanos Sidecar {{$labels.instance}} is unhealthy for more than {{$value}}
-      seconds.
-    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanossidecarunhealthy
-    summary: Thanos Sidecar is unhealthy.
+    description: Thanos Sidecar {{$labels.instance}} is unhealthy.
+    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanossidecarnoconnectiontostartedprometheus
+    summary: Thanos Sidecar cannot access Prometheus, even though Prometheus seems healthy and has reloaded WAL.
   expr: |
-    time() - max by (job, instance) (timestamp(thanos_sidecar_last_heartbeat_success_time_seconds{job=~".*thanos-sidecar.*"})) >= 240
+    thanos_sidecar_prometheus_up{job=~".*thanos-sidecar.*"} == 0
+    AND on (namespace, pod)
+    prometheus_tsdb_data_replay_duration_seconds != 0
+  for: 5m
   labels:
     severity: critical
 ```
 
 ## Query
 
-[embedmd]:# (../tmp/thanos-query.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-query.yaml"
 name: thanos-query
 rules:
 - alert: ThanosQueryHttpRequestQueryErrorRateHigh
   annotations:
-    description: Thanos Query {{$labels.job}} is failing to handle {{$value | humanize}}%
-      of "query" requests.
+    description: Thanos Query {{$labels.job}} is failing to handle {{$value | humanize}}% of "query" requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosqueryhttprequestqueryerrorratehigh
     summary: Thanos Query is failing to handle requests.
   expr: |
@@ -355,8 +326,7 @@ rules:
     severity: critical
 - alert: ThanosQueryHttpRequestQueryRangeErrorRateHigh
   annotations:
-    description: Thanos Query {{$labels.job}} is failing to handle {{$value | humanize}}%
-      of "query_range" requests.
+    description: Thanos Query {{$labels.job}} is failing to handle {{$value | humanize}}% of "query_range" requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosqueryhttprequestqueryrangeerrorratehigh
     summary: Thanos Query is failing to handle requests.
   expr: |
@@ -370,8 +340,7 @@ rules:
     severity: critical
 - alert: ThanosQueryGrpcServerErrorRate
   annotations:
-    description: Thanos Query {{$labels.job}} is failing to handle {{$value | humanize}}%
-      of requests.
+    description: Thanos Query {{$labels.job}} is failing to handle {{$value | humanize}}% of requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosquerygrpcservererrorrate
     summary: Thanos Query is failing to handle requests.
   expr: |
@@ -386,8 +355,7 @@ rules:
     severity: warning
 - alert: ThanosQueryGrpcClientErrorRate
   annotations:
-    description: Thanos Query {{$labels.job}} is failing to send {{$value | humanize}}%
-      of requests.
+    description: Thanos Query {{$labels.job}} is failing to send {{$value | humanize}}% of requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosquerygrpcclienterrorrate
     summary: Thanos Query is failing to send requests.
   expr: |
@@ -401,8 +369,7 @@ rules:
     severity: warning
 - alert: ThanosQueryHighDNSFailures
   annotations:
-    description: Thanos Query {{$labels.job}} have {{$value | humanize}}% of failing
-      DNS queries for store endpoints.
+    description: Thanos Query {{$labels.job}} have {{$value | humanize}}% of failing DNS queries for store endpoints.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosqueryhighdnsfailures
     summary: Thanos Query is having high number of DNS failures.
   expr: |
@@ -416,8 +383,7 @@ rules:
     severity: warning
 - alert: ThanosQueryInstantLatencyHigh
   annotations:
-    description: Thanos Query {{$labels.job}} has a 99th percentile latency of {{$value}}
-      seconds for instant queries.
+    description: Thanos Query {{$labels.job}} has a 99th percentile latency of {{$value}} seconds for instant queries.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosqueryinstantlatencyhigh
     summary: Thanos Query has high latency for queries.
   expr: |
@@ -431,8 +397,7 @@ rules:
     severity: critical
 - alert: ThanosQueryRangeLatencyHigh
   annotations:
-    description: Thanos Query {{$labels.job}} has a 99th percentile latency of {{$value}}
-      seconds for range queries.
+    description: Thanos Query {{$labels.job}} has a 99th percentile latency of {{$value}} seconds for range queries.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosqueryrangelatencyhigh
     summary: Thanos Query has high latency for queries.
   expr: |
@@ -448,14 +413,12 @@ rules:
 
 ## Receive
 
-[embedmd]:# (../tmp/thanos-receive.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-receive.yaml"
 name: thanos-receive
 rules:
 - alert: ThanosReceiveHttpRequestErrorRateHigh
   annotations:
-    description: Thanos Receive {{$labels.job}} is failing to handle {{$value | humanize}}%
-      of requests.
+    description: Thanos Receive {{$labels.job}} is failing to handle {{$value | humanize}}% of requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceivehttprequesterrorratehigh
     summary: Thanos Receive is failing to handle requests.
   expr: |
@@ -469,8 +432,7 @@ rules:
     severity: critical
 - alert: ThanosReceiveHttpRequestLatencyHigh
   annotations:
-    description: Thanos Receive {{$labels.job}} has a 99th percentile latency of {{
-      $value }} seconds for requests.
+    description: Thanos Receive {{$labels.job}} has a 99th percentile latency of {{ $value }} seconds for requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceivehttprequestlatencyhigh
     summary: Thanos Receive has high HTTP requests latency.
   expr: |
@@ -484,8 +446,7 @@ rules:
     severity: critical
 - alert: ThanosReceiveHighReplicationFailures
   annotations:
-    description: Thanos Receive {{$labels.job}} is failing to replicate {{$value |
-      humanize}}% of requests.
+    description: Thanos Receive {{$labels.job}} is failing to replicate {{$value | humanize}}% of requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceivehighreplicationfailures
     summary: Thanos Receive is having high number of replication failures.
   expr: |
@@ -509,8 +470,7 @@ rules:
     severity: warning
 - alert: ThanosReceiveHighForwardRequestFailures
   annotations:
-    description: Thanos Receive {{$labels.job}} is failing to forward {{$value | humanize}}%
-      of requests.
+    description: Thanos Receive {{$labels.job}} is failing to forward {{$value | humanize}}% of requests.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceivehighforwardrequestfailures
     summary: Thanos Receive is failing to forward requests.
   expr: |
@@ -524,8 +484,7 @@ rules:
     severity: info
 - alert: ThanosReceiveHighHashringFileRefreshFailures
   annotations:
-    description: Thanos Receive {{$labels.job}} is failing to refresh hashring file,
-      {{$value | humanize}} of attempts failed.
+    description: Thanos Receive {{$labels.job}} is failing to refresh hashring file, {{$value | humanize}} of attempts failed.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceivehighhashringfilerefreshfailures
     summary: Thanos Receive is failing to refresh hasring file.
   expr: |
@@ -540,19 +499,16 @@ rules:
     severity: warning
 - alert: ThanosReceiveConfigReloadFailure
   annotations:
-    description: Thanos Receive {{$labels.job}} has not been able to reload hashring
-      configurations.
+    description: Thanos Receive {{$labels.job}} has not been able to reload hashring configurations.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceiveconfigreloadfailure
     summary: Thanos Receive has not been able to reload configuration.
-  expr: avg by (job) (thanos_receive_config_last_reload_successful{job=~".*thanos-receive.*"})
-    != 1
+  expr: avg by (job) (thanos_receive_config_last_reload_successful{job=~".*thanos-receive.*"}) != 1
   for: 5m
   labels:
     severity: warning
 - alert: ThanosReceiveNoUpload
   annotations:
-    description: Thanos Receive {{$labels.instance}} has not uploaded latest data
-      to object storage.
+    description: Thanos Receive {{$labels.instance}} has not uploaded latest data to object storage.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceivenoupload
     summary: Thanos Receive has not uploaded latest data to object storage.
   expr: |
@@ -562,20 +518,32 @@ rules:
   for: 3h
   labels:
     severity: critical
+- alert: ThanosReceiveTrafficBelowThreshold
+  annotations:
+    description: At Thanos Receive {{$labels.job}} in {{$labels.namespace}} , the average 1-hr avg. metrics ingestion rate  is {{$value | humanize}}% of 12-hr avg. ingestion rate.
+    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceivetrafficbelowthreshold
+    summary: Thanos Receive is experiencing low avg. 1-hr ingestion rate relative to avg. 12-hr ingestion rate.
+  expr: |
+    (
+      avg_over_time(rate(http_requests_total{job=~".*thanos-receive.*", code=~"2..", handler="receive"}[5m])[1h:5m])
+    /
+      avg_over_time(rate(http_requests_total{job=~".*thanos-receive.*", code=~"2..", handler="receive"}[5m])[12h:5m])
+    ) * 100 < 50
+  for: 1h
+  labels:
+    severity: warning
 ```
 
 ## Replicate
 
-[embedmd]:# (../tmp/thanos-bucket-replicate.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-bucket-replicate.yaml"
 name: thanos-bucket-replicate
 rules:
 - alert: ThanosBucketReplicateErrorRate
   annotations:
-    description: Thanos Replicate is failing to run, {{$value | humanize}}% of attempts
-      failed.
+    description: Thanos Replicate is failing to run, {{$value | humanize}}% of attempts failed.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosbucketreplicateerrorrate
-    summary: Thanose Replicate is failing to run.
+    summary: Thanos Replicate is failing to run.
   expr: |
     (
       sum by (job) (rate(thanos_replicate_replication_runs_total{result="error", job=~".*thanos-bucket-replicate.*"}[5m]))
@@ -587,8 +555,7 @@ rules:
     severity: critical
 - alert: ThanosBucketReplicateRunLatency
   annotations:
-    description: Thanos Replicate {{$labels.job}} has a 99th percentile latency of
-      {{$value}} seconds for the replicate operations.
+    description: Thanos Replicate {{$labels.job}} has a 99th percentile latency of {{$value}} seconds for the replicate operations.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosbucketreplicaterunlatency
     summary: Thanos Replicate has a high latency for replicate operations.
   expr: |
@@ -606,25 +573,12 @@ rules:
 
 ### Absent Rules
 
-[embedmd]:# (../tmp/thanos-component-absent.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-component-absent.yaml"
 name: thanos-component-absent
 rules:
-- alert: ThanosBucketReplicateIsDown
-  annotations:
-    description: ThanosBucketReplicate has disappeared. Prometheus target for the
-      component cannot be discovered.
-    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosbucketreplicateisdown
-    summary: Thanos component has disappeared.
-  expr: |
-    absent(up{job=~".*thanos-bucket-replicate.*"} == 1)
-  for: 5m
-  labels:
-    severity: critical
 - alert: ThanosCompactIsDown
   annotations:
-    description: ThanosCompact has disappeared. Prometheus target for the component
-      cannot be discovered.
+    description: ThanosCompact has disappeared. Prometheus target for the component cannot be discovered.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanoscompactisdown
     summary: Thanos component has disappeared.
   expr: |
@@ -634,8 +588,7 @@ rules:
     severity: critical
 - alert: ThanosQueryIsDown
   annotations:
-    description: ThanosQuery has disappeared. Prometheus target for the component
-      cannot be discovered.
+    description: ThanosQuery has disappeared. Prometheus target for the component cannot be discovered.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosqueryisdown
     summary: Thanos component has disappeared.
   expr: |
@@ -645,8 +598,7 @@ rules:
     severity: critical
 - alert: ThanosReceiveIsDown
   annotations:
-    description: ThanosReceive has disappeared. Prometheus target for the component
-      cannot be discovered.
+    description: ThanosReceive has disappeared. Prometheus target for the component cannot be discovered.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceiveisdown
     summary: Thanos component has disappeared.
   expr: |
@@ -656,8 +608,7 @@ rules:
     severity: critical
 - alert: ThanosRuleIsDown
   annotations:
-    description: ThanosRule has disappeared. Prometheus target for the component cannot
-      be discovered.
+    description: ThanosRule has disappeared. Prometheus target for the component cannot be discovered.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosruleisdown
     summary: Thanos component has disappeared.
   expr: |
@@ -667,8 +618,7 @@ rules:
     severity: critical
 - alert: ThanosSidecarIsDown
   annotations:
-    description: ThanosSidecar has disappeared. Prometheus target for the component
-      cannot be discovered.
+    description: ThanosSidecar has disappeared. Prometheus target for the component cannot be discovered.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanossidecarisdown
     summary: Thanos component has disappeared.
   expr: |
@@ -678,8 +628,7 @@ rules:
     severity: critical
 - alert: ThanosStoreIsDown
   annotations:
-    description: ThanosStore has disappeared. Prometheus target for the component
-      cannot be discovered.
+    description: ThanosStore has disappeared. Prometheus target for the component cannot be discovered.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosstoreisdown
     summary: Thanos component has disappeared.
   expr: |

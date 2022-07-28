@@ -13,7 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
+
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
@@ -52,6 +53,21 @@ func TestHTTPServerMiddleware(t *testing.T) {
 
 	// Typical way:
 	req = httptest.NewRequest("GET", "http://example.com:5555/foo", nil)
+	b.Reset()
+
+	w = httptest.NewRecorder()
+	hm(w, req)
+
+	resp = w.Result()
+	body, err = ioutil.ReadAll(resp.Body)
+	testutil.Ok(t, err)
+
+	testutil.Equals(t, 200, resp.StatusCode)
+	testutil.Equals(t, "Test Works", string(body))
+	testutil.Assert(t, !strings.Contains(b.String(), "err="))
+
+	// URL with no explicit port number in the format- hostname:port
+	req = httptest.NewRequest("GET", "http://example.com/foo", nil)
 	b.Reset()
 
 	w = httptest.NewRecorder()

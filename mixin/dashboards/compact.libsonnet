@@ -1,5 +1,4 @@
 local g = import '../lib/thanos-grafana-builder/builder.libsonnet';
-local utils = import '../lib/utils.libsonnet';
 
 {
   local thanos = self,
@@ -7,7 +6,7 @@ local utils = import '../lib/utils.libsonnet';
     selector: error 'must provide selector for Thanos Compact dashboard',
     title: error 'must provide title for Thanos Compact dashboard',
     dashboard:: {
-      selector: std.join(', ', thanos.dashboard.selector + ['job="$job"']),
+      selector: std.join(', ', thanos.dashboard.selector + ['job=~"$job"']),
       dimensions: std.join(', ', thanos.dashboard.dimensions + ['job']),
     },
   },
@@ -174,7 +173,7 @@ local utils = import '../lib/utils.libsonnet';
         g.resourceUtilizationRow(thanos.compact.dashboard.selector, thanos.compact.dashboard.dimensions)
       ),
 
-    __overviewRows__+:: [
+    __overviewRows__+:: if thanos.compact == null then [] else [
       g.row('Compact')
       .addPanel(
         g.panel(

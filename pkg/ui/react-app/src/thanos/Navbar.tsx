@@ -13,6 +13,7 @@ import {
   DropdownToggle,
 } from 'reactstrap';
 import PathPrefixProps from '../types/PathPrefixProps';
+import { ThemeToggle } from '../Theme';
 
 interface NavConfig {
   name: string;
@@ -33,9 +34,9 @@ const navConfig: { [component: string]: (NavConfig | NavDropDown)[] } = {
       children: [
         { name: 'Runtime & Build Information', uri: '/status' },
         { name: 'Command-Line Flags', uri: '/flags' },
-        // TODO(onprem): Uncomment after `--target` flag on Querier becomes
-        // non-hidden or we move to `--endpoint`.
-        // { name: 'Targets', uri: '/targets' },
+        { name: 'Alerts', uri: '/alerts' },
+        { name: 'Targets', uri: '/targets' },
+        { name: 'Rules', uri: '/rules' },
       ],
     },
   ],
@@ -83,14 +84,6 @@ const navConfig: { [component: string]: (NavConfig | NavDropDown)[] } = {
   ],
 };
 
-const defaultClassicUIRoute: { [component: string]: string } = {
-  query: '/classic/graph',
-  rule: '/classic/alerts',
-  bucket: '/classic',
-  compact: '/classic/loaded',
-  store: '/classic/loaded',
-};
-
 interface NavigationProps {
   thanosComponent: string;
   defaultRoute: string;
@@ -101,7 +94,7 @@ const Navigation: FC<PathPrefixProps & NavigationProps> = ({ pathPrefix, thanosC
   const toggle = () => setIsOpen(!isOpen);
   return (
     <Navbar className="mb-3" dark color="dark" expand="md" fixed="top">
-      <NavbarToggler onClick={toggle} />
+      <NavbarToggler onClick={toggle} className="mr-2" />
       <Link className="navbar-brand" to={`${pathPrefix}${defaultRoute}`}>
         Thanos - {thanosComponent[0].toUpperCase()}
         {thanosComponent.substr(1, thanosComponent.length)}
@@ -136,13 +129,9 @@ const Navigation: FC<PathPrefixProps & NavigationProps> = ({ pathPrefix, thanosC
           <NavItem>
             <NavLink href="https://thanos.io/tip/thanos/getting-started.md/">Help</NavLink>
           </NavItem>
-          <NavItem>
-            <NavLink href={`${pathPrefix}${defaultClassicUIRoute[thanosComponent]}${window.location.search}`}>
-              Classic UI
-            </NavLink>
-          </NavItem>
         </Nav>
       </Collapse>
+      <ThemeToggle />
     </Navbar>
   );
 };

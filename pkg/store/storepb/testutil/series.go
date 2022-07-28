@@ -16,11 +16,12 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/types"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/wal"
+
 	"github.com/thanos-io/thanos/pkg/store/hintspb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -82,7 +83,7 @@ func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head,
 
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = opts.TSDBDir
-	h, err := tsdb.NewHead(nil, nil, w, headOpts)
+	h, err := tsdb.NewHead(nil, nil, w, headOpts, nil)
 	testutil.Ok(t, err)
 
 	app := h.Appender(context.Background())

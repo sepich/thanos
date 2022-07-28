@@ -13,15 +13,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	cortexutil "github.com/cortexproject/cortex/pkg/util"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/weaveworks/common/httpgrpc"
 
+	"github.com/thanos-io/thanos/internal/cortex/querier/queryrange"
+	cortexutil "github.com/thanos-io/thanos/internal/cortex/util"
+
 	queryv1 "github.com/thanos-io/thanos/pkg/api/query"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
 const (
@@ -53,7 +54,7 @@ func NewThanosQueryRangeCodec(partialResponse bool) *queryRangeCodec {
 	}
 }
 
-func (c queryRangeCodec) DecodeRequest(_ context.Context, r *http.Request) (queryrange.Request, error) {
+func (c queryRangeCodec) DecodeRequest(_ context.Context, r *http.Request, forwardHeaders []string) (queryrange.Request, error) {
 	var (
 		result ThanosQueryRangeRequest
 		err    error
@@ -126,6 +127,14 @@ func (c queryRangeCodec) DecodeRequest(_ context.Context, r *http.Request) (quer
 		}
 	}
 
+	for _, header := range forwardHeaders {
+		for h, hv := range r.Header {
+			if strings.EqualFold(h, header) {
+				result.Headers = append(result.Headers, &RequestHeader{Name: h, Values: hv})
+				break
+			}
+		}
+	}
 	return &result, nil
 }
 
@@ -161,7 +170,11 @@ func (c queryRangeCodec) EncodeRequest(ctx context.Context, r queryrange.Request
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, "error creating request: %s", err.Error())
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
+	for _, hv := range thanosReq.Headers {
+		for _, v := range hv.Values {
+			req.Header.Add(hv.Name, v)
+		}
+	}
 	return req.WithContext(ctx), nil
 }
 
@@ -180,7 +193,7 @@ func parseDurationMillis(s string) (int64, error) {
 }
 
 func parseEnableDedupParam(s string) (bool, error) {
-	enableDeduplication := true
+	enableDeduplication := true // Deduplication is enabled by default.
 	if s != "" {
 		var err error
 		enableDeduplication, err = strconv.ParseBool(s)

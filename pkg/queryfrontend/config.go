@@ -7,17 +7,20 @@ import (
 	"strings"
 	"time"
 
-	cortexcache "github.com/cortexproject/cortex/pkg/chunk/cache"
-	"github.com/cortexproject/cortex/pkg/frontend/transport"
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	cortexvalidation "github.com/cortexproject/cortex/pkg/util/validation"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	extflag "github.com/efficientgo/tools/extkingpin"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
+	prommodel "github.com/prometheus/common/model"
 	"gopkg.in/yaml.v2"
 
+	cortexcache "github.com/thanos-io/thanos/internal/cortex/chunk/cache"
+	"github.com/thanos-io/thanos/internal/cortex/frontend/transport"
+	"github.com/thanos-io/thanos/internal/cortex/querier"
+	"github.com/thanos-io/thanos/internal/cortex/querier/queryrange"
+	"github.com/thanos-io/thanos/internal/cortex/util/flagext"
+	cortexvalidation "github.com/thanos-io/thanos/internal/cortex/util/validation"
 	"github.com/thanos-io/thanos/pkg/cacheutil"
-	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/model"
 )
 
@@ -26,6 +29,7 @@ type ResponseCacheProvider string
 const (
 	INMEMORY  ResponseCacheProvider = "IN-MEMORY"
 	MEMCACHED ResponseCacheProvider = "MEMCACHED"
+	REDIS     ResponseCacheProvider = "REDIS"
 )
 
 var (
@@ -40,6 +44,11 @@ var (
 			MaxItemSize:               model.Bytes(1024 * 1024),
 			DNSProviderUpdateInterval: 10 * time.Second,
 		},
+		Expiration: 24 * time.Hour,
+	}
+	// DefaultRedisConfig is default redis config for queryfrontend.
+	DefaultRedisConfig = RedisResponseCacheConfig{
+		Redis:      cacheutil.DefaultRedisClientConfig,
 		Expiration: 24 * time.Hour,
 	}
 )
@@ -57,6 +66,13 @@ type InMemoryResponseCacheConfig struct {
 // MemcachedResponseCacheConfig holds the configs for the memcache cache provider.
 type MemcachedResponseCacheConfig struct {
 	Memcached cacheutil.MemcachedClientConfig `yaml:",inline"`
+	// Expiration sets a global expiration limit for all cached items.
+	Expiration time.Duration `yaml:"expiration"`
+}
+
+// RedisResponseCacheConfig holds the configs for the redis cache provider.
+type RedisResponseCacheConfig struct {
+	Redis cacheutil.RedisClientConfig `yaml:",inline"`
 	// Expiration sets a global expiration limit for all cached items.
 	Expiration time.Duration `yaml:"expiration"`
 }
@@ -133,21 +149,61 @@ func NewCacheConfig(logger log.Logger, confContentYaml []byte) (*cortexcache.Con
 				WriteBackGoroutines: config.Memcached.MaxAsyncConcurrency,
 			},
 		}, nil
+	case string(REDIS):
+		config := DefaultRedisConfig
+		if err := yaml.UnmarshalStrict(backendConfig, &config); err != nil {
+			return nil, err
+		}
+		if config.Expiration <= 0 {
+			level.Warn(logger).Log("msg", "redis cache valid time set to 0, so using a default of 24 hours expiration time")
+			config.Expiration = 24 * time.Hour
+		}
+		return &cortexcache.Config{
+			Redis: cortexcache.RedisConfig{
+				Endpoint:    config.Redis.Addr,
+				Timeout:     config.Redis.ReadTimeout,
+				Expiration:  config.Expiration,
+				DB:          config.Redis.DB,
+				PoolSize:    config.Redis.PoolSize,
+				Password:    flagext.Secret{Value: config.Redis.Password},
+				IdleTimeout: config.Redis.IdleTimeout,
+				MaxConnAge:  config.Redis.MaxConnAge,
+			},
+			Background: cortexcache.BackgroundConfig{
+				WriteBackBuffer:     config.Redis.MaxSetMultiConcurrency * config.Redis.SetMultiBatchSize,
+				WriteBackGoroutines: config.Redis.MaxSetMultiConcurrency,
+			},
+		}, nil
 	default:
 		return nil, errors.Errorf("response cache with type %s is not supported", cacheConfig.Type)
 	}
+}
+
+// DownstreamTripperConfig stores the http.Transport configuration for query-frontend's HTTP downstream tripper.
+type DownstreamTripperConfig struct {
+	IdleConnTimeout       prommodel.Duration `yaml:"idle_conn_timeout"`
+	ResponseHeaderTimeout prommodel.Duration `yaml:"response_header_timeout"`
+	TLSHandshakeTimeout   prommodel.Duration `yaml:"tls_handshake_timeout"`
+	ExpectContinueTimeout prommodel.Duration `yaml:"expect_continue_timeout"`
+	MaxIdleConns          *int               `yaml:"max_idle_conns"`
+	MaxIdleConnsPerHost   *int               `yaml:"max_idle_conns_per_host"`
+	MaxConnsPerHost       *int               `yaml:"max_conns_per_host"`
+
+	CachePathOrContent extflag.PathOrContent
 }
 
 // Config holds the query frontend configs.
 type Config struct {
 	QueryRangeConfig
 	LabelsConfig
+	DownstreamTripperConfig
 
 	CortexHandlerConfig    *transport.HandlerConfig
 	CompressResponses      bool
 	CacheCompression       string
 	RequestLoggingDecision string
 	DownstreamURL          string
+	ForwardHeaders         []string
 }
 
 // QueryRangeConfig holds the config for query range tripperware.
@@ -188,7 +244,7 @@ func (cfg *Config) Validate() error {
 		if cfg.QueryRangeConfig.SplitQueriesByInterval <= 0 {
 			return errors.New("split queries interval should be greater than 0 when caching is enabled")
 		}
-		if err := cfg.QueryRangeConfig.ResultsCacheConfig.Validate(); err != nil {
+		if err := cfg.QueryRangeConfig.ResultsCacheConfig.Validate(querier.Config{}); err != nil {
 			return errors.Wrap(err, "invalid ResultsCache config for query_range tripperware")
 		}
 	}
@@ -197,7 +253,7 @@ func (cfg *Config) Validate() error {
 		if cfg.LabelsConfig.SplitQueriesByInterval <= 0 {
 			return errors.New("split queries interval should be greater than 0  when caching is enabled")
 		}
-		if err := cfg.LabelsConfig.ResultsCacheConfig.Validate(); err != nil {
+		if err := cfg.LabelsConfig.ResultsCacheConfig.Validate(querier.Config{}); err != nil {
 			return errors.Wrap(err, "invalid ResultsCache config for labels tripperware")
 		}
 	}
@@ -206,7 +262,7 @@ func (cfg *Config) Validate() error {
 		return errors.New("labels.default-time-range cannot be set to 0")
 	}
 
-	if len(cfg.DownstreamURL) == 0 {
+	if cfg.DownstreamURL == "" {
 		return errors.New("downstream URL should be configured")
 	}
 

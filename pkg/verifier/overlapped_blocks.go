@@ -7,12 +7,12 @@ import (
 	"context"
 	"sort"
 
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/tsdb"
+
 	"github.com/thanos-io/thanos/pkg/block"
-	"github.com/thanos-io/thanos/pkg/compact"
 )
 
 // OverlappedBlocksIssue checks bucket for blocks with overlapped time ranges.
@@ -52,7 +52,7 @@ func fetchOverlaps(ctx context.Context, fetcher block.MetadataFetcher) (map[stri
 
 	groupMetasMap := map[string][]tsdb.BlockMeta{}
 	for _, meta := range metas {
-		groupKey := compact.DefaultGroupKey(meta.Thanos)
+		groupKey := meta.Thanos.GroupKey()
 		groupMetasMap[groupKey] = append(groupMetasMap[groupKey], meta.BlockMeta)
 	}
 

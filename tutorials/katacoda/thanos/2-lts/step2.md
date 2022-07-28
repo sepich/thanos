@@ -40,7 +40,7 @@ Enter the credentials as mentioned below:
 **Access Key** = `minio`
 **Secret Key** = `melovethanos`
 
-## Sidear block backup
+## Sidecar block backup
 
 All Thanos components that use object storage uses the same `objstore.config` flag with the same "little" bucket config format.
 
@@ -63,7 +63,7 @@ Let's restart sidecar with updated configuration in backup mode.
 docker stop prometheus-0-eu1-sidecar
 ```{{execute}}
 
-[Thanos sidecar](https://thanos.io/tip/components/sidecar.md/) allows to backup all the blocks that Prometheus persits to
+[Thanos sidecar](https://thanos.io/tip/components/sidecar.md/) allows to backup all the blocks that Prometheus persists to
 the disk. In order to accomplish this we need to make sure that:
 
 * Sidecar has direct access to the Prometheus data directory (in our case host's /root/prom-eu1 dir) (`--tsdb.path` flag)
@@ -79,7 +79,7 @@ docker run -d --net=host --rm \
     -v /root/prom-eu1:/prometheus \
     --name prometheus-0-eu1-sidecar \
     -u root \
-    quay.io/thanos/thanos:v0.20.0 \
+    quay.io/thanos/thanos:v0.26.0 \
     sidecar \
     --tsdb.path /prometheus \
     --objstore.config-file /etc/thanos/minio-bucket.yaml \

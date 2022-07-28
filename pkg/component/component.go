@@ -88,11 +88,31 @@ func FromProto(storeType storepb.StoreType) StoreAPI {
 	}
 }
 
+func FromString(storeType string) StoreAPI {
+	switch storeType {
+	case "query":
+		return Query
+	case "rule":
+		return Rule
+	case "sidecar":
+		return Sidecar
+	case "store":
+		return Store
+	case "receive":
+		return Receive
+	case "debug":
+		return Debug
+	default:
+		return UnknownStoreAPI
+	}
+}
+
 var (
 	Bucket          = source{component: component{name: "bucket"}}
 	Cleanup         = source{component: component{name: "cleanup"}}
 	Mark            = source{component: component{name: "mark"}}
 	Rewrite         = source{component: component{name: "rewrite"}}
+	Retention       = source{component: component{name: "retention"}}
 	Compact         = source{component: component{name: "compact"}}
 	Downsample      = source{component: component{name: "downsample"}}
 	Replicate       = source{component: component{name: "replicate"}}

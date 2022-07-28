@@ -1,21 +1,15 @@
----
-title: Sidecar
-type: docs
-menu: components
----
-
 # Sidecar
 
-The `thanos sidecar` command runs a component that gets deployed along with a Prometheus instance. This allows sidecar to optionally upload metrics to object storage and allow [Queriers](./query.md) to query Prometheus data with common, efficient StoreAPI.
+The `thanos sidecar` command runs a component that gets deployed along with a Prometheus instance. This allows sidecar to optionally upload metrics to object storage and allow [Queriers](query.md) to query Prometheus data with common, efficient StoreAPI.
 
 In details:
 
-* It implements Thanos' Store API on top of Prometheus' remote-read API. This allows [Queriers](./query.md) to treat Prometheus servers as yet another source of time series data without directly talking to its APIs.
+* It implements Thanos' Store API on top of Prometheus' remote-read API. This allows [Queriers](query.md) to treat Prometheus servers as yet another source of time series data without directly talking to its APIs.
 * Optionally, the sidecar uploads TSDB blocks to an object storage bucket as Prometheus produces them every 2 hours. This allows Prometheus servers to be run with relatively low retention while their historic data is made durable and queryable via object storage.
 
-  NOTE: This still does NOT mean that Prometheus can be fully stateless, because if it crashes and restarts you will lose ~2 hours of metrics, so persistent disk for Prometheus is highly recommended. The closest to stateless you can get is using remote write (which Thanos supports, see [Receiver](./receive.md). Remote write has other risks and consequences, and still if crashed you loose in positive case seconds of metrics data, so persistent disk is recommended in all cases.
+  NOTE: This still does NOT mean that Prometheus can be fully stateless, because if it crashes and restarts you will lose ~2 hours of metrics, so persistent disk for Prometheus is highly recommended. The closest to stateless you can get is using remote write (which Thanos supports, see [Receiver](receive.md). Remote write has other risks and consequences, and still if crashed you lose in positive case seconds of metrics data, so persistent disk is recommended in all cases.
 
-* Optionally Thanos sidecar is able to watch Prometheus rules and configuration, decompress and substitute environment variables if needed and ping Prometheus to reload them. Read more about this in [here](./sidecar.md#reloader-configuration)
+* Optionally Thanos sidecar is able to watch Prometheus rules and configuration, decompress and substitute environment variables if needed and ping Prometheus to reload them. Read more about this in [here](#reloader-configuration)
 
 Prometheus servers connected to the Thanos cluster via the sidecar are subject to a few limitations and recommendations for safe operations:
 
@@ -27,10 +21,9 @@ Prometheus servers connected to the Thanos cluster via the sidecar are subject t
 If you choose to use the sidecar to also upload data to object storage:
 
 * Must specify object storage (`--objstore.*` flags)
-* It only uploads uncompacted Prometheus blocks. For compacted blocks, see [Upload compacted blocks](./sidecar.md/#upload-compacted-blocks).
-* The `--storage.tsdb.min-block-duration` and `--storage.tsdb.max-block-duration` must be set to equal values to disable local compaction on order to use Thanos sidecar upload, otherwise leave local compaction on if sidecar just exposes StoreAPI and your retention is normal. The default of `2h` is recommended.
-  Mentioned parameters set to equal values disable the internal Prometheus compaction, which is needed to avoid the uploaded data corruption when Thanos compactor does its job, this is critical for data consistency and should not be ignored if you plan to use Thanos compactor. Even though you set mentioned parameters equal, you might observe Prometheus internal metric `prometheus_tsdb_compactions_total` being incremented, don't be confused by that: Prometheus writes initial head block to filesytem via its internal compaction mechanism, but if you have followed recommendations - data won't be modified by Prometheus before the sidecar uploads it. Thanos sidecar will also check sanity of the flags set to Prometheus on the startup and log errors or warning if they have been configured improperly (#838).
-* The retention is recommended to not be lower than three times the min block duration, so 6 hours. This achieves resilience in the face of connectivity issues to the object storage since all local data will remain available within the Thanos cluster. If connectivity gets restored the backlog of blocks gets uploaded to the object storage.
+* It only uploads uncompacted Prometheus blocks. For compacted blocks, see [Upload compacted blocks](#upload-compacted-blocks).
+* The `--storage.tsdb.min-block-duration` and `--storage.tsdb.max-block-duration` must be set to equal values to disable local compaction in order to use Thanos sidecar upload, otherwise leave local compaction on if sidecar just exposes StoreAPI and your retention is normal. The default of `2h` is recommended. Mentioned parameters set to equal values disable the internal Prometheus compaction, which is needed to avoid the corruption of uploaded data when Thanos compactor does its job, this is critical for data consistency and should not be ignored if you plan to use Thanos compactor. Even though you set mentioned parameters equal, you might observe Prometheus internal metric `prometheus_tsdb_compactions_total` being incremented, don't be confused by that: Prometheus writes initial head block to filesystem via its internal compaction mechanism, but if you have followed recommendations - data won't be modified by Prometheus before the sidecar uploads it. Thanos sidecar will also check sanity of the flags set to Prometheus on the startup and log errors or warning if they have been configured improperly (#838).
+* The retention of Prometheus is recommended to not be lower than three times of the min block duration, so 6 hours. This achieves resilience in the face of connectivity issues to the object storage since all local data will remain available within the Thanos cluster. If connectivity gets restored the backlog of blocks gets uploaded to the object storage.
 
 ## Reloader Configuration
 
@@ -58,10 +51,12 @@ thanos sidecar \
 
 The example content of `bucket.yml`:
 
-```yaml
+```yaml mdox-exec="go run scripts/cfggen/main.go --name=gcs.Config"
 type: GCS
 config:
-  bucket: example-bucket
+  bucket: ""
+  service_account: ""
+prefix: ""
 ```
 
 ## Upload compacted blocks
@@ -75,8 +70,7 @@ To use this, the Prometheus compaction needs to be disabled. This can be done by
 
 ## Flags
 
-[embedmd]:# (flags/sidecar.txt $)
-```$
+```$ mdox-exec="thanos sidecar --help"
 usage: thanos sidecar [<flags>]
 
 Sidecar for Prometheus server.
@@ -108,6 +102,9 @@ Flags:
                                  Listen host:port for HTTP endpoints.
       --http-grace-period=2m     Time to wait after an interrupt received for
                                  HTTP Server.
+      --http.config=""           [EXPERIMENTAL] Path to the configuration file
+                                 that can enable TLS or authentication for all
+                                 HTTP endpoints.
       --log.format=logfmt        Log format to use. Possible options: logfmt or
                                  json.
       --log.level=info           Log filtering level.
@@ -128,17 +125,20 @@ Flags:
                                  Path to YAML file that contains object store
                                  configuration. See format details:
                                  https://thanos.io/tip/thanos/storage.md/#configuration
+      --prometheus.http-client=<content>
+                                 Alternative to 'prometheus.http-client-file'
+                                 flag (mutually exclusive). Content of YAML file
+                                 or string with http client configs. see Format
+                                 details : ...
+      --prometheus.http-client-file=<file-path>
+                                 Path to YAML file or string with http client
+                                 configs. see Format details : ...
       --prometheus.ready_timeout=10m
                                  Maximum time to wait for the Prometheus
                                  instance to start up
       --prometheus.url=http://localhost:9090
                                  URL at which to reach Prometheus's API. For
                                  better performance use local network.
-      --receive.connection-pool-size=RECEIVE.CONNECTION-POOL-SIZE
-                                 Controls the http MaxIdleConns. Default is 0,
-                                 which is unlimited
-      --receive.connection-pool-size-per-host=100
-                                 Controls the http MaxIdleConnsPerHost
       --reloader.config-envsubst-file=""
                                  Output file for environment variable
                                  substituted config file.
@@ -157,11 +157,11 @@ Flags:
                                  flag (mutually exclusive). Content of YAML file
                                  with request logging configuration. See format
                                  details:
-                                 https://gist.github.com/yashrsharma44/02f5765c5710dd09ce5d14e854f22825
+                                 https://thanos.io/tip/thanos/logging.md/#configuration
       --request.logging-config-file=<file-path>
                                  Path to YAML file with request logging
                                  configuration. See format details:
-                                 https://gist.github.com/yashrsharma44/02f5765c5710dd09ce5d14e854f22825
+                                 https://thanos.io/tip/thanos/logging.md/#configuration
       --shipper.upload-compacted
                                  If true shipper will try to upload compacted
                                  blocks as well. Useful for migration purposes.

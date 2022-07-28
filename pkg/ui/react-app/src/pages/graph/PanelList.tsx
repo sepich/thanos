@@ -23,7 +23,6 @@ export const updateURL = (nextPanels: PanelMeta[]) => {
 interface PanelListProps extends PathPrefixProps, RouteComponentProps {
   panels: PanelMeta[];
   metrics: string[];
-  useExperimentalEditor: boolean;
   useLocalTime: boolean;
   queryHistoryEnabled: boolean;
   stores: StoreListProps;
@@ -35,7 +34,6 @@ interface PanelListProps extends PathPrefixProps, RouteComponentProps {
 
 export const PanelListContent: FC<PanelListProps> = ({
   metrics = [],
-  useExperimentalEditor,
   useLocalTime,
   pathPrefix,
   queryHistoryEnabled,
@@ -120,7 +118,6 @@ export const PanelListContent: FC<PanelListProps> = ({
               )
             )
           }
-          useExperimentalEditor={useExperimentalEditor}
           useLocalTime={useLocalTime}
           metricNames={metrics}
           pastQueries={queryHistoryEnabled ? historyItems : []}
@@ -143,7 +140,6 @@ const PanelListContentWithIndicator = withStatusIndicator(PanelListContent);
 
 const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' }) => {
   const [delta, setDelta] = useState(0);
-  const [useExperimentalEditor, setUseExperimentalEditor] = useLocalStorage('use-new-editor', true);
   const [useLocalTime, setUseLocalTime] = useLocalStorage('use-local-time', false);
   const [enableQueryHistory, setEnableQueryHistory] = useLocalStorage('enable-query-history', false);
   const [debugMode, setDebugMode] = useState(false);
@@ -152,12 +148,16 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
   const [enableLinter, setEnableLinter] = useLocalStorage('enable-linter', true);
 
   const { response: metricsRes, error: metricsErr } = useFetch<string[]>(`${pathPrefix}/api/v1/label/__name__/values`);
-  const { response: storesRes, error: storesErr, isLoading: storesLoading } = useFetch<StoreListProps>(
-    `${pathPrefix}/api/v1/stores`
-  );
-  const { response: flagsRes, error: flagsErr, isLoading: flagsLoading } = useFetch<FlagMap>(
-    `${pathPrefix}/api/v1/status/flags`
-  );
+  const {
+    response: storesRes,
+    error: storesErr,
+    isLoading: storesLoading,
+  } = useFetch<StoreListProps>(`${pathPrefix}/api/v1/stores`);
+  const {
+    response: flagsRes,
+    error: flagsErr,
+    isLoading: flagsLoading,
+  } = useFetch<FlagMap>(`${pathPrefix}/api/v1/status/flags`);
   const defaultStep = flagsRes?.data?.['query.default-step'] || '1s';
 
   const browserTime = new Date().getTime() / 1000;
@@ -204,6 +204,8 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
           >
             Enable Store Filtering
           </Checkbox>
+        </div>
+        <div className="float-right">
           <Checkbox
             wrapperStyles={{ marginLeft: 20, display: 'inline-block' }}
             id="autocomplete-checkbox"
@@ -212,22 +214,11 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
           >
             Enable autocomplete
           </Checkbox>
-        </div>
-        <div className="float-right">
-          <Checkbox
-            wrapperStyles={{ display: 'inline-block' }}
-            id="use-experimental-editor-checkbox"
-            onChange={({ target }) => setUseExperimentalEditor(target.checked)}
-            defaultChecked={useExperimentalEditor}
-          >
-            Use experimental editor
-          </Checkbox>
           <Checkbox
             wrapperStyles={{ marginLeft: 20, display: 'inline-block' }}
             id="highlighting-checkbox"
             onChange={({ target }) => setEnableHighlighting(target.checked)}
             defaultChecked={enableHighlighting}
-            disabled={!useExperimentalEditor}
           >
             Enable highlighting
           </Checkbox>
@@ -236,7 +227,6 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
             id="linter-checkbox"
             onChange={({ target }) => setEnableLinter(target.checked)}
             defaultChecked={enableLinter}
-            disabled={!useExperimentalEditor}
           >
             Enable linter
           </Checkbox>
@@ -271,7 +261,6 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
       <PanelListContentWithIndicator
         panels={decodePanelOptionsFromQueryString(window.location.search)}
         pathPrefix={pathPrefix}
-        useExperimentalEditor={useExperimentalEditor}
         useLocalTime={useLocalTime}
         metrics={metricsRes.data}
         stores={debugMode ? storesRes.data : {}}

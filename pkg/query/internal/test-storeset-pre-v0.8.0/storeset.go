@@ -15,18 +15,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
+	"google.golang.org/grpc"
+
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"google.golang.org/grpc"
 )
 
 const (
@@ -72,7 +73,7 @@ func (s *grpcStoreSpec) Addr() string {
 
 // Metadata method for gRPC store API tries to reach host Info method until context timeout. If we are unable to get metadata after
 // that time, we assume that the host is unhealthy and return error.
-func (s *grpcStoreSpec) Metadata(ctx context.Context, client storepb.StoreClient) (labelSets []labels.Labels, mint int64, maxt int64, err error) {
+func (s *grpcStoreSpec) Metadata(ctx context.Context, client storepb.StoreClient) (labelSets []labels.Labels, mint, maxt int64, err error) {
 	resp, err := client.Info(ctx, &storepb.InfoRequest{}, grpc.WaitForReady(true))
 	if err != nil {
 		return nil, 0, 0, errors.Wrapf(err, "fetching store info from %s", s.addr)
@@ -181,7 +182,7 @@ type storeRef struct {
 	logger log.Logger
 }
 
-func (s *storeRef) Update(labelSets []labels.Labels, minTime int64, maxTime int64) {
+func (s *storeRef) Update(labelSets []labels.Labels, minTime, maxTime int64) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 

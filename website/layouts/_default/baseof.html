@@ -18,7 +18,7 @@
     <link rel="icon" href="{{ "/icon-light.png" | relURL }}" />
     <title>{{ block "title" . }}{{ .Site.Title }}{{ end }}</title>
     <meta name="description" content="{{ .Site.Params.Description }}"></meta>
-    <meta property="og:image" content="{{ "/icon-light.png" | absURL }}" />
+    <meta property="og:image" content="{{ "/thanos-og-image.png" | absURL }}" />
     <meta property="og:type" content="object" />
     <meta property="og:title" content="Thanos" />
     <meta property="og:description" content="{{ .Site.Title }}" />
@@ -26,7 +26,7 @@
     <meta name="twitter:site" content="@{{ .Site.Params.TwitterHandle }}"></meta>
     <meta name="twitter:title" content="Thanos Metrics"></meta>
     <meta name="twitter:description" content="{{ .Site.Params.Description }}"></meta>
-    <meta name="twitter:image" content="{{ "/thanos-twitter.png" | absURL }}"></meta>
+    <meta name="twitter:image" content="{{ "/thanos-og-image.png" | absURL }}"></meta>
 </head>
 
 <body>
@@ -64,7 +64,7 @@
     {{ block "main" . }}{{ end }}
     <footer class="bg-dark text-light">
         <div class="container text-center text-md-left">
-            <div class="row py-5">
+            <div class="row py-5 footer-container">
                 <div class="col-12 col-md-6 col-lg mb-3 mb-lg-0">
                     <img src="{{ "icon-dark.png" | relURL }}" alt="Thanos" width="45%">
                 </div>
@@ -87,7 +87,7 @@
                         <li><a href="https://twitter.com/{{ .Site.Params.TwitterHandle }}" class="text-reset"><i class="fab fa-fw fa-twitter"></i> Twitter</a></li>
                     </ul>
                 </div>
-                <div class="col col-md-6 col-lg">
+                <div class="col col-md-6 col-lg about-section">
                     <h6 class="font-weight-bold">About</h6>
                     <p>Thanos is an OSS licensed project as Apache License 2.0</p>
                     <p>Founded by <a href="https://improbable.io" class="text-reset">Improbable ❤️</a></p>

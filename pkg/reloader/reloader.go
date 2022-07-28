@@ -7,7 +7,7 @@
 // Reloader type is useful when you want to:
 //
 // 	* Watch on changes against certain file e.g (`cfgFile`).
-// 	* Optionally, specify different different output file for watched `cfgFile` (`cfgOutputFile`).
+// 	* Optionally, specify different output file for watched `cfgFile` (`cfgOutputFile`).
 // 	This will also try decompress the `cfgFile` if needed and substitute ALL the envvars using Kubernetes substitution format: (`$(var)`)
 // 	* Watch on changes against certain directories (`watchedDirs`).
 //
@@ -71,11 +71,12 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
@@ -85,6 +86,7 @@ import (
 type Reloader struct {
 	logger        log.Logger
 	reloadURL     *url.URL
+	httpClient    http.Client
 	cfgFile       string
 	cfgOutputFile string
 	watchInterval time.Duration
@@ -94,11 +96,14 @@ type Reloader struct {
 
 	lastCfgHash         []byte
 	lastWatchedDirsHash []byte
+	forceReload         bool
 
-	reloads           prometheus.Counter
-	reloadErrors      prometheus.Counter
-	configApplyErrors prometheus.Counter
-	configApply       prometheus.Counter
+	reloads                    prometheus.Counter
+	reloadErrors               prometheus.Counter
+	lastReloadSuccess          prometheus.Gauge
+	lastReloadSuccessTimestamp prometheus.Gauge
+	configApplyErrors          prometheus.Counter
+	configApply                prometheus.Counter
 }
 
 // Options bundles options for the Reloader.
@@ -152,6 +157,18 @@ func New(logger log.Logger, reg prometheus.Registerer, o *Options) *Reloader {
 			prometheus.CounterOpts{
 				Name: "reloader_reloads_failed_total",
 				Help: "Total number of reload requests that failed.",
+			},
+		),
+		lastReloadSuccess: promauto.With(reg).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "reloader_last_reload_successful",
+				Help: "Whether the last reload attempt was successful",
+			},
+		),
+		lastReloadSuccessTimestamp: promauto.With(reg).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "reloader_last_reload_success_timestamp_seconds",
+				Help: "Timestamp of the last successful reload",
 			},
 		),
 		configApply: promauto.With(reg).NewCounter(
@@ -243,6 +260,7 @@ func (r *Reloader) Watch(ctx context.Context) error {
 		if err := r.apply(applyCtx); err != nil {
 			r.configApplyErrors.Inc()
 			level.Error(r.logger).Log("msg", "apply error", "err", err)
+			continue
 		}
 	}
 }
@@ -290,7 +308,7 @@ func (r *Reloader) apply(ctx context.Context) error {
 			defer func() {
 				_ = os.Remove(tmpFile)
 			}()
-			if err := ioutil.WriteFile(tmpFile, b, 0600); err != nil {
+			if err := ioutil.WriteFile(tmpFile, b, 0644); err != nil {
 				return errors.Wrap(err, "write file")
 			}
 			if err := os.Rename(tmpFile, r.cfgOutputFile); err != nil {
@@ -335,7 +353,7 @@ func (r *Reloader) apply(ctx context.Context) error {
 		watchedDirsHash = h.Sum(nil)
 	}
 
-	if bytes.Equal(r.lastCfgHash, cfgHash) && bytes.Equal(r.lastWatchedDirsHash, watchedDirsHash) {
+	if !r.forceReload && bytes.Equal(r.lastCfgHash, cfgHash) && bytes.Equal(r.lastWatchedDirsHash, watchedDirsHash) {
 		// Nothing to do.
 		return nil
 	}
@@ -347,9 +365,11 @@ func (r *Reloader) apply(ctx context.Context) error {
 		r.reloads.Inc()
 		if err := r.triggerReload(ctx); err != nil {
 			r.reloadErrors.Inc()
+			r.lastReloadSuccess.Set(0)
 			return errors.Wrap(err, "trigger reload")
 		}
 
+		r.forceReload = false
 		r.lastCfgHash = cfgHash
 		r.lastWatchedDirsHash = watchedDirsHash
 		level.Info(r.logger).Log(
@@ -357,8 +377,11 @@ func (r *Reloader) apply(ctx context.Context) error {
 			"cfg_in", r.cfgFile,
 			"cfg_out", r.cfgOutputFile,
 			"watched_dirs", strings.Join(r.watchedDirs, ", "))
+		r.lastReloadSuccess.Set(1)
+		r.lastReloadSuccessTimestamp.SetToCurrentTime()
 		return nil
 	}); err != nil {
+		r.forceReload = true
 		level.Error(r.logger).Log("msg", "Failed to trigger reload. Retrying.", "err", err)
 	}
 
@@ -395,7 +418,7 @@ func (r *Reloader) triggerReload(ctx context.Context) error {
 	}
 	req = req.WithContext(ctx)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return errors.Wrap(err, "reload request failed")
 	}
@@ -405,6 +428,11 @@ func (r *Reloader) triggerReload(ctx context.Context) error {
 		return errors.Errorf("received non-200 response: %s; have you set `--web.enable-lifecycle` Prometheus flag?", resp.Status)
 	}
 	return nil
+}
+
+// SetHttpClient sets Http client for reloader.
+func (r *Reloader) SetHttpClient(client http.Client) {
+	r.httpClient = client
 }
 
 // ReloadURLFromBase returns the standard Prometheus reload URL from its base URL.

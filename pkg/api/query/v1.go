@@ -28,19 +28,20 @@ import (
 	"strings"
 	"time"
 
-	cortexutil "github.com/cortexproject/cortex/pkg/util"
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
+
+	"github.com/prometheus/prometheus/util/stats"
 
 	"github.com/thanos-io/thanos/pkg/api"
 	"github.com/thanos-io/thanos/pkg/exemplars"
@@ -68,6 +69,7 @@ const (
 	MatcherParam             = "match[]"
 	StoreMatcherParam        = "storeMatch[]"
 	Step                     = "step"
+	Stats                    = "stats"
 )
 
 // QueryAPI is an API used by Thanos Querier.
@@ -89,10 +91,11 @@ type QueryAPI struct {
 	enableTargetPartialResponse         bool
 	enableMetricMetadataPartialResponse bool
 	enableExemplarPartialResponse       bool
+	enableQueryPushdown                 bool
 	disableCORS                         bool
 
-	replicaLabels []string
-	storeSet      *query.StoreSet
+	replicaLabels  []string
+	endpointStatus func() []query.EndpointStatus
 
 	defaultRangeQueryStep                  time.Duration
 	defaultInstantQueryMaxSourceResolution time.Duration
@@ -104,7 +107,7 @@ type QueryAPI struct {
 // NewQueryAPI returns an initialized QueryAPI type.
 func NewQueryAPI(
 	logger log.Logger,
-	storeSet *query.StoreSet,
+	endpointStatus func() []query.EndpointStatus,
 	qe func(int64) *promql.Engine,
 	c query.QueryableCreator,
 	ruleGroups rules.UnaryClient,
@@ -116,6 +119,8 @@ func NewQueryAPI(
 	enableRulePartialResponse bool,
 	enableTargetPartialResponse bool,
 	enableMetricMetadataPartialResponse bool,
+	enableExemplarPartialResponse bool,
+	enableQueryPushdown bool,
 	replicaLabels []string,
 	flagsMap map[string]string,
 	defaultRangeQueryStep time.Duration,
@@ -141,8 +146,10 @@ func NewQueryAPI(
 		enableRulePartialResponse:              enableRulePartialResponse,
 		enableTargetPartialResponse:            enableTargetPartialResponse,
 		enableMetricMetadataPartialResponse:    enableMetricMetadataPartialResponse,
+		enableExemplarPartialResponse:          enableExemplarPartialResponse,
+		enableQueryPushdown:                    enableQueryPushdown,
 		replicaLabels:                          replicaLabels,
-		storeSet:                               storeSet,
+		endpointStatus:                         endpointStatus,
 		defaultRangeQueryStep:                  defaultRangeQueryStep,
 		defaultInstantQueryMaxSourceResolution: defaultInstantQueryMaxSourceResolution,
 		defaultMetadataTimeRange:               defaultMetadataTimeRange,
@@ -178,6 +185,7 @@ func (qapi *QueryAPI) Register(r *route.Router, tracer opentracing.Tracer, logge
 
 	r.Get("/stores", instr("stores", qapi.stores))
 
+	r.Get("/alerts", instr("alerts", NewAlertsHandler(qapi.ruleGroups, qapi.enableRulePartialResponse)))
 	r.Get("/rules", instr("rules", NewRulesHandler(qapi.ruleGroups, qapi.enableRulePartialResponse)))
 
 	r.Get("/targets", instr("targets", NewTargetsHandler(qapi.targets, qapi.enableTargetPartialResponse)))
@@ -191,7 +199,7 @@ func (qapi *QueryAPI) Register(r *route.Router, tracer opentracing.Tracer, logge
 type queryData struct {
 	ResultType parser.ValueType `json:"resultType"`
 	Result     parser.Value     `json:"result"`
-
+	Stats      stats.QueryStats `json:"stats,omitempty"`
 	// Additional Thanos Response field.
 	Warnings []error `json:"warnings,omitempty"`
 }
@@ -283,7 +291,6 @@ func (qapi *QueryAPI) parseStep(r *http.Request, defaultRangeQueryStep time.Dura
 		}
 		return defaultRangeQueryStep, nil
 	}
-
 	// Default step is used this way to make it consistent with UI.
 	d := time.Duration(math.Max(float64(rangeSeconds/250), float64(defaultRangeQueryStep/time.Second))) * time.Second
 	return d, nil
@@ -338,10 +345,11 @@ func (qapi *QueryAPI) query(r *http.Request) (interface{}, []error, *api.ApiErro
 	span, ctx := tracing.StartSpan(ctx, "promql_instant_query")
 	defer span.Finish()
 
-	qry, err := qe.NewInstantQuery(qapi.queryableCreate(enableDedup, replicaLabels, storeDebugMatchers, maxSourceResolution, enablePartialResponse, false), r.FormValue("query"), ts)
+	qry, err := qe.NewInstantQuery(qapi.queryableCreate(enableDedup, replicaLabels, storeDebugMatchers, maxSourceResolution, enablePartialResponse, qapi.enableQueryPushdown, false), &promql.QueryOpts{}, r.FormValue("query"), ts)
 	if err != nil {
 		return nil, nil, &api.ApiError{Typ: api.ErrorBadData, Err: err}
 	}
+	defer qry.Close()
 
 	tracing.DoInSpan(ctx, "query_gate_ismyturn", func(ctx context.Context) {
 		err = qapi.gate.Start(ctx)
@@ -364,9 +372,15 @@ func (qapi *QueryAPI) query(r *http.Request) (interface{}, []error, *api.ApiErro
 		return nil, nil, &api.ApiError{Typ: api.ErrorExec, Err: res.Err}
 	}
 
+	// Optional stats field in response if parameter "stats" is not empty.
+	var qs stats.QueryStats
+	if r.FormValue(Stats) != "" {
+		qs = stats.NewQueryStats(qry.Stats())
+	}
 	return &queryData{
 		ResultType: res.Value.Type(),
 		Result:     res.Value,
+		Stats:      qs,
 	}, res.Warnings, nil
 }
 
@@ -449,7 +463,8 @@ func (qapi *QueryAPI) queryRange(r *http.Request) (interface{}, []error, *api.Ap
 	defer span.Finish()
 
 	qry, err := qe.NewRangeQuery(
-		qapi.queryableCreate(enableDedup, replicaLabels, storeDebugMatchers, maxSourceResolution, enablePartialResponse, false),
+		qapi.queryableCreate(enableDedup, replicaLabels, storeDebugMatchers, maxSourceResolution, enablePartialResponse, qapi.enableQueryPushdown, false),
+		&promql.QueryOpts{},
 		r.FormValue("query"),
 		start,
 		end,
@@ -458,6 +473,7 @@ func (qapi *QueryAPI) queryRange(r *http.Request) (interface{}, []error, *api.Ap
 	if err != nil {
 		return nil, nil, &api.ApiError{Typ: api.ErrorBadData, Err: err}
 	}
+	defer qry.Close()
 
 	tracing.DoInSpan(ctx, "query_gate_ismyturn", func(ctx context.Context) {
 		err = qapi.gate.Start(ctx)
@@ -478,9 +494,15 @@ func (qapi *QueryAPI) queryRange(r *http.Request) (interface{}, []error, *api.Ap
 		return nil, nil, &api.ApiError{Typ: api.ErrorExec, Err: res.Err}
 	}
 
+	// Optional stats field in response if parameter "stats" is not empty.
+	var qs stats.QueryStats
+	if r.FormValue(Stats) != "" {
+		qs = stats.NewQueryStats(qry.Stats())
+	}
 	return &queryData{
 		ResultType: res.Value.Type(),
 		Result:     res.Value,
+		Stats:      qs,
 	}, res.Warnings, nil
 }
 
@@ -516,7 +538,7 @@ func (qapi *QueryAPI) labelValues(r *http.Request) (interface{}, []error, *api.A
 		matcherSets = append(matcherSets, matchers)
 	}
 
-	q, err := qapi.queryableCreate(true, nil, storeDebugMatchers, 0, enablePartialResponse, true).
+	q, err := qapi.queryableCreate(true, nil, storeDebugMatchers, 0, enablePartialResponse, qapi.enableQueryPushdown, true).
 		Querier(ctx, timestamp.FromTime(start), timestamp.FromTime(end))
 	if err != nil {
 		return nil, nil, &api.ApiError{Typ: api.ErrorExec, Err: err}
@@ -527,21 +549,30 @@ func (qapi *QueryAPI) labelValues(r *http.Request) (interface{}, []error, *api.A
 		vals     []string
 		warnings storage.Warnings
 	)
-	// TODO(yeya24): push down matchers to Store level.
 	if len(matcherSets) > 0 {
-		// Get all series which match matchers.
-		var sets []storage.SeriesSet
-		for _, mset := range matcherSets {
-			s := q.Select(false, nil, mset...)
-			sets = append(sets, s)
+		var callWarnings storage.Warnings
+		labelValuesSet := make(map[string]struct{})
+		for _, matchers := range matcherSets {
+			vals, callWarnings, err = q.LabelValues(name, matchers...)
+			if err != nil {
+				return nil, nil, &api.ApiError{Typ: api.ErrorExec, Err: err}
+			}
+			warnings = append(warnings, callWarnings...)
+			for _, val := range vals {
+				labelValuesSet[val] = struct{}{}
+			}
 		}
-		vals, warnings, err = labelValuesByMatchers(sets, name)
+
+		vals = make([]string, 0, len(labelValuesSet))
+		for val := range labelValuesSet {
+			vals = append(vals, val)
+		}
+		sort.Strings(vals)
 	} else {
 		vals, warnings, err = q.LabelValues(name)
-	}
-
-	if err != nil {
-		return nil, nil, &api.ApiError{Typ: api.ErrorExec, Err: err}
+		if err != nil {
+			return nil, nil, &api.ApiError{Typ: api.ErrorExec, Err: err}
+		}
 	}
 
 	if vals == nil {
@@ -594,7 +625,7 @@ func (qapi *QueryAPI) series(r *http.Request) (interface{}, []error, *api.ApiErr
 		return nil, nil, apiErr
 	}
 
-	q, err := qapi.queryableCreate(enableDedup, replicaLabels, storeDebugMatchers, math.MaxInt64, enablePartialResponse, true).
+	q, err := qapi.queryableCreate(enableDedup, replicaLabels, storeDebugMatchers, math.MaxInt64, enablePartialResponse, qapi.enableQueryPushdown, true).
 		Querier(r.Context(), timestamp.FromTime(start), timestamp.FromTime(end))
 	if err != nil {
 		return nil, nil, &api.ApiError{Typ: api.ErrorExec, Err: err}
@@ -644,7 +675,7 @@ func (qapi *QueryAPI) labelNames(r *http.Request) (interface{}, []error, *api.Ap
 		matcherSets = append(matcherSets, matchers)
 	}
 
-	q, err := qapi.queryableCreate(true, nil, storeDebugMatchers, 0, enablePartialResponse, true).
+	q, err := qapi.queryableCreate(true, nil, storeDebugMatchers, 0, enablePartialResponse, qapi.enableQueryPushdown, true).
 		Querier(r.Context(), timestamp.FromTime(start), timestamp.FromTime(end))
 	if err != nil {
 		return nil, nil, &api.ApiError{Typ: api.ErrorExec, Err: err}
@@ -655,15 +686,26 @@ func (qapi *QueryAPI) labelNames(r *http.Request) (interface{}, []error, *api.Ap
 		names    []string
 		warnings storage.Warnings
 	)
-	// TODO(yeya24): push down matchers to Store level.
+
 	if len(matcherSets) > 0 {
-		// Get all series which match matchers.
-		var sets []storage.SeriesSet
-		for _, mset := range matcherSets {
-			s := q.Select(false, nil, mset...)
-			sets = append(sets, s)
+		var callWarnings storage.Warnings
+		labelNamesSet := make(map[string]struct{})
+		for _, matchers := range matcherSets {
+			names, callWarnings, err = q.LabelNames(matchers...)
+			if err != nil {
+				return nil, nil, &api.ApiError{Typ: api.ErrorExec, Err: err}
+			}
+			warnings = append(warnings, callWarnings...)
+			for _, val := range names {
+				labelNamesSet[val] = struct{}{}
+			}
 		}
-		names, warnings, err = labelNamesByMatchers(sets)
+
+		names = make([]string, 0, len(labelNamesSet))
+		for name := range labelNamesSet {
+			names = append(names, name)
+		}
+		sort.Strings(names)
 	} else {
 		names, warnings, err = q.LabelNames()
 	}
@@ -679,9 +721,13 @@ func (qapi *QueryAPI) labelNames(r *http.Request) (interface{}, []error, *api.Ap
 }
 
 func (qapi *QueryAPI) stores(_ *http.Request) (interface{}, []error, *api.ApiError) {
-	statuses := make(map[string][]query.StoreStatus)
-	for _, status := range qapi.storeSet.GetStoreStatus() {
-		statuses[status.StoreType.String()] = append(statuses[status.StoreType.String()], status)
+	statuses := make(map[string][]query.EndpointStatus)
+	for _, status := range qapi.endpointStatus() {
+		// Don't consider an endpoint if we cannot retrieve component type.
+		if status.ComponentType == nil {
+			continue
+		}
+		statuses[status.ComponentType.String()] = append(statuses[status.ComponentType.String()], status)
 	}
 	return statuses, nil, nil
 }
@@ -718,6 +764,52 @@ func NewTargetsHandler(client targets.UnaryClient, enablePartialResponse bool) f
 	}
 }
 
+// NewAlertsHandler created handler compatible with HTTP /api/v1/alerts https://prometheus.io/docs/prometheus/latest/querying/api/#alerts
+// which uses gRPC Unary Rules API (Rules API works for both /alerts and /rules).
+func NewAlertsHandler(client rules.UnaryClient, enablePartialResponse bool) func(*http.Request) (interface{}, []error, *api.ApiError) {
+	ps := storepb.PartialResponseStrategy_ABORT
+	if enablePartialResponse {
+		ps = storepb.PartialResponseStrategy_WARN
+	}
+
+	return func(r *http.Request) (interface{}, []error, *api.ApiError) {
+		span, ctx := tracing.StartSpan(r.Context(), "receive_http_request")
+		defer span.Finish()
+
+		var (
+			groups   *rulespb.RuleGroups
+			warnings storage.Warnings
+			err      error
+		)
+
+		// TODO(bwplotka): Allow exactly the same functionality as query API: passing replica, dedup and partial response as HTTP params as well.
+		req := &rulespb.RulesRequest{
+			Type:                    rulespb.RulesRequest_ALERT,
+			PartialResponseStrategy: ps,
+		}
+		tracing.DoInSpan(ctx, "retrieve_rules", func(ctx context.Context) {
+			groups, warnings, err = client.Rules(ctx, req)
+		})
+		if err != nil {
+			return nil, nil, &api.ApiError{Typ: api.ErrorInternal, Err: errors.Errorf("error retrieving rules: %v", err)}
+		}
+
+		var resp struct {
+			Alerts []*rulespb.AlertInstance `json:"alerts"`
+		}
+		for _, g := range groups.Groups {
+			for _, r := range g.Rules {
+				a := r.GetAlert()
+				if a == nil {
+					continue
+				}
+				resp.Alerts = append(resp.Alerts, a.Alerts...)
+			}
+		}
+		return resp, warnings, nil
+	}
+}
+
 // NewRulesHandler created handler compatible with HTTP /api/v1/rules https://prometheus.io/docs/prometheus/latest/querying/api/#rules
 // which uses gRPC Unary Rules API.
 func NewRulesHandler(client rules.UnaryClient, enablePartialResponse bool) func(*http.Request) (interface{}, []error, *api.ApiError) {
@@ -727,6 +819,15 @@ func NewRulesHandler(client rules.UnaryClient, enablePartialResponse bool) func(
 	}
 
 	return func(r *http.Request) (interface{}, []error, *api.ApiError) {
+		span, ctx := tracing.StartSpan(r.Context(), "receive_http_request")
+		defer span.Finish()
+
+		var (
+			groups   *rulespb.RuleGroups
+			warnings storage.Warnings
+			err      error
+		)
+
 		typeParam := r.URL.Query().Get("type")
 		typ, ok := rulespb.RulesRequest_Type_value[strings.ToUpper(typeParam)]
 		if !ok {
@@ -736,12 +837,19 @@ func NewRulesHandler(client rules.UnaryClient, enablePartialResponse bool) func(
 			typ = int32(rulespb.RulesRequest_ALL)
 		}
 
+		if err := r.ParseForm(); err != nil {
+			return nil, nil, &api.ApiError{Typ: api.ErrorInternal, Err: errors.Errorf("error parsing request form='%v'", MatcherParam)}
+		}
+
 		// TODO(bwplotka): Allow exactly the same functionality as query API: passing replica, dedup and partial response as HTTP params as well.
 		req := &rulespb.RulesRequest{
 			Type:                    rulespb.RulesRequest_Type(typ),
 			PartialResponseStrategy: ps,
+			MatcherString:           r.Form[MatcherParam],
 		}
-		groups, warnings, err := client.Rules(r.Context(), req)
+		tracing.DoInSpan(ctx, "retrieve_rules", func(ctx context.Context) {
+			groups, warnings, err = client.Rules(ctx, req)
+		})
 		if err != nil {
 			return nil, nil, &api.ApiError{Typ: api.ErrorInternal, Err: errors.Errorf("error retrieving rules: %v", err)}
 		}
@@ -758,26 +866,39 @@ func NewExemplarsHandler(client exemplars.UnaryClient, enablePartialResponse boo
 	}
 
 	return func(r *http.Request) (interface{}, []error, *api.ApiError) {
-		start, err := cortexutil.ParseTime(r.FormValue("start"))
+		span, ctx := tracing.StartSpan(r.Context(), "exemplar_query_request")
+		defer span.Finish()
+
+		var (
+			data     []*exemplarspb.ExemplarData
+			warnings storage.Warnings
+			err      error
+		)
+
+		start, err := parseTimeParam(r, "start", infMinTime)
 		if err != nil {
 			return nil, nil, &api.ApiError{Typ: api.ErrorBadData, Err: err}
 		}
-		end, err := cortexutil.ParseTime(r.FormValue("end"))
+		end, err := parseTimeParam(r, "end", infMaxTime)
 		if err != nil {
 			return nil, nil, &api.ApiError{Typ: api.ErrorBadData, Err: err}
 		}
 
 		req := &exemplarspb.ExemplarsRequest{
-			Start:                   start,
-			End:                     end,
+			Start:                   timestamp.FromTime(start),
+			End:                     timestamp.FromTime(end),
 			Query:                   r.FormValue("query"),
 			PartialResponseStrategy: ps,
 		}
-		exemplarsData, warnings, err := client.Exemplars(r.Context(), req)
+
+		tracing.DoInSpan(ctx, "retrieve_exemplars", func(ctx context.Context) {
+			data, warnings, err = client.Exemplars(ctx, req)
+		})
+
 		if err != nil {
 			return nil, nil, &api.ApiError{Typ: api.ErrorInternal, Err: errors.Wrap(err, "retrieving exemplars")}
 		}
-		return exemplarsData, warnings, nil
+		return data, warnings, nil
 	}
 }
 
@@ -854,55 +975,6 @@ func parseDuration(s string) (time.Duration, error) {
 	return 0, errors.Errorf("cannot parse %q to a valid duration", s)
 }
 
-// Modified from https://github.com/eklockare/prometheus/blob/6178-matchers-with-label-values/web/api/v1/api.go#L571-L591.
-// labelNamesByMatchers uses matchers to filter out matching series, then label names are extracted.
-func labelNamesByMatchers(sets []storage.SeriesSet) ([]string, storage.Warnings, error) {
-	set := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
-	labelNamesSet := make(map[string]struct{})
-	for set.Next() {
-		series := set.At()
-		for _, lb := range series.Labels() {
-			labelNamesSet[lb.Name] = struct{}{}
-		}
-	}
-
-	warnings := set.Warnings()
-	if set.Err() != nil {
-		return nil, warnings, set.Err()
-	}
-	// Convert the map to an array.
-	labelNames := make([]string, 0, len(labelNamesSet))
-	for key := range labelNamesSet {
-		labelNames = append(labelNames, key)
-	}
-	sort.Strings(labelNames)
-	return labelNames, warnings, nil
-}
-
-// Modified from https://github.com/eklockare/prometheus/blob/6178-matchers-with-label-values/web/api/v1/api.go#L571-L591.
-// LabelValuesByMatchers uses matchers to filter out matching series, then label values are extracted.
-func labelValuesByMatchers(sets []storage.SeriesSet, name string) ([]string, storage.Warnings, error) {
-	set := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
-	labelValuesSet := make(map[string]struct{})
-	for set.Next() {
-		series := set.At()
-		labelValue := series.Labels().Get(name)
-		labelValuesSet[labelValue] = struct{}{}
-	}
-
-	warnings := set.Warnings()
-	if set.Err() != nil {
-		return nil, warnings, set.Err()
-	}
-	// Convert the map to an array.
-	labelValues := make([]string, 0, len(labelValuesSet))
-	for key := range labelValuesSet {
-		labelValues = append(labelValues, key)
-	}
-	sort.Strings(labelValues)
-	return labelValues, warnings, nil
-}
-
 // NewMetricMetadataHandler creates handler compatible with HTTP /api/v1/metadata https://prometheus.io/docs/prometheus/latest/querying/api/#querying-metric-metadata
 // which uses gRPC Unary Metadata API.
 func NewMetricMetadataHandler(client metadata.UnaryClient, enablePartialResponse bool) func(*http.Request) (interface{}, []error, *api.ApiError) {
@@ -912,6 +984,15 @@ func NewMetricMetadataHandler(client metadata.UnaryClient, enablePartialResponse
 	}
 
 	return func(r *http.Request) (interface{}, []error, *api.ApiError) {
+		span, ctx := tracing.StartSpan(r.Context(), "metadata_http_request")
+		defer span.Finish()
+
+		var (
+			t        map[string][]metadatapb.Meta
+			warnings storage.Warnings
+			err      error
+		)
+
 		req := &metadatapb.MetricMetadataRequest{
 			// By default we use -1, which means no limit.
 			Limit:                   -1,
@@ -928,7 +1009,9 @@ func NewMetricMetadataHandler(client metadata.UnaryClient, enablePartialResponse
 			req.Limit = int32(limit)
 		}
 
-		t, warnings, err := client.MetricMetadata(r.Context(), req)
+		tracing.DoInSpan(ctx, "retrieve_metadata", func(ctx context.Context) {
+			t, warnings, err = client.MetricMetadata(ctx, req)
+		})
 		if err != nil {
 			return nil, nil, &api.ApiError{Typ: api.ErrorInternal, Err: errors.Wrap(err, "retrieving metadata")}
 		}

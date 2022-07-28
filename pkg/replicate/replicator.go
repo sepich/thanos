@@ -10,24 +10,26 @@ import (
 	"strings"
 	"time"
 
-	thanosmodel "github.com/thanos-io/thanos/pkg/model"
-
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	extflag "github.com/efficientgo/tools/extkingpin"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
 	"github.com/oklog/ulid"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
+
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/client"
+
 	thanosblock "github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/component"
-	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/extprom"
-	"github.com/thanos-io/thanos/pkg/objstore/client"
+	thanosmodel "github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/server/http"
@@ -75,6 +77,7 @@ func RunReplicate(
 	reg *prometheus.Registry,
 	_ opentracing.Tracer,
 	httpBindAddr string,
+	httpTLSConfig string,
 	httpGracePeriod time.Duration,
 	labelSelector labels.Selector,
 	resolutions []compact.ResolutionLevel,
@@ -84,6 +87,7 @@ func RunReplicate(
 	singleRun bool,
 	minTime, maxTime *thanosmodel.TimeOrDurationValue,
 	blockIDs []ulid.ULID,
+	ignoreMarkedForDeletion bool,
 ) error {
 	logger = log.With(logger, "component", "replicate")
 
@@ -98,6 +102,7 @@ func RunReplicate(
 	s := http.New(logger, reg, component.Replicate, httpProbe,
 		http.WithListen(httpBindAddr),
 		http.WithGracePeriod(httpGracePeriod),
+		http.WithTLSConfig(httpTLSConfig),
 	)
 
 	g.Add(func() error {
@@ -164,16 +169,7 @@ func RunReplicate(
 	}, []string{"result"})
 	replicationRunDuration.WithLabelValues(labelSuccess)
 	replicationRunDuration.WithLabelValues(labelError)
-
-	fetcher, err := thanosblock.NewMetaFetcher(
-		logger,
-		32,
-		fromBkt,
-		"",
-		reg,
-		[]thanosblock.MetadataFilter{thanosblock.NewTimePartitionMetaFilter(*minTime, *maxTime)},
-		nil,
-	)
+	fetcher, err := newMetaFetcher(logger, fromBkt, reg, *minTime, *maxTime, 32, ignoreMarkedForDeletion)
 	if err != nil {
 		return errors.Wrapf(err, "create meta fetcher with bucket %v", fromBkt)
 	}
@@ -211,6 +207,7 @@ func RunReplicate(
 		defer runutil.CloseWithLogOnErr(logger, fromBkt, "from bucket client")
 		defer runutil.CloseWithLogOnErr(logger, toBkt, "to bucket client")
 
+		statusProber.Ready()
 		if singleRun || len(blockIDs) > 0 {
 			return replicateFn()
 		}
@@ -238,4 +235,29 @@ func RunReplicate(
 	level.Info(logger).Log("msg", "starting replication")
 
 	return nil
+}
+
+func newMetaFetcher(
+	logger log.Logger,
+	fromBkt objstore.InstrumentedBucket,
+	reg prometheus.Registerer,
+	minTime,
+	maxTime thanosmodel.TimeOrDurationValue,
+	concurrency int,
+	ignoreMarkedForDeletion bool,
+) (*thanosblock.MetaFetcher, error) {
+	filters := []thanosblock.MetadataFilter{
+		thanosblock.NewTimePartitionMetaFilter(minTime, maxTime),
+	}
+	if ignoreMarkedForDeletion {
+		filters = append(filters, thanosblock.NewIgnoreDeletionMarkFilter(logger, fromBkt, 0, concurrency))
+	}
+	return thanosblock.NewMetaFetcher(
+		logger,
+		concurrency,
+		fromBkt,
+		"",
+		reg,
+		filters,
+	)
 }

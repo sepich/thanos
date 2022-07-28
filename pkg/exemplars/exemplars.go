@@ -6,11 +6,13 @@ package exemplars
 import (
 	"context"
 	"sort"
+	"sync"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/thanos-io/thanos/pkg/exemplars/exemplarspb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
+	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 var _ UnaryClient = &GRPCClient{}
@@ -36,10 +38,13 @@ type exemplarsServer struct {
 
 	warnings []error
 	data     []*exemplarspb.ExemplarData
+	mu       sync.Mutex
 }
 
 func (srv *exemplarsServer) Send(res *exemplarspb.ExemplarsResponse) error {
 	if res.GetWarning() != "" {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
 		srv.warnings = append(srv.warnings, errors.New(res.GetWarning()))
 		return nil
 	}
@@ -48,6 +53,8 @@ func (srv *exemplarsServer) Send(res *exemplarspb.ExemplarsResponse) error {
 		return errors.New("empty exemplars data")
 	}
 
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 	srv.data = append(srv.data, res.GetData())
 	return nil
 }
@@ -73,60 +80,61 @@ func NewGRPCClientWithDedup(es exemplarspb.ExemplarsServer, replicaLabels []stri
 }
 
 func (rr *GRPCClient) Exemplars(ctx context.Context, req *exemplarspb.ExemplarsRequest) ([]*exemplarspb.ExemplarData, storage.Warnings, error) {
+	span, ctx := tracing.StartSpan(ctx, "exemplar_grpc_request")
+	defer span.Finish()
+
 	resp := &exemplarsServer{ctx: ctx}
 
 	if err := rr.proxy.Exemplars(req, resp); err != nil {
 		return nil, nil, errors.Wrap(err, "proxy Exemplars")
 	}
 
-	resp.data = dedupExemplarsData(resp.data, rr.replicaLabels)
-	for _, d := range resp.data {
-		d.Exemplars = dedupExemplars(d.Exemplars, rr.replicaLabels)
+	if resp.data == nil {
+		return make([]*exemplarspb.ExemplarData, 0), resp.warnings, nil
 	}
 
+	resp.data = dedupExemplarsResponse(resp.data, rr.replicaLabels)
 	return resp.data, resp.warnings, nil
 }
 
-func dedupExemplarsData(exemplarsData []*exemplarspb.ExemplarData, replicaLabels map[string]struct{}) []*exemplarspb.ExemplarData {
+func dedupExemplarsResponse(exemplarsData []*exemplarspb.ExemplarData, replicaLabels map[string]struct{}) []*exemplarspb.ExemplarData {
 	if len(exemplarsData) == 0 {
 		return exemplarsData
 	}
 
-	// Sort each exemplar's label names such that they are comparable.
-	for _, d := range exemplarsData {
-		sort.Slice(d.SeriesLabels.Labels, func(i, j int) bool {
-			return d.SeriesLabels.Labels[i].Name < d.SeriesLabels.Labels[j].Name
-		})
-	}
-
-	// Sort exemplars data such that they appear next to each other.
-	sort.Slice(exemplarsData, func(i, j int) bool {
-		return exemplarsData[i].Compare(exemplarsData[j]) < 0
-	})
-
-	i := 0
-	exemplarsData[i].SeriesLabels.Labels = removeReplicaLabels(exemplarsData[i].SeriesLabels.Labels, replicaLabels)
-	for j := 1; j < len(exemplarsData); j++ {
-		exemplarsData[j].SeriesLabels.Labels = removeReplicaLabels(exemplarsData[j].SeriesLabels.Labels, replicaLabels)
-		if exemplarsData[i].Compare(exemplarsData[j]) != 0 {
-			// Effectively retain exemplarsData[j] in the resulting slice.
-			i++
-			exemplarsData[i] = exemplarsData[j]
+	// Deduplicate series labels.
+	hashToExemplar := make(map[uint64]*exemplarspb.ExemplarData)
+	for _, e := range exemplarsData {
+		if len(e.Exemplars) == 0 {
 			continue
+		}
+		e.SeriesLabels.Labels = removeReplicaLabels(e.SeriesLabels.Labels, replicaLabels)
+		h := labelpb.ZLabelsToPromLabels(e.SeriesLabels.Labels).Hash()
+		if ref, ok := hashToExemplar[h]; ok {
+			ref.Exemplars = append(ref.Exemplars, e.Exemplars...)
+		} else {
+			hashToExemplar[h] = e
 		}
 	}
 
-	return exemplarsData[:i+1]
-}
-
-func dedupExemplars(exemplars []*exemplarspb.Exemplar, replicaLabels map[string]struct{}) []*exemplarspb.Exemplar {
-	if len(exemplars) == 0 {
-		return exemplars
+	res := make([]*exemplarspb.ExemplarData, 0, len(hashToExemplar))
+	for _, e := range hashToExemplar {
+		// Dedup exemplars with the same series labels.
+		e.Exemplars = dedupExemplars(e.Exemplars)
+		res = append(res, e)
 	}
 
+	// Sort by series labels.
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Compare(res[j]) < 0
+	})
+	return res
+}
+
+func dedupExemplars(exemplars []*exemplarspb.Exemplar) []*exemplarspb.Exemplar {
 	for _, e := range exemplars {
 		sort.Slice(e.Labels.Labels, func(i, j int) bool {
-			return e.Labels.Labels[i].Name < e.Labels.Labels[j].Name
+			return e.Labels.Labels[i].Compare(e.Labels.Labels[j]) < 0
 		})
 	}
 
@@ -135,9 +143,7 @@ func dedupExemplars(exemplars []*exemplarspb.Exemplar, replicaLabels map[string]
 	})
 
 	i := 0
-	exemplars[i].Labels.Labels = removeReplicaLabels(exemplars[i].Labels.Labels, replicaLabels)
 	for j := 1; j < len(exemplars); j++ {
-		exemplars[j].Labels.Labels = removeReplicaLabels(exemplars[j].Labels.Labels, replicaLabels)
 		if exemplars[i].Compare(exemplars[j]) != 0 {
 			// Effectively retain exemplars[j] in the resulting slice.
 			i++
@@ -149,6 +155,9 @@ func dedupExemplars(exemplars []*exemplarspb.Exemplar, replicaLabels map[string]
 }
 
 func removeReplicaLabels(labels []labelpb.ZLabel, replicaLabels map[string]struct{}) []labelpb.ZLabel {
+	if len(replicaLabels) == 0 {
+		return labels
+	}
 	newLabels := make([]labelpb.ZLabel, 0, len(labels))
 	for _, l := range labels {
 		if _, ok := replicaLabels[l.Name]; !ok {

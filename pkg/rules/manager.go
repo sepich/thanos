@@ -18,8 +18,8 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/rulefmt"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/rules"
 	"gopkg.in/yaml.v3"
 
@@ -28,6 +28,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 const tmpRuleDir = ".tmp-rules"
@@ -43,6 +44,7 @@ func (g Group) toProto() *rulespb.RuleGroup {
 		Name:                    g.Name(),
 		File:                    g.OriginalFile,
 		Interval:                g.Interval().Seconds(),
+		Limit:                   int64(g.Limit()),
 		PartialResponseStrategy: g.PartialResponseStrategy,
 		// UTC needed due to https://github.com/gogo/protobuf/issues/519.
 		LastEvaluation:            g.GetLastEvaluation().UTC(),
@@ -115,8 +117,9 @@ type Manager struct {
 	mgrs    map[storepb.PartialResponseStrategy]*rules.Manager
 	extLset labels.Labels
 
-	mtx       sync.RWMutex
-	ruleFiles map[string]string
+	mtx         sync.RWMutex
+	ruleFiles   map[string]string
+	externalURL string
 }
 
 // NewManager creates new Manager.
@@ -128,12 +131,14 @@ func NewManager(
 	baseOpts rules.ManagerOptions,
 	queryFuncCreator func(partialResponseStrategy storepb.PartialResponseStrategy) rules.QueryFunc,
 	extLset labels.Labels,
+	externalURL string,
 ) *Manager {
 	m := &Manager{
-		workDir:   filepath.Join(dataDir, tmpRuleDir),
-		mgrs:      make(map[storepb.PartialResponseStrategy]*rules.Manager),
-		extLset:   extLset,
-		ruleFiles: make(map[string]string),
+		workDir:     filepath.Join(dataDir, tmpRuleDir),
+		mgrs:        make(map[storepb.PartialResponseStrategy]*rules.Manager),
+		extLset:     extLset,
+		ruleFiles:   make(map[string]string),
+		externalURL: externalURL,
 	}
 	for _, strategy := range storepb.PartialResponseStrategy_value {
 		s := storepb.PartialResponseStrategy(strategy)
@@ -355,7 +360,7 @@ func (m *Manager) Update(evalInterval time.Duration, files []string) error {
 
 			// Use full file name appending to work dir, so we can differentiate between different dirs and same filenames(!).
 			// This will be also used as key for file group name.
-			newFn := filepath.Join(m.workDir, s.String(), strings.TrimLeft(fn, m.workDir))
+			newFn := filepath.Join(m.workDir, s.String(), fn)
 			if err := os.MkdirAll(filepath.Dir(newFn), os.ModePerm); err != nil {
 				errs.Add(errors.Wrapf(err, "create %s", filepath.Dir(newFn)))
 				continue
@@ -377,7 +382,7 @@ func (m *Manager) Update(evalInterval time.Duration, files []string) error {
 			continue
 		}
 		// We add external labels in `pkg/alert.Queue`.
-		if err := mgr.Update(evalInterval, fs, nil); err != nil {
+		if err := mgr.Update(evalInterval, fs, m.extLset, m.externalURL, nil); err != nil {
 			// TODO(bwplotka): Prometheus logs all error details. Fix it upstream to have consistent error handling.
 			errs.Add(errors.Wrapf(err, "strategy %s, update rules", s))
 			continue
@@ -390,7 +395,7 @@ func (m *Manager) Update(evalInterval time.Duration, files []string) error {
 }
 
 // Rules returns specified rules from manager. This is used by gRPC and locally for HTTP and UI purposes.
-func (m *Manager) Rules(r *rulespb.RulesRequest, s rulespb.Rules_RulesServer) error {
+func (m *Manager) Rules(r *rulespb.RulesRequest, s rulespb.Rules_RulesServer) (err error) {
 	groups := m.protoRuleGroups()
 
 	pgs := make([]*rulespb.RuleGroup, 0, len(groups))
@@ -419,7 +424,10 @@ func (m *Manager) Rules(r *rulespb.RulesRequest, s rulespb.Rules_RulesServer) er
 	enrichRulesWithExtLabels(pgs, m.extLset)
 
 	for _, pg := range pgs {
-		if err := s.Send(&rulespb.RulesResponse{Result: &rulespb.RulesResponse_Group{Group: pg}}); err != nil {
+		tracing.DoInSpan(s.Context(), "send_rule_group_response", func(_ context.Context) {
+			err = s.Send(&rulespb.RulesResponse{Result: &rulespb.RulesResponse_Group{Group: pg}})
+		})
+		if err != nil {
 			return err
 		}
 	}

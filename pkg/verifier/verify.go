@@ -10,13 +10,14 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/block"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/thanos-io/thanos/pkg/objstore"
+
+	"github.com/thanos-io/objstore"
 )
 
 type Verifier interface {
@@ -111,7 +112,7 @@ idLoop:
 }
 
 // New returns verifier's manager.
-func NewManager(reg prometheus.Registerer, logger log.Logger, bkt objstore.Bucket, backupBkt objstore.Bucket, fetcher block.MetadataFetcher, deleteDelay time.Duration, vs Registry) *Manager {
+func NewManager(reg prometheus.Registerer, logger log.Logger, bkt, backupBkt objstore.Bucket, fetcher block.MetadataFetcher, deleteDelay time.Duration, vs Registry) *Manager {
 	return &Manager{
 		Context: Context{
 			Logger:      logger,

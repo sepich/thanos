@@ -13,9 +13,12 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/pkg/labels"
-
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/notifier"
+
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
@@ -24,11 +27,9 @@ func TestQueue_Pop_all_Pushed(t *testing.T) {
 	batchsize := 1
 	pushes := 3
 
-	q := NewQueue(
-		nil, nil, qcapacity, batchsize, nil, nil,
-	)
+	q := NewQueue(nil, nil, qcapacity, batchsize, nil, nil, nil)
 	for i := 0; i < pushes; i++ {
-		q.Push([]*Alert{
+		q.Push([]*notifier.Alert{
 			{},
 			{},
 		})
@@ -45,13 +46,9 @@ func TestQueue_Pop_all_Pushed(t *testing.T) {
 }
 
 func TestQueue_Push_Relabelled(t *testing.T) {
-	q := NewQueue(
-		nil, nil, 10, 10,
-		labels.FromStrings("a", "1", "replica", "A"), // Labels to be added.
-		[]string{"b", "replica"},                     // Labels to be dropped (excluding those added).
-	)
+	q := NewQueue(nil, nil, 10, 10, labels.FromStrings("a", "1", "replica", "A"), []string{"b", "replica"}, nil)
 
-	q.Push([]*Alert{
+	q.Push([]*notifier.Alert{
 		{Labels: labels.FromStrings("b", "2", "c", "3")},
 		{Labels: labels.FromStrings("c", "3")},
 		{Labels: labels.FromStrings("a", "2")},
@@ -63,7 +60,59 @@ func TestQueue_Push_Relabelled(t *testing.T) {
 	testutil.Equals(t, labels.FromStrings("a", "1"), q.queue[2].Labels)
 }
 
-func assertSameHosts(t *testing.T, expected []*url.URL, found []*url.URL) {
+func TestQueue_Push_Relabelled_Alerts(t *testing.T) {
+	q := NewQueue(
+		nil, nil, 10, 10, labels.New(), []string{},
+		[]*relabel.Config{
+			{
+				SourceLabels: model.LabelNames{"a"},
+				Separator:    ";",
+				Regex:        relabel.MustNewRegexp(".*(b).*"),
+				TargetLabel:  "d",
+				Action:       relabel.Replace,
+				Replacement:  "$1",
+			},
+		},
+	)
+
+	q.Push([]*notifier.Alert{
+		{Labels: labels.FromMap(map[string]string{
+			"a": "abc",
+		})},
+	})
+
+	testutil.Equals(t, 1, len(q.queue))
+	testutil.Equals(
+		t, labels.FromMap(map[string]string{
+			"a": "abc",
+			"d": "b",
+		}),
+		q.queue[0].Labels,
+	)
+}
+
+func TestQueue_Push_RelabelDropAlerts(t *testing.T) {
+	q := NewQueue(nil, nil, 10, 10, nil, nil,
+		[]*relabel.Config{
+			{
+				SourceLabels: model.LabelNames{"a"},
+				Regex:        relabel.MustNewRegexp("1"),
+				Action:       relabel.Drop,
+			},
+		})
+
+	q.Push([]*notifier.Alert{
+		{Labels: labels.FromStrings("a", "1")},
+		{Labels: labels.FromStrings("a", "2")},
+		{Labels: labels.FromStrings("b", "3")},
+	})
+
+	testutil.Equals(t, 2, len(q.queue))
+	testutil.Equals(t, labels.FromStrings("a", "2"), q.queue[0].Labels)
+	testutil.Equals(t, labels.FromStrings("b", "3"), q.queue[1].Labels)
+}
+
+func assertSameHosts(t *testing.T, expected, found []*url.URL) {
 	testutil.Equals(t, len(expected), len(found))
 
 	host := map[string]struct{}{}
@@ -107,7 +156,7 @@ func TestSenderSendsOk(t *testing.T) {
 	}
 	s := NewSender(nil, nil, []*Alertmanager{NewAlertmanager(nil, poster, time.Minute, APIv1)})
 
-	s.Send(context.Background(), []*Alert{{}, {}})
+	s.Send(context.Background(), []*notifier.Alert{{}, {}})
 
 	assertSameHosts(t, poster.urls, poster.seen)
 
@@ -134,7 +183,7 @@ func TestSenderSendsOneFails(t *testing.T) {
 	}
 	s := NewSender(nil, nil, []*Alertmanager{NewAlertmanager(nil, poster, time.Minute, APIv1)})
 
-	s.Send(context.Background(), []*Alert{{}, {}})
+	s.Send(context.Background(), []*notifier.Alert{{}, {}})
 
 	assertSameHosts(t, poster.urls, poster.seen)
 
@@ -155,7 +204,7 @@ func TestSenderSendsAllFail(t *testing.T) {
 	}
 	s := NewSender(nil, nil, []*Alertmanager{NewAlertmanager(nil, poster, time.Minute, APIv1)})
 
-	s.Send(context.Background(), []*Alert{{}, {}})
+	s.Send(context.Background(), []*notifier.Alert{{}, {}})
 
 	assertSameHosts(t, poster.urls, poster.seen)
 

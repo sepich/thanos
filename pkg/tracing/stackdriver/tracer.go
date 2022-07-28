@@ -10,15 +10,16 @@ import (
 	"os"
 
 	trace "cloud.google.com/go/trace/apiv1"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/googleapis/gax-go"
 	gcloudtracer "github.com/lovoo/gcloud-opentracing"
 	"github.com/opentracing/basictracer-go"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/common/version"
-	"github.com/thanos-io/thanos/pkg/tracing"
 	pb "google.golang.org/genproto/googleapis/devtools/cloudtrace/v1"
+
+	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 type tracer struct {
@@ -55,11 +56,11 @@ func (t *tracer) StartSpan(operationName string, opts ...opentracing.StartSpanOp
 	return span
 }
 
-func (t *tracer) Extract(format interface{}, carrier interface{}) (opentracing.SpanContext, error) {
+func (t *tracer) Extract(format, carrier interface{}) (opentracing.SpanContext, error) {
 	return t.wrapped.Extract(format, carrier)
 }
 
-func (t *tracer) Inject(sm opentracing.SpanContext, format interface{}, carrier interface{}) error {
+func (t *tracer) Inject(sm opentracing.SpanContext, format, carrier interface{}) error {
 	return t.wrapped.Inject(sm, format, carrier)
 }
 

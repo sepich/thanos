@@ -4,25 +4,27 @@
 package main
 
 import (
+	"net"
 	"net/http"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
-	cortexfrontend "github.com/cortexproject/cortex/pkg/frontend"
-	"github.com/cortexproject/cortex/pkg/frontend/transport"
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	cortexvalidation "github.com/cortexproject/cortex/pkg/util/validation"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	extflag "github.com/efficientgo/tools/extkingpin"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/weaveworks/common/user"
+	"gopkg.in/yaml.v2"
 
+	cortexfrontend "github.com/thanos-io/thanos/internal/cortex/frontend"
+	"github.com/thanos-io/thanos/internal/cortex/frontend/transport"
+	"github.com/thanos-io/thanos/internal/cortex/querier/queryrange"
+	cortexvalidation "github.com/thanos-io/thanos/internal/cortex/util/validation"
 	"github.com/thanos-io/thanos/pkg/api"
 	"github.com/thanos-io/thanos/pkg/component"
-	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
@@ -89,7 +91,7 @@ func registerQueryFrontend(app *extkingpin.App) {
 	cmd.Flag("query-range.partial-response", "Enable partial response for query range requests if no partial_response param is specified. --no-query-range.partial-response for disabling.").
 		Default("true").BoolVar(&cfg.QueryRangeConfig.PartialResponseStrategy)
 
-	cfg.QueryRangeConfig.CachePathOrContent = *extflag.RegisterPathOrContent(cmd, "query-range.response-cache-config", "YAML file that contains response cache configuration.", false)
+	cfg.QueryRangeConfig.CachePathOrContent = *extflag.RegisterPathOrContent(cmd, "query-range.response-cache-config", "YAML file that contains response cache configuration.", extflag.WithEnvSubstitution())
 
 	// Labels tripperware flags.
 	cmd.Flag("labels.split-interval", "Split labels requests by an interval and execute in parallel, it should be greater than 0 when labels.response-cache-config is configured.").
@@ -110,13 +112,15 @@ func registerQueryFrontend(app *extkingpin.App) {
 	cmd.Flag("labels.default-time-range", "The default metadata time range duration for retrieving labels through Labels and Series API when the range parameters are not specified.").
 		Default("24h").DurationVar(&cfg.DefaultTimeRange)
 
-	cfg.LabelsConfig.CachePathOrContent = *extflag.RegisterPathOrContent(cmd, "labels.response-cache-config", "YAML file that contains response cache configuration.", false)
+	cfg.LabelsConfig.CachePathOrContent = *extflag.RegisterPathOrContent(cmd, "labels.response-cache-config", "YAML file that contains response cache configuration.", extflag.WithEnvSubstitution())
 
 	cmd.Flag("cache-compression-type", "Use compression in results cache. Supported values are: 'snappy' and '' (disable compression).").
 		Default("").StringVar(&cfg.CacheCompression)
 
 	cmd.Flag("query-frontend.downstream-url", "URL of downstream Prometheus Query compatible API.").
 		Default("http://localhost:9090").StringVar(&cfg.DownstreamURL)
+
+	cfg.DownstreamTripperConfig.CachePathOrContent = *extflag.RegisterPathOrContent(cmd, "query-frontend.downstream-tripper-config", "YAML file that contains downstream tripper configuration. If your downstream URL is localhost or 127.0.0.1 then it is highly recommended to increase max_idle_conns_per_host to at least 100.", extflag.WithEnvSubstitution())
 
 	cmd.Flag("query-frontend.compress-responses", "Compress HTTP responses.").
 		Default("false").BoolVar(&cfg.CompressResponses)
@@ -129,6 +133,8 @@ func registerQueryFrontend(app *extkingpin.App) {
 		"If multiple headers match the request, the first matching arg specified will take precedence. "+
 		"If no headers match 'anonymous' will be used.").PlaceHolder("<http-header-name>").StringsVar(&cfg.orgIdHeaders)
 
+	cmd.Flag("query-frontend.forward-header", "List of headers forwarded by the query-frontend to downstream queriers, default is empty").PlaceHolder("<http-header-name>").StringsVar(&cfg.ForwardHeaders)
+
 	cmd.Flag("log.request.decision", "Deprecation Warning - This flag would be soon deprecated, and replaced with `request.logging-config`. Request Logging for logging the start and end of requests. By default this flag is disabled. LogFinishCall : Logs the finish call of the requests. LogStartAndFinishCall : Logs the start and finish call of the requests. NoLogCall : Disable request logging.").Default("").EnumVar(&cfg.RequestLoggingDecision, "NoLogCall", "LogFinishCall", "LogStartAndFinishCall", "")
 	reqLogConfig := extkingpin.RegisterRequestLoggingFlags(cmd)
 
@@ -140,6 +146,53 @@ func registerQueryFrontend(app *extkingpin.App) {
 
 		return runQueryFrontend(g, logger, reg, tracer, httpLogOpts, cfg, comp)
 	})
+}
+
+func parseTransportConfiguration(downstreamTripperConfContentYaml []byte) (*http.Transport, error) {
+	downstreamTripper := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	if len(downstreamTripperConfContentYaml) > 0 {
+		tripperConfig := &queryfrontend.DownstreamTripperConfig{}
+		if err := yaml.UnmarshalStrict(downstreamTripperConfContentYaml, tripperConfig); err != nil {
+			return nil, errors.Wrap(err, "parsing downstream tripper config YAML file")
+		}
+
+		if tripperConfig.IdleConnTimeout > 0 {
+			downstreamTripper.IdleConnTimeout = time.Duration(tripperConfig.IdleConnTimeout)
+		}
+		if tripperConfig.ResponseHeaderTimeout > 0 {
+			downstreamTripper.ResponseHeaderTimeout = time.Duration(tripperConfig.ResponseHeaderTimeout)
+		}
+		if tripperConfig.TLSHandshakeTimeout > 0 {
+			downstreamTripper.TLSHandshakeTimeout = time.Duration(tripperConfig.TLSHandshakeTimeout)
+		}
+		if tripperConfig.ExpectContinueTimeout > 0 {
+			downstreamTripper.ExpectContinueTimeout = time.Duration(tripperConfig.ExpectContinueTimeout)
+		}
+		if tripperConfig.MaxIdleConns != nil {
+			downstreamTripper.MaxIdleConns = *tripperConfig.MaxIdleConns
+		}
+		if tripperConfig.MaxIdleConnsPerHost != nil {
+			downstreamTripper.MaxIdleConnsPerHost = *tripperConfig.MaxIdleConnsPerHost
+		}
+		if tripperConfig.MaxConnsPerHost != nil {
+			downstreamTripper.MaxConnsPerHost = *tripperConfig.MaxConnsPerHost
+		}
+	}
+
+	return downstreamTripper, nil
 }
 
 func runQueryFrontend(
@@ -191,7 +244,16 @@ func runQueryFrontend(
 	}
 
 	// Create a downstream roundtripper.
-	roundTripper, err := cortexfrontend.NewDownstreamRoundTripper(cfg.DownstreamURL)
+	downstreamTripperConfContentYaml, err := cfg.DownstreamTripperConfig.CachePathOrContent.Content()
+	if err != nil {
+		return err
+	}
+	downstreamTripper, err := parseTransportConfiguration(downstreamTripperConfContentYaml)
+	if err != nil {
+		return err
+	}
+
+	roundTripper, err := cortexfrontend.NewDownstreamRoundTripper(cfg.DownstreamURL, downstreamTripper)
 	if err != nil {
 		return errors.Wrap(err, "setup downstream roundtripper")
 	}
@@ -220,6 +282,7 @@ func runQueryFrontend(
 		srv := httpserver.New(logger, reg, comp, httpProbe,
 			httpserver.WithListen(cfg.http.bindAddress),
 			httpserver.WithGracePeriod(time.Duration(cfg.http.gracePeriod)),
+			httpserver.WithTLSConfig(cfg.http.tlsConfig),
 		)
 
 		instr := func(f http.HandlerFunc) http.HandlerFunc {
@@ -235,9 +298,10 @@ func runQueryFrontend(
 					logger,
 					ins.NewHandler(
 						name,
-						logMiddleware.HTTPMiddleware(
-							name,
-							gziphandler.GzipHandler(middleware.RequestID(f)),
+						gziphandler.GzipHandler(
+							middleware.RequestID(
+								logMiddleware.HTTPMiddleware(name, f),
+							),
 						),
 					),
 					// Cortex frontend middlewares require orgID.

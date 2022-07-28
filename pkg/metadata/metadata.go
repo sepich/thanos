@@ -5,10 +5,12 @@ package metadata
 
 import (
 	"context"
+	"sync"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/thanos-io/thanos/pkg/metadata/metadatapb"
+	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 var _ UnaryClient = &GRPCClient{}
@@ -32,6 +34,9 @@ func NewGRPCClient(ts metadatapb.MetadataServer) *GRPCClient {
 }
 
 func (rr *GRPCClient) MetricMetadata(ctx context.Context, req *metadatapb.MetricMetadataRequest) (map[string][]metadatapb.Meta, storage.Warnings, error) {
+	span, ctx := tracing.StartSpan(ctx, "metadata_grpc_request")
+	defer span.Finish()
+
 	srv := &metadataServer{ctx: ctx, metric: req.Metric, limit: int(req.Limit)}
 
 	if req.Limit >= 0 {
@@ -63,10 +68,13 @@ type metadataServer struct {
 
 	warnings    []error
 	metadataMap map[string][]metadatapb.Meta
+	mu          sync.Mutex
 }
 
 func (srv *metadataServer) Send(res *metadatapb.MetricMetadataResponse) error {
 	if res.GetWarning() != "" {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
 		srv.warnings = append(srv.warnings, errors.New(res.GetWarning()))
 		return nil
 	}
@@ -80,6 +88,8 @@ func (srv *metadataServer) Send(res *metadatapb.MetricMetadataResponse) error {
 		return nil
 	}
 
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 	for k, v := range res.GetMetadata().Metadata {
 		if metadata, ok := srv.metadataMap[k]; !ok {
 			// If limit is set and it is positive, we limit the size of the map.
