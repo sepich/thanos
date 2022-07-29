@@ -7,19 +7,25 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/mozillazg/go-cos"
+	"github.com/go-kit/log"
 	"github.com/pkg/errors"
+	"github.com/prometheus/common/model"
+	"github.com/tencentyun/cos-go-sdk-v5"
+	"gopkg.in/yaml.v2"
+
+	"github.com/thanos-io/thanos/pkg/exthttp"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/objstore/clientutil"
 	"github.com/thanos-io/thanos/pkg/runutil"
-	"gopkg.in/yaml.v2"
 )
 
 // DirDelim is the delimiter used to model a directory structure in an object store bucket.
@@ -32,17 +38,42 @@ type Bucket struct {
 	name   string
 }
 
+// DefaultConfig is the default config for an cos client. default tune the `MaxIdleConnsPerHost`.
+var DefaultConfig = Config{
+	HTTPConfig: HTTPConfig{
+		IdleConnTimeout:       model.Duration(90 * time.Second),
+		ResponseHeaderTimeout: model.Duration(2 * time.Minute),
+		TLSHandshakeTimeout:   model.Duration(10 * time.Second),
+		ExpectContinueTimeout: model.Duration(1 * time.Second),
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       0,
+	},
+}
+
 // Config encapsulates the necessary config values to instantiate an cos client.
 type Config struct {
-	Bucket    string `yaml:"bucket"`
-	Region    string `yaml:"region"`
-	AppId     string `yaml:"app_id"`
-	SecretKey string `yaml:"secret_key"`
-	SecretId  string `yaml:"secret_id"`
+	Bucket     string     `yaml:"bucket"`
+	Region     string     `yaml:"region"`
+	AppId      string     `yaml:"app_id"`
+	Endpoint   string     `yaml:"endpoint"`
+	SecretKey  string     `yaml:"secret_key"`
+	SecretId   string     `yaml:"secret_id"`
+	HTTPConfig HTTPConfig `yaml:"http_config"`
 }
 
 // Validate checks to see if mandatory cos config options are set.
 func (conf *Config) validate() error {
+	if conf.Endpoint != "" {
+		if _, err := url.Parse(conf.Endpoint); err != nil {
+			return errors.Wrap(err, "parse endpoint")
+		}
+		if conf.SecretId == "" ||
+			conf.SecretKey == "" {
+			return errors.New("secret_id or secret_key is empty")
+		}
+		return nil
+	}
 	if conf.Bucket == "" ||
 		conf.AppId == "" ||
 		conf.Region == "" ||
@@ -53,31 +84,76 @@ func (conf *Config) validate() error {
 	return nil
 }
 
+// parseConfig unmarshal a buffer into a Config with default HTTPConfig values.
+func parseConfig(conf []byte) (Config, error) {
+	config := DefaultConfig
+	if err := yaml.Unmarshal(conf, &config); err != nil {
+		return Config{}, err
+	}
+
+	return config, nil
+}
+
+// HTTPConfig stores the http.Transport configuration for the cos client.
+type HTTPConfig struct {
+	IdleConnTimeout       model.Duration `yaml:"idle_conn_timeout"`
+	ResponseHeaderTimeout model.Duration `yaml:"response_header_timeout"`
+	TLSHandshakeTimeout   model.Duration `yaml:"tls_handshake_timeout"`
+	ExpectContinueTimeout model.Duration `yaml:"expect_continue_timeout"`
+	MaxIdleConns          int            `yaml:"max_idle_conns"`
+	MaxIdleConnsPerHost   int            `yaml:"max_idle_conns_per_host"`
+	MaxConnsPerHost       int            `yaml:"max_conns_per_host"`
+}
+
+// DefaultTransport build http.Transport from config.
+func DefaultTransport(c HTTPConfig) *http.Transport {
+	transport := exthttp.NewTransport()
+	transport.IdleConnTimeout = time.Duration(c.IdleConnTimeout)
+	transport.ResponseHeaderTimeout = time.Duration(c.ResponseHeaderTimeout)
+	transport.TLSHandshakeTimeout = time.Duration(c.TLSHandshakeTimeout)
+	transport.ExpectContinueTimeout = time.Duration(c.ExpectContinueTimeout)
+	transport.MaxIdleConns = c.MaxIdleConns
+	transport.MaxIdleConnsPerHost = c.MaxIdleConnsPerHost
+	transport.MaxConnsPerHost = c.MaxConnsPerHost
+	return transport
+}
+
 // NewBucket returns a new Bucket using the provided cos configuration.
 func NewBucket(logger log.Logger, conf []byte, component string) (*Bucket, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
 
-	var config Config
-	if err := yaml.Unmarshal(conf, &config); err != nil {
+	config, err := parseConfig(conf)
+	if err != nil {
 		return nil, errors.Wrap(err, "parsing cos configuration")
 	}
+
+	return NewBucketWithConfig(logger, config, component)
+}
+
+// NewBucketWithConfig returns a new Bucket using the provided cos config values.
+func NewBucketWithConfig(logger log.Logger, config Config, component string) (*Bucket, error) {
 	if err := config.validate(); err != nil {
 		return nil, errors.Wrap(err, "validate cos configuration")
 	}
 
-	bucketUrl := cos.NewBucketURL(config.Bucket, config.AppId, config.Region, true)
-
-	b, err := cos.NewBaseURL(bucketUrl.String())
-	if err != nil {
-		return nil, errors.Wrap(err, "initialize cos base url")
+	var bucketURL *url.URL
+	var err error
+	if config.Endpoint != "" {
+		bucketURL, err = url.Parse(config.Endpoint)
+		if err != nil {
+			return nil, errors.Wrap(err, "parse endpoint")
+		}
+	} else {
+		bucketURL = cos.NewBucketURL(fmt.Sprintf("%s-%s", config.Bucket, config.AppId), config.Region, true)
 	}
-
+	b := &cos.BaseURL{BucketURL: bucketURL}
 	client := cos.NewClient(b, &http.Client{
 		Transport: &cos.AuthorizationTransport{
 			SecretID:  config.SecretId,
 			SecretKey: config.SecretKey,
+			Transport: DefaultTransport(config.HTTPConfig),
 		},
 	})
 
@@ -119,10 +195,86 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 	}, nil
 }
 
+var (
+	_ cos.FixedLengthReader = (*fixedLengthReader)(nil)
+)
+
+type fixedLengthReader struct {
+	io.Reader
+	size int64
+}
+
+func newFixedLengthReader(r io.Reader, size int64) io.Reader {
+	return fixedLengthReader{
+		Reader: io.LimitReader(r, size),
+		size:   size,
+	}
+}
+
+// Size implement cos.FixedLengthReader interface.
+func (r fixedLengthReader) Size() int64 {
+	return r.size
+}
+
 // Upload the contents of the reader as an object into the bucket.
 func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader) error {
-	if _, err := b.client.Object.Put(ctx, name, r, nil); err != nil {
-		return errors.Wrap(err, "upload cos object")
+	size, err := objstore.TryToGetSize(r)
+	if err != nil {
+		return errors.Wrapf(err, "getting size of %s", name)
+	}
+	// partSize 128MB.
+	const partSize = 1024 * 1024 * 128
+	partNums, lastSlice := int(math.Floor(float64(size)/partSize)), size%partSize
+	if partNums == 0 {
+		if _, err := b.client.Object.Put(ctx, name, r, nil); err != nil {
+			return errors.Wrapf(err, "Put object: %s", name)
+		}
+		return nil
+	}
+	// 1. init.
+	result, _, err := b.client.Object.InitiateMultipartUpload(ctx, name, nil)
+	if err != nil {
+		return errors.Wrapf(err, "InitiateMultipartUpload %s", name)
+	}
+	uploadEveryPart := func(partSize int64, part int, uploadID string) (string, error) {
+		r := newFixedLengthReader(r, partSize)
+		resp, err := b.client.Object.UploadPart(ctx, name, uploadID, part, r, &cos.ObjectUploadPartOptions{
+			ContentLength: partSize,
+		})
+		if err != nil {
+			if _, err := b.client.Object.AbortMultipartUpload(ctx, name, uploadID); err != nil {
+				return "", err
+			}
+			return "", err
+		}
+		etag := resp.Header.Get("ETag")
+		return etag, nil
+	}
+	optcom := &cos.CompleteMultipartUploadOptions{}
+	// 2. upload parts.
+	for part := 1; part <= partNums; part++ {
+		etag, err := uploadEveryPart(partSize, part, result.UploadID)
+		if err != nil {
+			return errors.Wrapf(err, "uploadPart %d, %s", part, name)
+		}
+		optcom.Parts = append(optcom.Parts, cos.Object{
+			PartNumber: part, ETag: etag},
+		)
+	}
+	// 3. upload last part.
+	if lastSlice != 0 {
+		part := partNums + 1
+		etag, err := uploadEveryPart(lastSlice, part, result.UploadID)
+		if err != nil {
+			return errors.Wrapf(err, "uploadPart %d, %s", part, name)
+		}
+		optcom.Parts = append(optcom.Parts, cos.Object{
+			PartNumber: part, ETag: etag},
+		)
+	}
+	// 4. complete.
+	if _, _, err := b.client.Object.CompleteMultipartUpload(ctx, name, result.UploadID, optcom); err != nil {
+		return errors.Wrapf(err, "CompleteMultipartUpload %s", name)
 	}
 	return nil
 }
@@ -158,13 +310,17 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error, opt
 }
 
 func (b *Bucket) getRange(ctx context.Context, name string, off, length int64) (io.ReadCloser, error) {
-	if len(name) == 0 {
+	if name == "" {
 		return nil, errors.New("given object name should not empty")
 	}
 
 	opts := &cos.ObjectGetOptions{}
 	if length != -1 {
 		if err := setRange(opts, off, off+length-1); err != nil {
+			return nil, err
+		}
+	} else if off > 0 {
+		if err := setRange(opts, off, 0); err != nil {
 			return nil, err
 		}
 	}
@@ -177,8 +333,19 @@ func (b *Bucket) getRange(ctx context.Context, name string, off, length int64) (
 		runutil.ExhaustCloseWithLogOnErr(b.logger, resp.Body, "cos get range obj close")
 		return nil, err
 	}
+	// Add size info into reader to pass it to Upload function.
+	r := objectSizerReadCloser{ReadCloser: resp.Body, size: resp.ContentLength}
+	return r, nil
+}
 
-	return resp.Body, nil
+type objectSizerReadCloser struct {
+	io.ReadCloser
+	size int64
+}
+
+// ObjectSize implement objstore.ObjectSizer.
+func (o objectSizerReadCloser) ObjectSize() (int64, error) {
+	return o.size, nil
 }
 
 // Get returns a reader for the given object name.
@@ -303,6 +470,7 @@ func configFromEnv() Config {
 		Bucket:    os.Getenv("COS_BUCKET"),
 		AppId:     os.Getenv("COS_APP_ID"),
 		Region:    os.Getenv("COS_REGION"),
+		Endpoint:  os.Getenv("COS_ENDPOINT"),
 		SecretId:  os.Getenv("COS_SECRET_ID"),
 		SecretKey: os.Getenv("COS_SECRET_KEY"),
 	}
@@ -346,7 +514,7 @@ func NewTestBucket(t testing.TB) (objstore.Bucket, func(), error) {
 		t.Log("WARNING. Reusing", c.Bucket, "COS bucket for COS tests. Manual cleanup afterwards is required")
 		return b, func() {}, nil
 	}
-	c.Bucket = objstore.CreateTemporaryTestBucketName(t)
+	c.Bucket = createTemporaryTestBucketName(t)
 
 	bc, err := yaml.Marshal(c)
 	if err != nil {
@@ -372,6 +540,16 @@ func NewTestBucket(t testing.TB) (objstore.Bucket, func(), error) {
 }
 
 func validateForTest(conf Config) error {
+	if conf.Endpoint != "" {
+		if _, err := url.Parse(conf.Endpoint); err != nil {
+			return errors.Wrap(err, "parse endpoint")
+		}
+		if conf.SecretId == "" ||
+			conf.SecretKey == "" {
+			return errors.New("secret_id or secret_key is empty")
+		}
+		return nil
+	}
 	if conf.AppId == "" ||
 		conf.Region == "" ||
 		conf.SecretId == "" ||
@@ -379,4 +557,17 @@ func validateForTest(conf Config) error {
 		return errors.New("insufficient cos configuration information")
 	}
 	return nil
+}
+
+// createTemporaryTestBucketName create a temp cos bucket for test.
+// Bucket Naming Conventions: https://intl.cloud.tencent.com/document/product/436/13312#overview
+func createTemporaryTestBucketName(t testing.TB) string {
+	src := rand.New(rand.NewSource(time.Now().UnixNano()))
+	name := fmt.Sprintf("test_%x_%s", src.Int31(), strings.ToLower(t.Name()))
+	name = strings.NewReplacer("_", "-", "/", "-").Replace(name)
+	const maxLength = 50
+	if len(name) >= maxLength {
+		name = name[:maxLength]
+	}
+	return strings.TrimSuffix(name, "-")
 }

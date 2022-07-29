@@ -18,7 +18,7 @@ import (
 	"time"
 
 	alioss "github.com/aliyun/aliyun-oss-go-sdk/oss"
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 
@@ -164,9 +164,13 @@ func NewBucket(logger log.Logger, conf []byte, component string) (*Bucket, error
 		return nil, errors.Wrap(err, "parse aliyun oss config file failed")
 	}
 
-	if config.Endpoint == "" || config.Bucket == "" || config.AccessKeyID == "" || config.AccessKeySecret == "" {
-		return nil, errors.New("aliyun oss endpoint or bucket or access_key_id or access_key_secret " +
-			"is not present in config file")
+	return NewBucketWithConfig(logger, config, component)
+}
+
+// NewBucketWithConfig returns a new Bucket using the provided oss config struct.
+func NewBucketWithConfig(logger log.Logger, config Config, component string) (*Bucket, error) {
+	if err := validate(config); err != nil {
+		return nil, err
 	}
 
 	client, err := alioss.New(config.Endpoint, config.AccessKeyID, config.AccessKeySecret)
@@ -186,6 +190,18 @@ func NewBucket(logger log.Logger, conf []byte, component string) (*Bucket, error
 		bucket: bk,
 	}
 	return bkt, nil
+}
+
+// validate checks to see the config options are set.
+func validate(config Config) error {
+	if config.Endpoint == "" || config.Bucket == "" {
+		return errors.New("aliyun oss endpoint or bucket is not present in config file")
+	}
+	if config.AccessKeyID == "" || config.AccessKeySecret == "" {
+		return errors.New("aliyun oss access_key_id or access_key_secret is not present in config file")
+	}
+
+	return nil
 }
 
 // Iter calls f for each entry in the given directory (not recursive). The argument to f is the full
@@ -238,7 +254,7 @@ func NewTestBucketFromConfig(t testing.TB, c Config, reuseBucket bool) (objstore
 	if c.Bucket == "" {
 		src := rand.NewSource(time.Now().UnixNano())
 
-		bktToCreate := strings.Replace(fmt.Sprintf("test_%s_%x", strings.ToLower(t.Name()), src.Int63()), "_", "-", -1)
+		bktToCreate := strings.ReplaceAll(fmt.Sprintf("test_%s_%x", strings.ToLower(t.Name()), src.Int63()), "_", "-")
 		if len(bktToCreate) >= 63 {
 			bktToCreate = bktToCreate[:63]
 		}
@@ -309,7 +325,7 @@ func (b *Bucket) setRange(start, end int64, name string) (alioss.Option, error) 
 }
 
 func (b *Bucket) getRange(_ context.Context, name string, off, length int64) (io.ReadCloser, error) {
-	if len(name) == 0 {
+	if name == "" {
 		return nil, errors.New("given object name should not empty")
 	}
 

@@ -9,10 +9,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
@@ -78,7 +79,7 @@ func NewDiskWriter(ctx context.Context, logger log.Logger, bDir string) (_ *Disk
 	if err = os.RemoveAll(bTmp); err != nil {
 		return nil, err
 	}
-	if err = os.MkdirAll(bTmp, 0777); err != nil {
+	if err = os.MkdirAll(bTmp, 0750); err != nil {
 		return nil, err
 	}
 
@@ -160,7 +161,7 @@ func (s *statsGatheringSeriesWriter) AddSymbol(sym string) error {
 	return nil
 }
 
-func (s *statsGatheringSeriesWriter) AddSeries(ref uint64, l labels.Labels, chks ...chunks.Meta) error {
+func (s *statsGatheringSeriesWriter) AddSeries(ref storage.SeriesRef, l labels.Labels, chks ...chunks.Meta) error {
 	if err := s.iw.AddSeries(ref, l, chks...); err != nil {
 		return err
 	}

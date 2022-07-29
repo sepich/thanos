@@ -13,13 +13,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/gogo/status"
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/relabel"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/model/timestamp"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/weaveworks/common/httpgrpc"
 	"google.golang.org/grpc/codes"
 
@@ -76,11 +78,11 @@ func (c *swappableCache) FetchMultiPostings(ctx context.Context, blockID ulid.UL
 	return c.ptr.FetchMultiPostings(ctx, blockID, keys)
 }
 
-func (c *swappableCache) StoreSeries(ctx context.Context, blockID ulid.ULID, id uint64, v []byte) {
+func (c *swappableCache) StoreSeries(ctx context.Context, blockID ulid.ULID, id storage.SeriesRef, v []byte) {
 	c.ptr.StoreSeries(ctx, blockID, id, v)
 }
 
-func (c *swappableCache) FetchMultiSeries(ctx context.Context, blockID ulid.ULID, ids []uint64) (map[uint64][]byte, []uint64) {
+func (c *swappableCache) FetchMultiSeries(ctx context.Context, blockID ulid.ULID, ids []storage.SeriesRef) (map[storage.SeriesRef][]byte, []storage.SeriesRef) {
 	return c.ptr.FetchMultiSeries(ctx, blockID, ids)
 }
 
@@ -116,7 +118,7 @@ func prepareTestBlocks(t testing.TB, now time.Time, count int, dir string, bkt o
 
 		dir1, dir2 := filepath.Join(dir, id1.String()), filepath.Join(dir, id2.String())
 
-		// Add labels to the meta of the second block.
+		// Replace labels to the meta of the second block.
 		meta, err := metadata.ReadFromDir(dir2)
 		testutil.Ok(t, err)
 		meta.Thanos.Labels = map[string]string{"ext2": "value2"}
@@ -163,8 +165,7 @@ func prepareStoreWithTestBlocks(t testing.TB, dir string, bkt objstore.Bucket, m
 	}
 	extLset := labels.FromStrings("ext1", "value1")
 
-	minTime, maxTime := prepareTestBlocks(t, time.Now(), 3, dir, bkt,
-		series, extLset)
+	minTime, maxTime := prepareTestBlocks(t, time.Now(), 3, dir, bkt, series, extLset)
 
 	s := &storeSuite{
 		logger:  log.NewLogfmtLogger(os.Stderr),
@@ -176,9 +177,10 @@ func prepareStoreWithTestBlocks(t testing.TB, dir string, bkt objstore.Bucket, m
 	metaFetcher, err := block.NewMetaFetcher(s.logger, 20, objstore.WithNoopInstr(bkt), dir, nil, []block.MetadataFilter{
 		block.NewTimePartitionMetaFilter(filterConf.MinTime, filterConf.MaxTime),
 		block.NewLabelShardedMetaFilter(relabelConfig),
-	}, nil)
+	})
 	testutil.Ok(t, err)
 
+	reg := prometheus.NewRegistry()
 	store, err := NewBucketStore(
 		objstore.WithNoopInstr(bkt),
 		metaFetcher,
@@ -195,6 +197,7 @@ func prepareStoreWithTestBlocks(t testing.TB, dir string, bkt objstore.Bucket, m
 		WithLogger(s.logger),
 		WithIndexCache(s.cache),
 		WithFilterConfig(filterConf),
+		WithRegistry(reg),
 	)
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, store.Close()) }()
@@ -208,8 +211,35 @@ func prepareStoreWithTestBlocks(t testing.TB, dir string, bkt objstore.Bucket, m
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Check if the blocks are being loaded.
+	start := time.Now()
+	time.Sleep(time.Second * 1)
 	testutil.Ok(t, store.SyncBlocks(ctx))
+
+	// Get the value of the metric 'thanos_bucket_store_blocks_last_loaded_timestamp_seconds' to capture the timestamp of the last loaded block.
+	m := gatherFamily(t, reg, "thanos_bucket_store_blocks_last_loaded_timestamp_seconds")
+	lastUploaded := time.Unix(int64(m.Metric[0].Gauge.GetValue()), 0)
+
+	if lastUploaded.Before(start) {
+		t.Fatalf("no blocks are loaded ")
+	}
+
 	return s
+}
+
+func gatherFamily(t testing.TB, reg prometheus.Gatherer, familyName string) *dto.MetricFamily {
+
+	families, err := reg.Gather()
+	testutil.Ok(t, err)
+
+	for _, f := range families {
+		if f.GetName() == familyName {
+			return f
+		}
+	}
+
+	t.Fatalf("could not find family %s", familyName)
+	return nil
 }
 
 // TODO(bwplotka): Benchmark Series.
@@ -660,26 +690,95 @@ func TestBucketStore_LabelNames_e2e(t *testing.T) {
 		defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
 
 		s := prepareStoreWithTestBlocks(t, dir, bkt, false, NewChunksLimiterFactory(0), NewSeriesLimiterFactory(0), emptyRelabelConfig, allowAllFilterConf)
+		s.cache.SwapWith(noopCache{})
 
 		mint, maxt := s.store.TimeRange()
 		testutil.Equals(t, s.minTime, mint)
 		testutil.Equals(t, s.maxTime, maxt)
 
-		vals, err := s.store.LabelNames(ctx, &storepb.LabelNamesRequest{
-			Start: timestamp.FromTime(minTime),
-			End:   timestamp.FromTime(maxTime),
-		})
-		testutil.Ok(t, err)
-		// ext2 is added by the prepareStoreWithTestBlocks function.
-		testutil.Equals(t, []string{"a", "b", "c", "ext1", "ext2"}, vals.Names)
+		for name, tc := range map[string]struct {
+			req      *storepb.LabelNamesRequest
+			expected []string
+		}{
+			"basic labelNames": {
+				req: &storepb.LabelNamesRequest{
+					Start: timestamp.FromTime(minTime),
+					End:   timestamp.FromTime(maxTime),
+				},
+				expected: []string{"a", "b", "c", "ext1", "ext2"}, // ext2 is added by the prepareStoreWithTestBlocks function.
+			},
+			"outside the time range": {
+				req: &storepb.LabelNamesRequest{
+					Start: timestamp.FromTime(time.Now().Add(-24 * time.Hour)),
+					End:   timestamp.FromTime(time.Now().Add(-23 * time.Hour)),
+				},
+				expected: nil,
+			},
+			"matcher matching everything": {
+				req: &storepb.LabelNamesRequest{
+					Start: timestamp.FromTime(minTime),
+					End:   timestamp.FromTime(maxTime),
+					Matchers: []storepb.LabelMatcher{
+						{
+							Type:  storepb.LabelMatcher_EQ,
+							Name:  "a",
+							Value: "1",
+						},
+					},
+				},
+				expected: []string{"a", "b", "c", "ext1", "ext2"},
+			},
+			"b=1 matcher": {
+				req: &storepb.LabelNamesRequest{
+					Start: timestamp.FromTime(minTime),
+					End:   timestamp.FromTime(maxTime),
+					Matchers: []storepb.LabelMatcher{
+						{
+							Type:  storepb.LabelMatcher_EQ,
+							Name:  "b",
+							Value: "1",
+						},
+					},
+				},
+				expected: []string{"a", "b", "ext1"},
+			},
 
-		// Outside the time range.
-		vals, err = s.store.LabelNames(ctx, &storepb.LabelNamesRequest{
-			Start: timestamp.FromTime(time.Now().Add(-24 * time.Hour)),
-			End:   timestamp.FromTime(time.Now().Add(-23 * time.Hour)),
-		})
-		testutil.Ok(t, err)
-		testutil.Equals(t, []string(nil), vals.Names)
+			"b='' matcher": {
+				req: &storepb.LabelNamesRequest{
+					Start: timestamp.FromTime(minTime),
+					End:   timestamp.FromTime(maxTime),
+					Matchers: []storepb.LabelMatcher{
+						{
+							Type:  storepb.LabelMatcher_EQ,
+							Name:  "b",
+							Value: "",
+						},
+					},
+				},
+				expected: []string{"a", "c", "ext2"},
+			},
+			"outside the time range, with matcher": {
+				req: &storepb.LabelNamesRequest{
+					Start: timestamp.FromTime(time.Now().Add(-24 * time.Hour)),
+					End:   timestamp.FromTime(time.Now().Add(-23 * time.Hour)),
+					Matchers: []storepb.LabelMatcher{
+						{
+							Type:  storepb.LabelMatcher_EQ,
+							Name:  "a",
+							Value: "1",
+						},
+					},
+				},
+				expected: nil,
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				vals, err := s.store.LabelNames(ctx, tc.req)
+				testutil.Ok(t, err)
+
+				testutil.Equals(t, tc.expected, vals.Names)
+			})
+		}
 	})
 }
 
@@ -693,26 +792,104 @@ func TestBucketStore_LabelValues_e2e(t *testing.T) {
 		defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
 
 		s := prepareStoreWithTestBlocks(t, dir, bkt, false, NewChunksLimiterFactory(0), NewSeriesLimiterFactory(0), emptyRelabelConfig, allowAllFilterConf)
+		s.cache.SwapWith(noopCache{})
 
 		mint, maxt := s.store.TimeRange()
 		testutil.Equals(t, s.minTime, mint)
 		testutil.Equals(t, s.maxTime, maxt)
 
-		vals, err := s.store.LabelValues(ctx, &storepb.LabelValuesRequest{
-			Label: "a",
-			Start: timestamp.FromTime(minTime),
-			End:   timestamp.FromTime(maxTime),
-		})
-		testutil.Ok(t, err)
-		testutil.Equals(t, []string{"1", "2"}, vals.Values)
+		for name, tc := range map[string]struct {
+			req      *storepb.LabelValuesRequest
+			expected []string
+		}{
+			"label a": {
+				req: &storepb.LabelValuesRequest{
+					Label: "a",
+					Start: timestamp.FromTime(minTime),
+					End:   timestamp.FromTime(maxTime),
+				},
+				expected: []string{"1", "2"},
+			},
+			"label a, outside time range": {
+				req: &storepb.LabelValuesRequest{
+					Label: "a",
+					Start: timestamp.FromTime(time.Now().Add(-24 * time.Hour)),
+					End:   timestamp.FromTime(time.Now().Add(-23 * time.Hour)),
+				},
+				expected: nil,
+			},
+			"label a, a=1": {
+				req: &storepb.LabelValuesRequest{
+					Label: "a",
+					Start: timestamp.FromTime(minTime),
+					End:   timestamp.FromTime(maxTime),
+					Matchers: []storepb.LabelMatcher{
+						{
+							Type:  storepb.LabelMatcher_EQ,
+							Name:  "a",
+							Value: "1",
+						},
+					},
+				},
+				expected: []string{"1"},
+			},
+			"label a, a=2, c=2": {
+				req: &storepb.LabelValuesRequest{
+					Label: "a",
+					Start: timestamp.FromTime(minTime),
+					End:   timestamp.FromTime(maxTime),
+					Matchers: []storepb.LabelMatcher{
+						{
+							Type:  storepb.LabelMatcher_EQ,
+							Name:  "a",
+							Value: "2",
+						},
+						{
+							Type:  storepb.LabelMatcher_EQ,
+							Name:  "c",
+							Value: "2",
+						},
+					},
+				},
+				expected: []string{"2"},
+			},
+			"label ext1": {
+				req: &storepb.LabelValuesRequest{
+					Label: "ext1",
+					Start: timestamp.FromTime(minTime),
+					End:   timestamp.FromTime(maxTime),
+				},
+				expected: []string{"value1"},
+			},
+			"label ext1, c=1": {
+				req: &storepb.LabelValuesRequest{
+					Label: "ext1",
+					Start: timestamp.FromTime(minTime),
+					End:   timestamp.FromTime(maxTime),
+					Matchers: []storepb.LabelMatcher{
+						{
+							Type:  storepb.LabelMatcher_EQ,
+							Name:  "c",
+							Value: "1",
+						},
+					},
+				},
+				expected: nil, // ext1 is replaced with ext2 for series with c
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				vals, err := s.store.LabelValues(ctx, tc.req)
+				testutil.Ok(t, err)
 
-		// Outside the time range.
-		vals, err = s.store.LabelValues(ctx, &storepb.LabelValuesRequest{
-			Label: "a",
-			Start: timestamp.FromTime(time.Now().Add(-24 * time.Hour)),
-			End:   timestamp.FromTime(time.Now().Add(-23 * time.Hour)),
-		})
-		testutil.Ok(t, err)
-		testutil.Equals(t, []string(nil), vals.Values)
+				testutil.Equals(t, tc.expected, emptyToNil(vals.Values))
+			})
+		}
 	})
+}
+
+func emptyToNil(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }

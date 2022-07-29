@@ -1,4 +1,4 @@
-# Auto generated binary variables helper managed by https://github.com/bwplotka/bingo v0.4.0. DO NOT EDIT.
+# Auto generated binary variables helper managed by https://github.com/bwplotka/bingo v0.5.2. DO NOT EDIT.
 # All tools are designed to be build inside $GOBIN.
 BINGO_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 GOPATH ?= $(shell go env GOPATH)
@@ -23,23 +23,17 @@ $(ALERTMANAGER): $(BINGO_DIR)/alertmanager.mod
 	@echo "(re)installing $(GOBIN)/alertmanager-v0.20.0"
 	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=alertmanager.mod -o=$(GOBIN)/alertmanager-v0.20.0 "github.com/prometheus/alertmanager/cmd/alertmanager"
 
-BINGO := $(GOBIN)/bingo-v0.3.0
+BINGO := $(GOBIN)/bingo-v0.5.2
 $(BINGO): $(BINGO_DIR)/bingo.mod
 	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
-	@echo "(re)installing $(GOBIN)/bingo-v0.3.0"
-	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=bingo.mod -o=$(GOBIN)/bingo-v0.3.0 "github.com/bwplotka/bingo"
+	@echo "(re)installing $(GOBIN)/bingo-v0.5.2"
+	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=bingo.mod -o=$(GOBIN)/bingo-v0.5.2 "github.com/bwplotka/bingo"
 
-EMBEDMD := $(GOBIN)/embedmd-v0.0.0-20181127031020-97c13d6e4160
-$(EMBEDMD): $(BINGO_DIR)/embedmd.mod
-	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
-	@echo "(re)installing $(GOBIN)/embedmd-v0.0.0-20181127031020-97c13d6e4160"
-	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=embedmd.mod -o=$(GOBIN)/embedmd-v0.0.0-20181127031020-97c13d6e4160 "github.com/campoy/embedmd"
-
-FAILLINT := $(GOBIN)/faillint-v1.5.0
+FAILLINT := $(GOBIN)/faillint-v1.8.0
 $(FAILLINT): $(BINGO_DIR)/faillint.mod
 	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
-	@echo "(re)installing $(GOBIN)/faillint-v1.5.0"
-	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=faillint.mod -o=$(GOBIN)/faillint-v1.5.0 "github.com/fatih/faillint"
+	@echo "(re)installing $(GOBIN)/faillint-v1.8.0"
+	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=faillint.mod -o=$(GOBIN)/faillint-v1.8.0 "github.com/fatih/faillint"
 
 GO_BINDATA := $(GOBIN)/go-bindata-v3.1.1+incompatible
 $(GO_BINDATA): $(BINGO_DIR)/go-bindata.mod
@@ -65,6 +59,12 @@ $(GOLANGCI_LINT): $(BINGO_DIR)/golangci-lint.mod
 	@echo "(re)installing $(GOBIN)/golangci-lint-v1.39.1-0.20210330125642-6844f6abf817"
 	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=golangci-lint.mod -o=$(GOBIN)/golangci-lint-v1.39.1-0.20210330125642-6844f6abf817 "github.com/golangci/golangci-lint/cmd/golangci-lint"
 
+GOTESPLIT := $(GOBIN)/gotesplit-v0.1.2
+$(GOTESPLIT): $(BINGO_DIR)/gotesplit.mod
+	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
+	@echo "(re)installing $(GOBIN)/gotesplit-v0.1.2"
+	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=gotesplit.mod -o=$(GOBIN)/gotesplit-v0.1.2 "github.com/Songmu/gotesplit/cmd/gotesplit"
+
 HUGO := $(GOBIN)/hugo-v0.80.0
 $(HUGO): $(BINGO_DIR)/hugo.mod
 	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
@@ -77,11 +77,11 @@ $(JB): $(BINGO_DIR)/jb.mod
 	@echo "(re)installing $(GOBIN)/jb-v0.4.0"
 	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=jb.mod -o=$(GOBIN)/jb-v0.4.0 "github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb"
 
-JSONNET_LINT := $(GOBIN)/jsonnet-lint-v0.17.1-0.20210113194615-cd59751527e0
+JSONNET_LINT := $(GOBIN)/jsonnet-lint-v0.17.1-0.20211101230100-b10eae7c683a
 $(JSONNET_LINT): $(BINGO_DIR)/jsonnet-lint.mod
 	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
-	@echo "(re)installing $(GOBIN)/jsonnet-lint-v0.17.1-0.20210113194615-cd59751527e0"
-	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=jsonnet-lint.mod -o=$(GOBIN)/jsonnet-lint-v0.17.1-0.20210113194615-cd59751527e0 "github.com/google/go-jsonnet/cmd/jsonnet-lint"
+	@echo "(re)installing $(GOBIN)/jsonnet-lint-v0.17.1-0.20211101230100-b10eae7c683a"
+	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=jsonnet-lint.mod -o=$(GOBIN)/jsonnet-lint-v0.17.1-0.20211101230100-b10eae7c683a "github.com/google/go-jsonnet/cmd/jsonnet-lint"
 
 JSONNET := $(GOBIN)/jsonnet-v0.17.0
 $(JSONNET): $(BINGO_DIR)/jsonnet.mod
@@ -95,25 +95,33 @@ $(JSONNETFMT): $(BINGO_DIR)/jsonnetfmt.mod
 	@echo "(re)installing $(GOBIN)/jsonnetfmt-v0.17.0"
 	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=jsonnetfmt.mod -o=$(GOBIN)/jsonnetfmt-v0.17.0 "github.com/google/go-jsonnet/cmd/jsonnetfmt"
 
-MINIO := $(GOBIN)/minio-v0.0.0-20200527010300-cccf2de129da
+MDOX := $(GOBIN)/mdox-v0.9.0
+$(MDOX): $(BINGO_DIR)/mdox.mod
+	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
+	@echo "(re)installing $(GOBIN)/mdox-v0.9.0"
+	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=mdox.mod -o=$(GOBIN)/mdox-v0.9.0 "github.com/bwplotka/mdox"
+
+MINIO := $(GOBIN)/minio-v0.0.0-20201125204248-91130e884b5d
 $(MINIO): $(BINGO_DIR)/minio.mod
 	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
-	@echo "(re)installing $(GOBIN)/minio-v0.0.0-20200527010300-cccf2de129da"
-	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=minio.mod -o=$(GOBIN)/minio-v0.0.0-20200527010300-cccf2de129da "github.com/minio/minio"
+	@echo "(re)installing $(GOBIN)/minio-v0.0.0-20201125204248-91130e884b5d"
+	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=minio.mod -o=$(GOBIN)/minio-v0.0.0-20201125204248-91130e884b5d "github.com/minio/minio"
 
-PROMDOC := $(GOBIN)/promdoc-v0.7.0
+PROMDOC := $(GOBIN)/promdoc-v0.8.0
 $(PROMDOC): $(BINGO_DIR)/promdoc.mod
 	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
-	@echo "(re)installing $(GOBIN)/promdoc-v0.7.0"
-	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=promdoc.mod -o=$(GOBIN)/promdoc-v0.7.0 "github.com/plexsystems/promdoc"
+	@echo "(re)installing $(GOBIN)/promdoc-v0.8.0"
+	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=promdoc.mod -o=$(GOBIN)/promdoc-v0.8.0 "github.com/plexsystems/promdoc"
 
-PROMETHEUS_ARRAY := $(GOBIN)/prometheus-v2.4.3+incompatible $(GOBIN)/prometheus-v1.8.2-0.20200724121523-657ba532e42f
-$(PROMETHEUS_ARRAY): $(BINGO_DIR)/prometheus.mod $(BINGO_DIR)/prometheus.1.mod
+PROMETHEUS_ARRAY := $(GOBIN)/prometheus-v2.4.3+incompatible $(GOBIN)/prometheus-v1.8.2-0.20200724121523-657ba532e42f $(GOBIN)/prometheus-v1.8.2-0.20210331101223-3cafc58827d1
+$(PROMETHEUS_ARRAY): $(BINGO_DIR)/prometheus.mod $(BINGO_DIR)/prometheus.1.mod $(BINGO_DIR)/prometheus.2.mod
 	@# Install binary/ries using Go 1.14+ build command. This is using bwplotka/bingo-controlled, separate go module with pinned dependencies.
 	@echo "(re)installing $(GOBIN)/prometheus-v2.4.3+incompatible"
 	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=prometheus.mod -o=$(GOBIN)/prometheus-v2.4.3+incompatible "github.com/prometheus/prometheus/cmd/prometheus"
 	@echo "(re)installing $(GOBIN)/prometheus-v1.8.2-0.20200724121523-657ba532e42f"
 	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=prometheus.1.mod -o=$(GOBIN)/prometheus-v1.8.2-0.20200724121523-657ba532e42f "github.com/prometheus/prometheus/cmd/prometheus"
+	@echo "(re)installing $(GOBIN)/prometheus-v1.8.2-0.20210331101223-3cafc58827d1"
+	@cd $(BINGO_DIR) && $(GO) build -mod=mod -modfile=prometheus.2.mod -o=$(GOBIN)/prometheus-v1.8.2-0.20210331101223-3cafc58827d1 "github.com/prometheus/prometheus/cmd/prometheus"
 
 PROMTOOL := $(GOBIN)/promtool-v1.8.2-0.20200522113006-f4dd45609a05
 $(PROMTOOL): $(BINGO_DIR)/promtool.mod

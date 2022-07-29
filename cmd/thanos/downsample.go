@@ -8,10 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	extflag "github.com/efficientgo/tools/extkingpin"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
@@ -19,12 +21,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
-	"github.com/thanos-io/thanos/pkg/extflag"
+	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
@@ -36,6 +38,7 @@ import (
 type DownsampleMetrics struct {
 	downsamples        *prometheus.CounterVec
 	downsampleFailures *prometheus.CounterVec
+	downsampleDuration *prometheus.HistogramVec
 }
 
 func newDownsampleMetrics(reg *prometheus.Registry) *DownsampleMetrics {
@@ -49,6 +52,11 @@ func newDownsampleMetrics(reg *prometheus.Registry) *DownsampleMetrics {
 		Name: "thanos_compact_downsample_failures_total",
 		Help: "Total number of failed downsampling attempts.",
 	}, []string{"group"})
+	m.downsampleDuration = promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "thanos_compact_downsample_duration_seconds",
+		Help:    "Duration of downsample runs",
+		Buckets: []float64{60, 300, 900, 1800, 3600, 7200, 14400}, // 1m, 5m, 15m, 30m, 60m, 120m, 240m
+	}, []string{"group"})
 
 	return m
 }
@@ -58,8 +66,11 @@ func RunDownsample(
 	logger log.Logger,
 	reg *prometheus.Registry,
 	httpBindAddr string,
+	httpTLSConfig string,
 	httpGracePeriod time.Duration,
 	dataDir string,
+	waitInterval time.Duration,
+	downsampleConcurrency int,
 	objStoreConfig *extflag.PathOrContent,
 	comp component.Component,
 	hashFunc metadata.HashFunc,
@@ -75,8 +86,8 @@ func RunDownsample(
 	}
 
 	metaFetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix("thanos_", reg), []block.MetadataFilter{
-		block.NewDeduplicateFilter(),
-	}, nil)
+		block.NewDeduplicateFilter(block.FetcherConcurrency),
+	})
 	if err != nil {
 		return errors.Wrap(err, "create meta fetcher")
 	}
@@ -103,31 +114,32 @@ func RunDownsample(
 			defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
 			statusProber.Ready()
 
-			level.Info(logger).Log("msg", "start first pass of downsampling")
-			metas, _, err := metaFetcher.Fetch(ctx)
-			if err != nil {
-				return errors.Wrap(err, "sync before first pass of downsampling")
-			}
+			return runutil.Repeat(waitInterval, ctx.Done(), func() error {
+				level.Info(logger).Log("msg", "start first pass of downsampling")
+				metas, _, err := metaFetcher.Fetch(ctx)
+				if err != nil {
+					return errors.Wrap(err, "sync before first pass of downsampling")
+				}
 
-			for _, meta := range metas {
-				groupKey := compact.DefaultGroupKey(meta.Thanos)
-				metrics.downsamples.WithLabelValues(groupKey)
-				metrics.downsampleFailures.WithLabelValues(groupKey)
-			}
-			if err := downsampleBucket(ctx, logger, metrics, bkt, metas, dataDir, hashFunc); err != nil {
-				return errors.Wrap(err, "downsampling failed")
-			}
+				for _, meta := range metas {
+					groupKey := meta.Thanos.GroupKey()
+					metrics.downsamples.WithLabelValues(groupKey)
+					metrics.downsampleFailures.WithLabelValues(groupKey)
+				}
+				if err := downsampleBucket(ctx, logger, metrics, bkt, metas, dataDir, downsampleConcurrency, hashFunc); err != nil {
+					return errors.Wrap(err, "downsampling failed")
+				}
 
-			level.Info(logger).Log("msg", "start second pass of downsampling")
-			metas, _, err = metaFetcher.Fetch(ctx)
-			if err != nil {
-				return errors.Wrap(err, "sync before second pass of downsampling")
-			}
-			if err := downsampleBucket(ctx, logger, metrics, bkt, metas, dataDir, hashFunc); err != nil {
-				return errors.Wrap(err, "downsampling failed")
-			}
-
-			return nil
+				level.Info(logger).Log("msg", "start second pass of downsampling")
+				metas, _, err = metaFetcher.Fetch(ctx)
+				if err != nil {
+					return errors.Wrap(err, "sync before second pass of downsampling")
+				}
+				if err := downsampleBucket(ctx, logger, metrics, bkt, metas, dataDir, downsampleConcurrency, hashFunc); err != nil {
+					return errors.Wrap(err, "downsampling failed")
+				}
+				return nil
+			})
 		}, func(error) {
 			cancel()
 		})
@@ -136,6 +148,7 @@ func RunDownsample(
 	srv := httpserver.New(logger, reg, comp, httpProbe,
 		httpserver.WithListen(httpBindAddr),
 		httpserver.WithGracePeriod(httpGracePeriod),
+		httpserver.WithTLSConfig(httpTLSConfig),
 	)
 
 	g.Add(func() error {
@@ -160,9 +173,10 @@ func downsampleBucket(
 	bkt objstore.Bucket,
 	metas map[ulid.ULID]*metadata.Meta,
 	dir string,
+	downsampleConcurrency int,
 	hashFunc metadata.HashFunc,
 ) (rerr error) {
-	if err := os.MkdirAll(dir, 0777); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return errors.Wrap(err, "create dir")
 	}
 
@@ -216,10 +230,47 @@ func downsampleBucket(
 		return metasULIDS[i].Compare(metasULIDS[j]) < 0
 	})
 
+	var (
+		wg                      sync.WaitGroup
+		metaCh                  = make(chan *metadata.Meta)
+		downsampleErrs          errutil.MultiError
+		errCh                   = make(chan error, downsampleConcurrency)
+		workerCtx, workerCancel = context.WithCancel(ctx)
+	)
+
+	defer workerCancel()
+
+	level.Debug(logger).Log("msg", "downsampling bucket", "concurrency", downsampleConcurrency)
+	for i := 0; i < downsampleConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for m := range metaCh {
+				resolution := downsample.ResLevel1
+				errMsg := "downsampling to 5 min"
+				if m.Thanos.Downsample.Resolution == downsample.ResLevel1 {
+					resolution = downsample.ResLevel2
+					errMsg = "downsampling to 60 min"
+				}
+				if err := processDownsampling(workerCtx, logger, bkt, m, dir, resolution, hashFunc, metrics); err != nil {
+					metrics.downsampleFailures.WithLabelValues(m.Thanos.GroupKey()).Inc()
+					errCh <- errors.Wrap(err, errMsg)
+
+				}
+				metrics.downsamples.WithLabelValues(m.Thanos.GroupKey()).Inc()
+			}
+		}()
+	}
+
+	// Workers scheduled, distribute blocks.
+metaSendLoop:
 	for _, mk := range metasULIDS {
 		m := metas[mk]
 
 		switch m.Thanos.Downsample.Resolution {
+		case downsample.ResLevel2:
+			continue
+
 		case downsample.ResLevel0:
 			missing := false
 			for _, id := range m.Compaction.Sources {
@@ -234,15 +285,9 @@ func downsampleBucket(
 			// Only downsample blocks once we are sure to get roughly 2 chunks out of it.
 			// NOTE(fabxc): this must match with at which block size the compactor creates downsampled
 			// blocks. Otherwise we may never downsample some data.
-			if m.MaxTime-m.MinTime < downsample.DownsampleRange0 {
+			if m.MaxTime-m.MinTime < downsample.ResLevel1DownsampleRange {
 				continue
 			}
-
-			if err := processDownsampling(ctx, logger, bkt, m, dir, downsample.ResLevel1, hashFunc); err != nil {
-				metrics.downsampleFailures.WithLabelValues(compact.DefaultGroupKey(m.Thanos)).Inc()
-				return errors.Wrap(err, "downsampling to 5 min")
-			}
-			metrics.downsamples.WithLabelValues(compact.DefaultGroupKey(m.Thanos)).Inc()
 
 		case downsample.ResLevel1:
 			missing := false
@@ -258,20 +303,45 @@ func downsampleBucket(
 			// Only downsample blocks once we are sure to get roughly 2 chunks out of it.
 			// NOTE(fabxc): this must match with at which block size the compactor creates downsampled
 			// blocks. Otherwise we may never downsample some data.
-			if m.MaxTime-m.MinTime < downsample.DownsampleRange1 {
+			if m.MaxTime-m.MinTime < downsample.ResLevel2DownsampleRange {
 				continue
 			}
-			if err := processDownsampling(ctx, logger, bkt, m, dir, downsample.ResLevel2, hashFunc); err != nil {
-				metrics.downsampleFailures.WithLabelValues(compact.DefaultGroupKey(m.Thanos)).Inc()
-				return errors.Wrap(err, "downsampling to 60 min")
-			}
-			metrics.downsamples.WithLabelValues(compact.DefaultGroupKey(m.Thanos)).Inc()
+		}
+
+		select {
+		case <-workerCtx.Done():
+			downsampleErrs.Add(workerCtx.Err())
+			break metaSendLoop
+		case metaCh <- m:
+		case downsampleErr := <-errCh:
+			downsampleErrs.Add(downsampleErr)
+			break metaSendLoop
 		}
 	}
-	return nil
+
+	close(metaCh)
+	wg.Wait()
+	workerCancel()
+	close(errCh)
+
+	// Collect any other error reported by the workers.
+	for downsampleErr := range errCh {
+		downsampleErrs.Add(downsampleErr)
+	}
+
+	return downsampleErrs.Err()
 }
 
-func processDownsampling(ctx context.Context, logger log.Logger, bkt objstore.Bucket, m *metadata.Meta, dir string, resolution int64, hashFunc metadata.HashFunc) error {
+func processDownsampling(
+	ctx context.Context,
+	logger log.Logger,
+	bkt objstore.Bucket,
+	m *metadata.Meta,
+	dir string,
+	resolution int64,
+	hashFunc metadata.HashFunc,
+	metrics *DownsampleMetrics,
+) error {
 	begin := time.Now()
 	bdir := filepath.Join(dir, m.ULID.String())
 
@@ -279,7 +349,7 @@ func processDownsampling(ctx context.Context, logger log.Logger, bkt objstore.Bu
 	if err != nil {
 		return errors.Wrapf(err, "download block %s", m.ULID)
 	}
-	level.Info(logger).Log("msg", "downloaded block", "id", m.ULID, "duration", time.Since(begin))
+	level.Info(logger).Log("msg", "downloaded block", "id", m.ULID, "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds())
 
 	if err := block.VerifyIndex(logger, filepath.Join(bdir, block.IndexFilename), m.MinTime, m.MaxTime); err != nil {
 		return errors.Wrap(err, "input block index not valid")
@@ -306,8 +376,10 @@ func processDownsampling(ctx context.Context, logger log.Logger, bkt objstore.Bu
 	}
 	resdir := filepath.Join(dir, id.String())
 
+	downsampleDuration := time.Since(begin)
 	level.Info(logger).Log("msg", "downsampled block",
-		"from", m.ULID, "to", id, "duration", time.Since(begin))
+		"from", m.ULID, "to", id, "duration", downsampleDuration, "duration_ms", downsampleDuration.Milliseconds())
+	metrics.downsampleDuration.WithLabelValues(m.Thanos.GroupKey()).Observe(downsampleDuration.Seconds())
 
 	if err := block.VerifyIndex(logger, filepath.Join(resdir, block.IndexFilename), m.MinTime, m.MaxTime); err != nil {
 		return errors.Wrap(err, "output block index not valid")
@@ -320,7 +392,7 @@ func processDownsampling(ctx context.Context, logger log.Logger, bkt objstore.Bu
 		return errors.Wrapf(err, "upload downsampled block %s", id)
 	}
 
-	level.Info(logger).Log("msg", "uploaded block", "id", id, "duration", time.Since(begin))
+	level.Info(logger).Log("msg", "uploaded block", "id", id, "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds())
 
 	// It is not harmful if these fails.
 	if err := os.RemoveAll(bdir); err != nil {

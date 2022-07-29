@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cortexproject/cortex/integration/e2e"
-	e2edb "github.com/cortexproject/cortex/integration/e2e/db"
-	"github.com/go-kit/kit/log"
+	"github.com/efficientgo/e2e"
+	"github.com/go-kit/log"
+
 	"github.com/thanos-io/thanos/pkg/objstore/s3"
 	"github.com/thanos-io/thanos/test/e2e/e2ethanos"
 
@@ -23,21 +23,16 @@ func BenchmarkUpload(b *testing.B) {
 	b.ReportAllocs()
 	ctx := context.Background()
 
-	s, err := e2e.NewScenario("e2e_bench_mino_client")
+	e, err := e2e.NewDockerEnvironment("e2e_bench_mino_client")
 	testutil.Ok(b, err)
-	b.Cleanup(e2ethanos.CleanScenario(b, s))
+	b.Cleanup(e2ethanos.CleanScenario(b, e))
 
-	const bucket = "test"
-	m := e2edb.NewMinio(8080, bucket)
-	testutil.Ok(b, s.StartAndWaitReady(m))
+	const bucket = "benchmark"
+	m := e2ethanos.NewMinio(e, "benchmark", bucket)
+	testutil.Ok(b, e2e.StartAndWaitReady(m))
 
-	bkt, err := s3.NewBucketWithConfig(log.NewNopLogger(), s3.Config{
-		Bucket:    bucket,
-		AccessKey: e2edb.MinioAccessKey,
-		SecretKey: e2edb.MinioSecretKey,
-		Endpoint:  m.HTTPEndpoint(),
-		Insecure:  true,
-	}, "test-feed")
+	bkt, err := s3.NewBucketWithConfig(log.NewNopLogger(),
+		e2ethanos.NewS3Config(bucket, m.Endpoint("https"), m.Dir()), "test-feed")
 	testutil.Ok(b, err)
 
 	buf := bytes.Buffer{}

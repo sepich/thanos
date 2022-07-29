@@ -8,28 +8,30 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"io"
 	stdlog "log"
 	"net"
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	statusapi "github.com/thanos-io/thanos/pkg/api/status"
+	"github.com/thanos-io/thanos/pkg/logging"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/gogo/protobuf/proto"
-	"github.com/golang/snappy"
 	"github.com/jpillora/backoff"
+	"github.com/klauspost/compress/s2"
 	"github.com/mwitkow/go-conntrack"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/route"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"google.golang.org/grpc"
@@ -40,6 +42,7 @@ import (
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/server/http/middleware"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 	"github.com/thanos-io/thanos/pkg/tracing"
@@ -59,11 +62,18 @@ const (
 	labelError   = "error"
 )
 
+// Allowed fields in client certificates.
+const (
+	CertificateFieldOrganization       = "organization"
+	CertificateFieldOrganizationalUnit = "organizationalUnit"
+	CertificateFieldCommonName         = "commonName"
+)
+
 var (
 	// errConflict is returned whenever an operation fails due to any conflict-type error.
 	errConflict = errors.New("conflict")
 
-	errBadReplica  = errors.New("replica count exceeds replication factor")
+	errBadReplica  = errors.New("request replica exceeds receiver replication factor")
 	errNotReady    = errors.New("target not ready")
 	errUnavailable = errors.New("target not available")
 )
@@ -72,16 +82,20 @@ var (
 type Options struct {
 	Writer            *Writer
 	ListenAddress     string
-	Registry          prometheus.Registerer
+	Registry          *prometheus.Registry
 	TenantHeader      string
+	TenantField       string
 	DefaultTenantID   string
 	ReplicaHeader     string
 	Endpoint          string
 	ReplicationFactor uint64
+	ReceiverMode      ReceiverMode
 	Tracer            opentracing.Tracer
 	TLSConfig         *tls.Config
 	DialOpts          []grpc.DialOption
 	ForwardTimeout    time.Duration
+	RelabelConfigs    []*relabel.Config
+	GetTSDBStats      GetStatsFunc
 }
 
 // Handler serves a Prometheus remote write receiving HTTP endpoint.
@@ -92,11 +106,12 @@ type Handler struct {
 	options  *Options
 	listener net.Listener
 
-	mtx        sync.RWMutex
-	hashring   Hashring
-	peers      *peerGroup
-	expBackoff backoff.Backoff
-	peerStates map[string]*retryState
+	mtx          sync.RWMutex
+	hashring     Hashring
+	peers        *peerGroup
+	expBackoff   backoff.Backoff
+	peerStates   map[string]*retryState
+	receiverMode ReceiverMode
 
 	forwardRequests   *prometheus.CounterVec
 	replications      *prometheus.CounterVec
@@ -108,31 +123,37 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 		logger = log.NewNopLogger()
 	}
 
+	var registerer prometheus.Registerer = nil
+	if o.Registry != nil {
+		registerer = o.Registry
+	}
+
 	h := &Handler{
-		logger:  logger,
-		writer:  o.Writer,
-		router:  route.New(),
-		options: o,
-		peers:   newPeerGroup(o.DialOpts...),
+		logger:       logger,
+		writer:       o.Writer,
+		router:       route.New(),
+		options:      o,
+		peers:        newPeerGroup(o.DialOpts...),
+		receiverMode: o.ReceiverMode,
 		expBackoff: backoff.Backoff{
 			Factor: 2,
 			Min:    100 * time.Millisecond,
 			Max:    30 * time.Second,
 			Jitter: true,
 		},
-		forwardRequests: promauto.With(o.Registry).NewCounterVec(
+		forwardRequests: promauto.With(registerer).NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "thanos_receive_forward_requests_total",
 				Help: "The number of forward requests.",
 			}, []string{"result"},
 		),
-		replications: promauto.With(o.Registry).NewCounterVec(
+		replications: promauto.With(registerer).NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "thanos_receive_replications_total",
 				Help: "The number of replication operations done by the receiver. The success of replication is fulfilled when a quorum is met.",
 			}, []string{"result"},
 		),
-		replicationFactor: promauto.With(o.Registry).NewGauge(
+		replicationFactor: promauto.With(registerer).NewGauge(
 			prometheus.GaugeOpts{
 				Name: "thanos_receive_replication_factor",
 				Help: "The number of times to replicate incoming write requests.",
@@ -168,6 +189,12 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 	}
 
 	h.router.Post("/api/v1/receive", instrf("receive", readyf(middleware.RequestID(http.HandlerFunc(h.receiveHTTP)))))
+
+	statusAPI := statusapi.New(statusapi.Options{
+		GetStats: h.getStats,
+		Registry: o.Registry,
+	})
+	statusAPI.Register(h.router, o.Tracer, logger, ins, logging.NewHTTPServerMiddleware(logger))
 
 	return h
 }
@@ -208,6 +235,19 @@ func (h *Handler) testReady(f http.HandlerFunc) http.HandlerFunc {
 			h.logger.Log("msg", "failed to write to response body", "err", err)
 		}
 	}
+}
+
+func (h *Handler) getStats(r *http.Request, statsByLabelName string) (*tsdb.Stats, error) {
+	if !h.isReady() {
+		return nil, fmt.Errorf("service unavailable")
+	}
+
+	tenantID := r.Header.Get(h.options.TenantHeader)
+	if tenantID == "" {
+		tenantID = h.options.DefaultTenantID
+	}
+
+	return h.options.GetTSDBStats(tenantID, statsByLabelName), nil
 }
 
 // Close stops the Handler.
@@ -258,17 +298,27 @@ type replica struct {
 }
 
 func (h *Handler) handleRequest(ctx context.Context, rep uint64, tenant string, wreq *prompb.WriteRequest) error {
+	tLogger := log.With(h.logger, "tenant", tenant)
+
+	// This replica value is used to detect cycles in cyclic topologies.
+	// A non-zero value indicates that the request has already been replicated by a previous receive instance.
+	// For almost all users, this is only used in fully connected topologies of IngestorRouter instances.
+	// For acyclic topologies that use RouterOnly and IngestorOnly instances, this causes issues when replicating data.
+	// See discussion in: https://github.com/thanos-io/thanos/issues/4359.
+	if h.receiverMode == RouterOnly || h.receiverMode == IngestorOnly {
+		rep = 0
+	}
+
 	// The replica value in the header is one-indexed, thus we need >.
 	if rep > h.options.ReplicationFactor {
+		level.Error(tLogger).Log("err", errBadReplica, "msg", "write request rejected",
+			"request_replica", rep, "replication_factor", h.options.ReplicationFactor)
 		return errBadReplica
 	}
 
-	r := replica{
-		n:          rep,
-		replicated: rep != 0,
-	}
+	r := replica{n: rep, replicated: rep != 0}
 
-	// On the wire, format is 1-indexed and in-code is 0-indexed so we decrement the value if it was already replicated.
+	// On the wire, format is 1-indexed and in-code is 0-indexed, so we decrement the value if it was already replicated.
 	if r.replicated {
 		r.n--
 	}
@@ -280,8 +330,25 @@ func (h *Handler) handleRequest(ctx context.Context, rep uint64, tenant string, 
 }
 
 func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
+	var err error
 	span, ctx := tracing.StartSpan(r.Context(), "receive_http")
 	defer span.Finish()
+
+	tenant := r.Header.Get(h.options.TenantHeader)
+	if tenant == "" {
+		tenant = h.options.DefaultTenantID
+	}
+
+	if h.options.TenantField != "" {
+		tenant, err = h.getTenantFromCertificate(r)
+		if err != nil {
+			// This must hard fail to ensure hard tenancy when feature is enabled.
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	tLogger := log.With(h.logger, "tenant", tenant)
 
 	// ioutil.ReadAll dynamically adjust the byte slice for read data, starting from 512B.
 	// Since this is receive hot path, grow upfront saving allocations and CPU time.
@@ -291,15 +358,15 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		compressed.Grow(512)
 	}
-	_, err := io.Copy(&compressed, r.Body)
+	_, err = io.Copy(&compressed, r.Body)
 	if err != nil {
 		http.Error(w, errors.Wrap(err, "read compressed request body").Error(), http.StatusInternalServerError)
 		return
 	}
 
-	reqBuf, err := snappy.Decode(nil, compressed.Bytes())
+	reqBuf, err := s2.Decode(nil, compressed.Bytes())
 	if err != nil {
-		level.Error(h.logger).Log("msg", "snappy decode error", "err", err)
+		level.Error(tLogger).Log("msg", "snappy decode error", "err", err)
 		http.Error(w, errors.Wrap(err, "snappy decode error").Error(), http.StatusBadRequest)
 		return
 	}
@@ -322,40 +389,29 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Exit early if the request contained no data.
+	// Exit early if the request contained no data. We don't support metadata yet. We also cannot fail here, because
+	// this would mean lack of forward compatibility for remote write proto.
 	if len(wreq.Timeseries) == 0 {
-		level.Info(h.logger).Log("msg", "empty timeseries from client")
+		// TODO(yeya24): Handle remote write metadata.
+		if len(wreq.Metadata) > 0 {
+			// TODO(bwplotka): Do we need this error message?
+			level.Debug(tLogger).Log("msg", "only metadata from client; metadata ingestion not supported; skipping")
+			return
+		}
+		level.Debug(tLogger).Log("msg", "empty remote write request; client bug or newer remote write protocol used?; skipping")
 		return
 	}
 
-	var tenant string
-	if h.options.Writer.tenantExtract {
-		labelpb.ReAllocZLabelsStrings(&wreq.Timeseries[0].Labels)
-		// All metrics from same src should have same external_labels
-		for _, l := range wreq.Timeseries[0].Labels {
-			if l.Name == h.options.Writer.tenantLabelName {
-				tenant = l.Value
-				break
-			}
-		}
-		u := r.Header.Get("X-Forwarded-User")
-		if prefix, ok := h.options.Writer.extractorConfig.TenantLabelPrefixes[u]; ok {
-			if !strings.HasPrefix(tenant, prefix) {
-				level.Debug(h.logger).Log("msg", "tenant label value has wrong prefix", "tenant", tenant, "prefix", prefix)
-				http.Error(w, "Wrong tenant label value", http.StatusForbidden)
-				return
-			}
-		}
-	} else {
-		tenant = r.Header.Get(h.options.TenantHeader)
-	}
-	if len(tenant) == 0 {
-		tenant = h.options.DefaultTenantID
+	// Apply relabeling configs.
+	h.relabel(&wreq)
+	if len(wreq.Timeseries) == 0 {
+		level.Debug(tLogger).Log("msg", "remote write request dropped due to relabeling.")
+		return
 	}
 
 	err = h.handleRequest(ctx, rep, tenant, &wreq)
 	if err != nil {
-		level.Debug(h.logger).Log("msg", "failed to handle request", "err", err)
+		level.Debug(tLogger).Log("msg", "failed to handle request", "err", err)
 	}
 
 	switch determineWriteErrorCause(err, 1) {
@@ -370,7 +426,7 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	case errBadReplica:
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	default:
-		level.Error(h.logger).Log("err", err, "msg", "internal server error")
+		level.Error(tLogger).Log("err", err, "msg", "internal server error")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -425,10 +481,6 @@ func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *p
 
 // writeQuorum returns minimum number of replicas that has to confirm write success before claiming replication success.
 func (h *Handler) writeQuorum() int {
-	// special case for 2 replicas: to be available when one replica down (#3194)
-	if h.options.ReplicationFactor == 2 {
-		return 1
-	}
 	return int((h.options.ReplicationFactor / 2) + 1)
 }
 
@@ -447,9 +499,13 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 		}
 	}()
 
-	logTags := []interface{}{"tenant", tenant}
-	if id, ok := middleware.RequestIDFromContext(pctx); ok {
-		logTags = append(logTags, "request-id", id)
+	var tLogger log.Logger
+	{
+		logTags := []interface{}{"tenant", tenant}
+		if id, ok := middleware.RequestIDFromContext(pctx); ok {
+			logTags = append(logTags, "request-id", id)
+		}
+		tLogger = log.With(h.logger, logTags)
 	}
 
 	ec := make(chan error)
@@ -499,7 +555,7 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 				if err != nil {
 					// When a MultiError is added to another MultiError, the error slices are concatenated, not nested.
 					// To avoid breaking the counting logic, we need to flatten the error.
-					level.Debug(h.logger).Log(append(logTags, "msg", "local tsdb write failed", "err", err.Error()))
+					level.Debug(tLogger).Log("msg", "local tsdb write failed", "err", err.Error())
 					ec <- errors.Wrapf(determineWriteErrorCause(err, 1), "store locally for endpoint %v", endpoint)
 					return
 				}
@@ -562,7 +618,7 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 							b.attempt++
 							dur := h.expBackoff.ForAttempt(b.attempt)
 							b.nextAllowed = time.Now().Add(dur)
-							level.Debug(h.logger).Log(append(logTags, "msg", "target unavailable backing off", "for", dur))
+							level.Debug(tLogger).Log("msg", "target unavailable backing off", "for", dur)
 						} else {
 							h.peerStates[endpoint] = &retryState{nextAllowed: time.Now().Add(h.expBackoff.ForAttempt(0))}
 						}
@@ -591,7 +647,7 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 		go func() {
 			for err := range ec {
 				if err != nil {
-					level.Debug(h.logger).Log(append(logTags, "msg", "request failed, but not needed to achieve quorum", "err", err))
+					level.Debug(tLogger).Log("msg", "request failed, but not needed to achieve quorum", "err", err)
 				}
 			}
 		}()
@@ -680,6 +736,23 @@ func (h *Handler) RemoteWrite(ctx context.Context, r *storepb.WriteRequest) (*st
 	default:
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+}
+
+// relabel relabels the time series labels in the remote write request.
+func (h *Handler) relabel(wreq *prompb.WriteRequest) {
+	if len(h.options.RelabelConfigs) == 0 {
+		return
+	}
+	timeSeries := make([]prompb.TimeSeries, 0, len(wreq.Timeseries))
+	for _, ts := range wreq.Timeseries {
+		lbls := relabel.Process(labelpb.ZLabelsToPromLabels(ts.Labels), h.options.RelabelConfigs...)
+		if lbls == nil {
+			continue
+		}
+		ts.Labels = labelpb.ZLabelsFromPromLabels(lbls)
+		timeSeries = append(timeSeries, ts)
+	}
+	wreq.Timeseries = timeSeries
 }
 
 // isConflict returns whether or not the given error represents a conflict.
@@ -809,4 +882,43 @@ func (p *peerGroup) get(ctx context.Context, addr string) (storepb.WriteableStor
 	client := storepb.NewWriteableStoreClient(conn)
 	p.cache[addr] = client
 	return client, nil
+}
+
+// getTenantFromCertificate extracts the tenant value from a client's presented certificate. The x509 field to use as
+// value can be configured with Options.TenantField. An error is returned when the extraction has not succeeded.
+func (h *Handler) getTenantFromCertificate(r *http.Request) (string, error) {
+	var tenant string
+
+	if len(r.TLS.PeerCertificates) == 0 {
+		return "", errors.New("could not get required certificate field from client cert")
+	}
+
+	// First cert is the leaf authenticated against.
+	cert := r.TLS.PeerCertificates[0]
+
+	switch h.options.TenantField {
+
+	case CertificateFieldOrganization:
+		if len(cert.Subject.Organization) == 0 {
+			return "", errors.New("could not get organization field from client cert")
+		}
+		tenant = cert.Subject.Organization[0]
+
+	case CertificateFieldOrganizationalUnit:
+		if len(cert.Subject.OrganizationalUnit) == 0 {
+			return "", errors.New("could not get organizationalUnit field from client cert")
+		}
+		tenant = cert.Subject.OrganizationalUnit[0]
+
+	case CertificateFieldCommonName:
+		if cert.Subject.CommonName == "" {
+			return "", errors.New("could not get commonName field from client cert")
+		}
+		tenant = cert.Subject.CommonName
+
+	default:
+		return "", errors.New("tls client cert field requested is not supported")
+	}
+
+	return tenant, nil
 }

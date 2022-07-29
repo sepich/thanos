@@ -11,12 +11,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 
+	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
-
-	"github.com/pkg/errors"
 )
 
 // Config stores the configuration for storing and accessing blobs in filesystem.
@@ -145,7 +144,7 @@ func (b *Bucket) GetRange(_ context.Context, name string, off, length int64) (io
 		return nil, errors.Wrapf(err, "stat %s", file)
 	}
 
-	f, err := os.OpenFile(file, os.O_RDONLY, 0666)
+	f, err := os.OpenFile(filepath.Clean(file), os.O_RDONLY, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -196,13 +195,17 @@ func (b *Bucket) Upload(_ context.Context, name string, r io.Reader) (err error)
 }
 
 func isDirEmpty(name string) (ok bool, err error) {
-	f, err := os.Open(name)
+	f, err := os.Open(filepath.Clean(name))
+	if os.IsNotExist(err) {
+		// The directory doesn't exist. We don't consider it an error and we treat it like empty.
+		return true, nil
+	}
 	if err != nil {
 		return false, err
 	}
 	defer runutil.CloseWithErrCapture(&err, f, "dir open")
 
-	if _, err = f.Readdir(1); err == io.EOF {
+	if _, err = f.Readdir(1); err == io.EOF || os.IsNotExist(err) {
 		return true, nil
 	}
 	return false, err

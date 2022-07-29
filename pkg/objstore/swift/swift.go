@@ -14,14 +14,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/ncw/swift"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"gopkg.in/yaml.v2"
+
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
-	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -282,7 +283,7 @@ func (c *Container) IsObjNotFoundErr(err error) bool {
 }
 
 // Upload writes the contents of the reader as an object into the container.
-func (c *Container) Upload(_ context.Context, name string, r io.Reader) error {
+func (c *Container) Upload(_ context.Context, name string, r io.Reader) (err error) {
 	size, err := objstore.TryToGetSize(r)
 	if err != nil {
 		level.Warn(c.logger).Log("msg", "could not guess file size, using large object to avoid issues if the file is larger than limit", "name", name, "err", err)
@@ -312,7 +313,7 @@ func (c *Container) Upload(_ context.Context, name string, r io.Reader) error {
 			return errors.Wrap(err, "create file")
 		}
 	}
-	defer runutil.CloseWithLogOnErr(c.logger, file, "upload object close")
+	defer runutil.CloseWithErrCapture(&err, file, "upload object close")
 	if _, err := io.Copy(file, r); err != nil {
 		return errors.Wrap(err, "uploading object")
 	}

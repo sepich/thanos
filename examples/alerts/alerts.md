@@ -4,8 +4,7 @@ Here are some example alerts configured for Kubernetes environment.
 
 ## Compaction
 
-[embedmd]:# (../tmp/thanos-compact.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-compact.yaml"
 name: thanos-compact
 rules:
 - alert: ThanosCompactMultipleRunning
@@ -22,7 +21,7 @@ rules:
   annotations:
     description: Thanos Compact {{$labels.job}} has failed to run and now is halted.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanoscompacthalted
-    summary: Thanos Compact has failed to run ans is now halted.
+    summary: Thanos Compact has failed to run and is now halted.
   expr: thanos_compact_halted{job=~".*thanos-compact.*"} == 1
   for: 5m
   labels:
@@ -74,8 +73,7 @@ rules:
 
 For Thanos Ruler we run some alerts in local Prometheus, to make sure that Thanos Ruler is working:
 
-[embedmd]:# (../tmp/thanos-rule.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-rule.yaml"
 name: thanos-rule
 rules:
 - alert: ThanosRuleQueueIsDroppingAlerts
@@ -198,8 +196,8 @@ rules:
     severity: warning
 - alert: ThanosRuleNoEvaluationFor10Intervals
   annotations:
-    description: Thanos Rule {{$labels.job}} has {{$value | humanize}}% rule groups
-      that did not evaluate for at least 10x of their expected interval.
+    description: Thanos Rule {{$labels.job}} has rule groups that did not evaluate
+      for at least 10x of their expected interval.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosrulenoevaluationfor10intervals
     summary: Thanos Rule has rule groups that did not evaluate for 10 intervals.
   expr: |
@@ -226,8 +224,7 @@ rules:
 
 ## Store Gateway
 
-[embedmd]:# (../tmp/thanos-store.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-store.yaml"
 name: thanos-store
 rules:
 - alert: ThanosStoreGrpcErrorRate
@@ -296,20 +293,9 @@ rules:
 
 ## Sidecar
 
-[embedmd]:# (../tmp/thanos-sidecar.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-sidecar.yaml"
 name: thanos-sidecar
 rules:
-- alert: ThanosSidecarPrometheusDown
-  annotations:
-    description: Thanos Sidecar {{$labels.instance}} cannot connect to Prometheus.
-    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanossidecarprometheusdown
-    summary: Thanos Sidecar cannot connect to Prometheus
-  expr: |
-    thanos_sidecar_prometheus_up{job=~".*thanos-sidecar.*"} == 0
-  for: 5m
-  labels:
-    severity: critical
 - alert: ThanosSidecarBucketOperationsFailed
   annotations:
     description: Thanos Sidecar {{$labels.instance}} bucket operations are failing
@@ -320,22 +306,24 @@ rules:
   for: 5m
   labels:
     severity: critical
-- alert: ThanosSidecarUnhealthy
+- alert: ThanosSidecarNoConnectionToStartedPrometheus
   annotations:
-    description: Thanos Sidecar {{$labels.instance}} is unhealthy for more than {{$value}}
-      seconds.
-    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanossidecarunhealthy
-    summary: Thanos Sidecar is unhealthy.
+    description: Thanos Sidecar {{$labels.instance}} is unhealthy.
+    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanossidecarnoconnectiontostartedprometheus
+    summary: Thanos Sidecar cannot access Prometheus, even though Prometheus seems
+      healthy and has reloaded WAL.
   expr: |
-    time() - max by (job, instance) (timestamp(thanos_sidecar_last_heartbeat_success_time_seconds{job=~".*thanos-sidecar.*"})) >= 240
+    thanos_sidecar_prometheus_up{job=~".*thanos-sidecar.*"} == 0
+    AND on (namespace, pod)
+    prometheus_tsdb_data_replay_duration_seconds != 0
+  for: 5m
   labels:
     severity: critical
 ```
 
 ## Query
 
-[embedmd]:# (../tmp/thanos-query.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-query.yaml"
 name: thanos-query
 rules:
 - alert: ThanosQueryHttpRequestQueryErrorRateHigh
@@ -448,8 +436,7 @@ rules:
 
 ## Receive
 
-[embedmd]:# (../tmp/thanos-receive.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-receive.yaml"
 name: thanos-receive
 rules:
 - alert: ThanosReceiveHttpRequestErrorRateHigh
@@ -562,12 +549,28 @@ rules:
   for: 3h
   labels:
     severity: critical
+- alert: ThanosReceiveTrafficBelowThreshold
+  annotations:
+    description: At Thanos Receive {{$labels.job}} in {{$labels.namespace}} , the
+      average 1-hr avg. metrics ingestion rate  is {{$value | humanize}}% of 12-hr
+      avg. ingestion rate.
+    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceivetrafficbelowthreshold
+    summary: Thanos Receive is experiencing low avg. 1-hr ingestion rate relative
+      to avg. 12-hr ingestion rate.
+  expr: |
+    (
+      avg_over_time(rate(http_requests_total{job=~".*thanos-receive.*", code=~"2..", handler="receive"}[5m])[1h:5m])
+    /
+      avg_over_time(rate(http_requests_total{job=~".*thanos-receive.*", code=~"2..", handler="receive"}[5m])[12h:5m])
+    ) * 100 < 50
+  for: 1h
+  labels:
+    severity: warning
 ```
 
 ## Replicate
 
-[embedmd]:# (../tmp/thanos-bucket-replicate.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-bucket-replicate.yaml"
 name: thanos-bucket-replicate
 rules:
 - alert: ThanosBucketReplicateErrorRate
@@ -575,7 +578,7 @@ rules:
     description: Thanos Replicate is failing to run, {{$value | humanize}}% of attempts
       failed.
     runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosbucketreplicateerrorrate
-    summary: Thanose Replicate is failing to run.
+    summary: Thanos Replicate is failing to run.
   expr: |
     (
       sum by (job) (rate(thanos_replicate_replication_runs_total{result="error", job=~".*thanos-bucket-replicate.*"}[5m]))
@@ -606,21 +609,9 @@ rules:
 
 ### Absent Rules
 
-[embedmd]:# (../tmp/thanos-component-absent.yaml yaml)
-```yaml
+```yaml mdox-exec="cat examples/tmp/thanos-component-absent.yaml"
 name: thanos-component-absent
 rules:
-- alert: ThanosBucketReplicateIsDown
-  annotations:
-    description: ThanosBucketReplicate has disappeared. Prometheus target for the
-      component cannot be discovered.
-    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosbucketreplicateisdown
-    summary: Thanos component has disappeared.
-  expr: |
-    absent(up{job=~".*thanos-bucket-replicate.*"} == 1)
-  for: 5m
-  labels:
-    severity: critical
 - alert: ThanosCompactIsDown
   annotations:
     description: ThanosCompact has disappeared. Prometheus target for the component

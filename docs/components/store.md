@@ -1,13 +1,6 @@
----
-title: Store
-type: docs
-menu: components
----
-
 # Store
 
-The `thanos store` command (also known as Store Gateway) implements the Store API on top of historical data in an object storage bucket. It acts primarily as an API gateway and therefore does not need significant amounts of local disk space. It joins a Thanos cluster on startup and advertises the data it can access.
-It keeps a small amount of information about all remote blocks on local disk and keeps it in sync with the bucket. This data is generally safe to delete across restarts at the cost of increased startup times.
+The `thanos store` command (also known as Store Gateway) implements the Store API on top of historical data in an object storage bucket. It acts primarily as an API gateway and therefore does not need significant amounts of local disk space. It joins a Thanos cluster on startup and advertises the data it can access. It keeps a small amount of information about all remote blocks on local disk and keeps it in sync with the bucket. This data is generally safe to delete across restarts at the cost of increased startup times.
 
 ```bash
 thanos store \
@@ -17,18 +10,19 @@ thanos store \
 
 The content of `bucket.yml`:
 
-```yaml
+```yaml mdox-exec="go run scripts/cfggen/main.go --name=gcs.Config"
 type: GCS
 config:
-  bucket: example-bucket
+  bucket: ""
+  service_account: ""
+prefix: ""
 ```
 
 In general, an average of 6 MB of local disk space is required per TSDB block stored in the object storage bucket, but for high cardinality blocks with large label set it can even go up to 30MB and more. It is for the pre-computed index, which includes symbols and postings offsets as well as metadata JSON.
 
 ## Flags
 
-[embedmd]:# (flags/store.txt $)
-```$
+```$ mdox-exec="thanos store --help"
 usage: thanos store [<flags>]
 
 Store node giving access to blocks in a bucket provider. Now supported GCS, S3,
@@ -41,6 +35,7 @@ Flags:
       --block-sync-concurrency=20
                                  Number of goroutines to use when constructing
                                  index-cache.json blocks from object storage.
+                                 Must be equal or greater than 1.
       --chunk-pool-size=2GB      Maximum size of concurrently allocatable bytes
                                  reserved strictly to reuse for chunks in
                                  memory.
@@ -75,6 +70,9 @@ Flags:
                                  Listen host:port for HTTP endpoints.
       --http-grace-period=2m     Time to wait after an interrupt received for
                                  HTTP Server.
+      --http.config=""           [EXPERIMENTAL] Path to the configuration file
+                                 that can enable TLS or authentication for all
+                                 HTTP endpoints.
       --ignore-deletion-marks-delay=24h
                                  Duration after which the blocks marked for
                                  deletion will be filtered out while fetching
@@ -141,11 +139,11 @@ Flags:
                                  flag (mutually exclusive). Content of YAML file
                                  with request logging configuration. See format
                                  details:
-                                 https://gist.github.com/yashrsharma44/02f5765c5710dd09ce5d14e854f22825
+                                 https://thanos.io/tip/thanos/logging.md/#configuration
       --request.logging-config-file=<file-path>
                                  Path to YAML file with request logging
                                  configuration. See format details:
-                                 https://gist.github.com/yashrsharma44/02f5765c5710dd09ce5d14e854f22825
+                                 https://thanos.io/tip/thanos/logging.md/#configuration
       --selector.relabel-config=<content>
                                  Alternative to 'selector.relabel-config-file'
                                  flag (mutually exclusive). Content of YAML file
@@ -223,7 +221,7 @@ By default Thanos Store Gateway looks at all the data in Object Store and return
 
 Thanos Store `--min-time`, `--max-time` flags allows you to shard Thanos Store based on constant time or time duration relative to current time.
 
-For example setting: `--min-time=-6w` & `--max-time==-2w` will make Thanos Store Gateway return metrics that fall within `now - 6 weeks` up to `now - 2 weeks` time range.
+For example setting: `--min-time=-6w` & `--max-time=-2w` will make Thanos Store Gateway return metrics that fall within `now - 6 weeks` up to `now - 2 weeks` time range.
 
 Constant time needs to be set in RFC3339 format. For example `--min-time=2018-01-01T00:00:00Z`, `--max-time=2019-01-01T23:59:59Z`.
 
@@ -233,35 +231,35 @@ We recommend having overlapping time ranges with Thanos Sidecar and other Thanos
 
 Thanos Querier deals with overlapping time series by merging them together.
 
-Filtering is done on a [Chunk](../design.md/#chunk) level, so Thanos Store might still return Samples which are outside of `--min-time` & `--max-time`.
+Filtering is done on a [Chunk](../design.md#chunk) level, so Thanos Store might still return Samples which are outside of `--min-time` & `--max-time`.
 
 ### External Label Partitioning (Sharding)
 
-Check more [here](https://thanos.io/tip/thanos/sharding.md/).
+Check more [here](../sharding.md).
 
 ## Probes
 
 - Thanos Store exposes two endpoints for probing.
-  - `/-/healthy` starts as soon as initial setup completed.
+  - `/-/healthy` starts as soon as initial setup is completed.
   - `/-/ready` starts after all the bootstrapping completed (e.g initial index building) and ready to serve traffic.
 
 > NOTE: Metric endpoint starts immediately so, make sure you set up readiness probe on designated HTTP `/-/ready` path.
 
 ## Index cache
 
-Thanos Store Gateway supports an index cache to speed up postings and series lookups from TSDB blocks indexes. Two types of caches are supported:
+Thanos Store Gateway supports an index cache to speed up postings and series lookups from TSDB blocks indexes. Three types of caches are supported:
 
-- `in-memory` (_default_)
+- `in-memory` (*default*)
 - `memcached`
+- `redis`
 
 ### In-memory index cache
 
 The `in-memory` index cache is enabled by default and its max size can be configured through the flag `--index-cache-size`.
 
-Alternatively, the `in-memory` index cache can also by configured using `--index-cache.config-file` to reference to the configuration file or `--index-cache.config` to put yaml config directly:
+Alternatively, the `in-memory` index cache can also be configured using `--index-cache.config-file` to reference the configuration file or `--index-cache.config` to put yaml config directly:
 
-[embedmd]:# (../flags/config_index_cache_in_memory.txt yaml)
-```yaml
+```yaml mdox-exec="go run scripts/cfggen/main.go --name=storecache.InMemoryIndexCacheConfig"
 type: IN-MEMORY
 config:
   max_size: 0
@@ -275,10 +273,9 @@ All the settings are **optional**:
 
 ### Memcached index cache
 
-The `memcached` index cache allows to use [Memcached](https://memcached.org) as cache backend. This cache type is configured using `--index-cache.config-file` to reference to the configuration file or `--index-cache.config` to put yaml config directly:
+The `memcached` index cache allows to use [Memcached](https://memcached.org) as cache backend. This cache type is configured using `--index-cache.config-file` to reference the configuration file or `--index-cache.config` to put yaml config directly:
 
-[embedmd]:# (../flags/config_index_cache_memcached.txt yaml)
-```yaml
+```yaml mdox-exec="go run scripts/cfggen/main.go --name=cacheutil.MemcachedClientConfig"
 type: MEMCACHED
 config:
   addresses: []
@@ -290,11 +287,12 @@ config:
   max_item_size: 0
   max_get_multi_batch_size: 0
   dns_provider_update_interval: 0s
+  auto_discovery: false
 ```
 
 The **required** settings are:
 
-- `addresses`: list of memcached addresses, that will get resolved with the [DNS service discovery](../service-discovery.md/#dns-service-discovery) provider.
+- `addresses`: list of memcached addresses, that will get resolved with the [DNS service discovery](../service-discovery.md#dns-service-discovery) provider. If your cluster supports auto-discovery, you should use the flag `auto_discovery` instead and only point to *one of* the memcached servers. This typically means that there should be only one address specified that resolves to any of the alive memcached servers. Use this for Amazon ElastiCache and other similar services.
 
 While the remaining settings are **optional**:
 
@@ -306,12 +304,58 @@ While the remaining settings are **optional**:
 - `max_get_multi_batch_size`: maximum number of keys a single underlying operation should fetch. If more keys are specified, internally keys are splitted into multiple batches and fetched concurrently, honoring `max_get_multi_concurrency`. If set to `0`, the batch size is unlimited.
 - `max_item_size`: maximum size of an item to be stored in memcached. This option should be set to the same value of memcached `-I` flag (defaults to 1MB) in order to avoid wasting network round trips to store items larger than the max item size allowed in memcached. If set to `0`, the item size is unlimited.
 - `dns_provider_update_interval`: the DNS discovery update interval.
+- `auto_discovery`: whether to use the auto-discovery mechanism for memcached.
+
+### Redis index cache
+
+The `redis` index cache allows to use [Redis](https://redis.io) as cache backend. This cache type is configured using `--index-cache.config-file` to reference the configuration file or `--index-cache.config` to put yaml config directly:
+
+```yaml mdox-exec="go run scripts/cfggen/main.go --name=cacheutil.RedisClientConfig"
+type: REDIS
+config:
+  addr: ""
+  username: ""
+  password: ""
+  db: 0
+  dial_timeout: 5s
+  read_timeout: 3s
+  write_timeout: 3s
+  pool_size: 100
+  min_idle_conns: 10
+  idle_timeout: 5m0s
+  max_conn_age: 0s
+  max_get_multi_concurrency: 100
+  get_multi_batch_size: 100
+  max_set_multi_concurrency: 100
+  set_multi_batch_size: 100
+```
+
+The **required** settings are:
+
+- `addr`: redis server address.
+
+While the remaining settings are **optional**:
+
+- `username`: the username to connect redis, only redis 6.0 and grater need this field.
+- `password`: the password to connect redis.
+- `db`: the database to be selected after connecting to the server.
+- `dial_timeout`: the redis dial timeout.
+- `read_timeout`: the redis read timeout.
+- `write_timeout`: the redis write timeout.
+- `pool_size`: maximum number of socket connections.
+- `min_idle_conns`: specifies the minimum number of idle connections which is useful when establishing new connection is slow.
+- `idle_timeout`: amount of time after which client closes idle connections. Should be less than server's timeout.
+- `max_conn_age`: connection age at which client retires (closes) the connection.
+- `max_get_multi_concurrency`: specifies the maximum number of concurrent GetMulti() operations.
+- `get_multi_batch_size`: specifies the maximum size per batch for mget.
+- `max_set_multi_concurrency`: specifies the maximum number of concurrent SetMulti() operations.
+- `set_multi_batch_size`: specifies the maximum size per batch for pipeline set.
 
 ## Caching Bucket
 
-Thanos Store Gateway supports a "caching bucket" with [chunks](../design.md/#chunk) and metadata caching to speed up loading of [chunks](../design.md/#chunk) from TSDB blocks. To configure caching, one needs to use `--store.caching-bucket.config=<yaml content>` or `--store.caching-bucket.config-file=<file.yaml>`.
+Thanos Store Gateway supports a "caching bucket" with [chunks](../design.md#chunk) and metadata caching to speed up loading of [chunks](../design.md#chunk) from TSDB blocks. To configure caching, one needs to use `--store.caching-bucket.config=<yaml content>` or `--store.caching-bucket.config-file=<file.yaml>`.
 
-Both memcached and in-memory cache "backend"s are supported:
+memcached/in-memory/redis cache "backend"s are supported:
 
 ```yaml
 type: MEMCACHED # Case-insensitive
@@ -336,13 +380,14 @@ metafile_content_ttl: 24h
 metafile_max_size: 1MiB
 ```
 
-`config` field for memcached supports all the same configuration as memcached for [index cache](#memcached-index-cache). `addresses` in the config field is a **required** setting
+- `config` field for memcached supports all the same configuration as memcached for [index cache](#memcached-index-cache). `addresses` in the config field is a **required** setting
+- `config` field for redis supports all the same configuration as redis for [index cache](#redis-index-cache).
 
-Additional options to configure various aspects of [chunks](../design.md/#chunk) cache are available:
+Additional options to configure various aspects of [chunks](../design.md#chunk) cache are available:
 
-- `chunk_subrange_size`: size of segment of [chunks](../design.md/#chunk) object that is stored to the cache. This is the smallest unit that chunks cache is working with.
+- `chunk_subrange_size`: size of segment of [chunks](../design.md#chunk) object that is stored to the cache. This is the smallest unit that chunks cache is working with.
 - `max_chunks_get_range_requests`: how many "get range" sub-requests may cache perform to fetch missing subranges.
-- `chunk_object_attrs_ttl`: how long to keep information about [chunk file](../design.md/#chunk-file) attributes (e.g. size) in the cache.
+- `chunk_object_attrs_ttl`: how long to keep information about [chunk file](../design.md#chunk-file) attributes (e.g. size) in the cache.
 - `chunk_subrange_ttl`: how long to keep individual subranges in the cache.
 
 Following options are used for metadata caching (meta.json files, deletion mark files, iteration result):
@@ -353,12 +398,55 @@ Following options are used for metadata caching (meta.json files, deletion mark 
 - `metafile_content_ttl`: how long to cache content of meta.json and deletion mark files.
 - `metafile_max_size`: maximum size of cached meta.json and deletion mark file. Larger files are not cached.
 
-The yml structure for setting the in memory cache configs for caching bucket are the same as the [in-memory index cache](https://thanos.io/tip/components/store.md/#in-memory-index-cache) and all the options to configure Caching Buket mentioned above can be used.
+The yml structure for setting the in memory cache configs for caching bucket is the same as the [in-memory index cache](#in-memory-index-cache) and all the options to configure Caching Buket mentioned above can be used.
 
-Note that chunks and metadata cache is an experimental feature, and these fields may be renamed or removed completely in the future.
+In addition to the same cache backends memcached/in-memory/redis, caching bucket supports another type of backend.
+
+### *EXPERIMENTAL* Groupcache Caching Bucket Provider
+
+Groupcache is an experimental cache backend for the caching bucket introduced from version `v0.25` of Thanos.
+
+With groupcache, you do not need any external components for the caching layer because the caching layer becomes shared between all of the processes of Thanos Store. Another benefit that it provides is that it is a cache filling library meaning that given enough space in memory, the values will only be loaded once. For example, if the same metric is used in multiple concurrent queries then with groupcache Thanos Store would only load the metric's data from remote object storage once.
+
+All in all, it should be a superior caching solution to all other currently supported solutions. It just needs some battle-testing. So, help is needed with testing in real life scenarios! Please create an issue if you've found any problem. 🤗
+
+Here is how it looks like:
+
+<img src="../img/groupcache.png" class="img-fluid" alt="Example of a groupcache group showing that each Thanos Store instance communicates with all others in the group"/>
+
+Note that with groupcache enabled, new routes are registed on the HTTP server with the prefix `/_groupcache`. Using those routes, anyone can access any kind of data in the configured remote object storage. So, if you are exposing your Thanos Store to the Internet then it is highly recommended to use a reverse proxy in front and disable access to `/_groupcache/...`.
+
+Currently TLS *is* supported but on the client's side no verification is done of the received certificate. This will be added in the future. HTTP2 over cleartext is also enabled to improve the performance for users that don't use TLS.
+
+Example configuration that you could provide to the caching bucket configuration flags with the explanation of each configuration key:
+
+```yaml
+type: GROUPCACHE
+config:
+  self_url: http://10.123.22.3:8080
+  peers:
+    - http://10.123.22.3:8080
+    - http://10.123.22.10:8080
+    - http://10.123.22.100:8080
+  groupcache_group: test_group
+  dns_interval: 1s
+  timeout: 2s
+```
+
+In this case, three Thanos Store nodes are running in the same group meaning that they all point to the same remote object storage.
+
+- `self_url` - our own URL. On each node this will be different. This should be the external IP through which other nodes could access us;
+- `groupcache_group` - the groupcache group's name. All nodes using the same remote object storage configuration should use the same name. It is used in the HTTP requests. If it is different then nodes will not be able to load data from each other.
+- `dns_internal` - how often DNS lookups should be made.
+
+In the `peers` section it is possible to use the prefix form to automatically look up the peers using DNS. For example, you could use `dns+http://store.thanos.consul.svc:8080` to automatically look up healthy nodes from Consul using its DNS interface.
+
+Note that there must be no trailing slash in the `peers` configuration i.e. one of the strings must be identical to `self_url` and others should have the same form. Without this, loading data from peers may fail.
+
+If timeout is set to zero then there is no timeout for fetching and fetching's lifetime is equal to the lifetime to the original request's lifetime. It is recommended to keep it higher than zero. It is generally preferred to keep this value higher because the fetching operation potentially includes loading of data from remote object storage.
 
 ## Index Header
 
-In order to query series inside blocks from object storage, Store Gateway has to know certain initial info from each block index. In order to achieve so, on startup the Gateway builds an `index-header` for each block and stores it on local disk; such `index-header` is build downloading specific pieces of original block's index, stored on local disk and then mmaped and used by Store Gateway.
+In order to query series inside blocks from object storage, Store Gateway has to know certain initial info from each block index. In order to achieve so, on startup the Gateway builds an `index-header` for each block and stores it on local disk; such `index-header` is build by downloading specific pieces of original block's index, stored on local disk and then mmaped and used by Store Gateway.
 
 For more information, please refer to the [Binary index-header](../operating/binary-index-header.md) operational guide.

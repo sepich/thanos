@@ -8,19 +8,21 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	yaml "gopkg.in/yaml.v2"
+
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/objstore/azure"
+	"github.com/thanos-io/thanos/pkg/objstore/bos"
 	"github.com/thanos-io/thanos/pkg/objstore/cos"
 	"github.com/thanos-io/thanos/pkg/objstore/filesystem"
 	"github.com/thanos-io/thanos/pkg/objstore/gcs"
 	"github.com/thanos-io/thanos/pkg/objstore/oss"
 	"github.com/thanos-io/thanos/pkg/objstore/s3"
 	"github.com/thanos-io/thanos/pkg/objstore/swift"
-	yaml "gopkg.in/yaml.v2"
 )
 
 type ObjProvider string
@@ -33,11 +35,13 @@ const (
 	SWIFT      ObjProvider = "SWIFT"
 	COS        ObjProvider = "COS"
 	ALIYUNOSS  ObjProvider = "ALIYUNOSS"
+	BOS        ObjProvider = "BOS"
 )
 
 type BucketConfig struct {
 	Type   ObjProvider `yaml:"type"`
 	Config interface{} `yaml:"config"`
+	Prefix string      `yaml:"prefix" default:""`
 }
 
 // NewBucket initializes and returns new object storage clients.
@@ -70,11 +74,14 @@ func NewBucket(logger log.Logger, confContentYaml []byte, reg prometheus.Registe
 		bucket, err = oss.NewBucket(logger, config, component)
 	case string(FILESYSTEM):
 		bucket, err = filesystem.NewBucketFromConfig(config)
+	case string(BOS):
+		bucket, err = bos.NewBucket(logger, config, component)
 	default:
 		return nil, errors.Errorf("bucket with type %s is not supported", bucketConf.Type)
 	}
 	if err != nil {
 		return nil, errors.Wrap(err, fmt.Sprintf("create %s client", bucketConf.Type))
 	}
-	return objstore.NewTracingBucket(objstore.BucketWithMetrics(bucket.Name(), bucket, reg)), nil
+
+	return objstore.NewTracingBucket(objstore.BucketWithMetrics(bucket.Name(), objstore.NewPrefixedBucket(bucket, bucketConf.Prefix), reg)), nil
 }

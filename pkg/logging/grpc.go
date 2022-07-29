@@ -31,11 +31,11 @@ func NewRequestConfig(configYAML []byte) (*RequestConfig, error) {
 // checkOptionsConfigEmpty checks if the OptionsConfig struct is empty and valid.
 // If invalid combination is present, return an error.
 func checkOptionsConfigEmpty(optcfg OptionsConfig) (bool, error) {
-	if len(optcfg.Level) == 0 && !optcfg.Decision.LogEnd && !optcfg.Decision.LogStart {
+	if optcfg.Level == "" && !optcfg.Decision.LogEnd && !optcfg.Decision.LogStart {
 		return true, nil
 	}
-	if len(optcfg.Level) == 0 && (optcfg.Decision.LogStart || optcfg.Decision.LogEnd) {
-		return false, fmt.Errorf("level field is empty.")
+	if optcfg.Level == "" && (optcfg.Decision.LogStart || optcfg.Decision.LogEnd) {
+		return false, fmt.Errorf("level field is empty")
 	}
 	return false, nil
 }
@@ -79,7 +79,7 @@ func fillGlobalOptionConfig(reqLogConfig *RequestConfig, isgRPC bool) (string, b
 }
 
 // getGRPCLoggingOption returns the logging ENUM based on logStart and logEnd values.
-func getGRPCLoggingOption(logStart bool, logEnd bool) (grpc_logging.Decision, error) {
+func getGRPCLoggingOption(logStart, logEnd bool) (grpc_logging.Decision, error) {
 	if !logStart && !logEnd {
 		return grpc_logging.NoLogCall, nil
 	}
@@ -89,19 +89,19 @@ func getGRPCLoggingOption(logStart bool, logEnd bool) (grpc_logging.Decision, er
 	if logStart && logEnd {
 		return grpc_logging.LogStartAndFinishCall, nil
 	}
-	return -1, fmt.Errorf("log start call is not supported.")
+	return -1, fmt.Errorf("log start call is not supported")
 }
 
 // validateLevel validates the list of level entries.
 // Raise an error if empty or log level not in uppercase.
 func validateLevel(level string) error {
-	if len(level) == 0 {
-		return fmt.Errorf("level field in YAML file is empty.")
+	if level == "" {
+		return fmt.Errorf("level field in YAML file is empty")
 	}
 	if level == "INFO" || level == "DEBUG" || level == "ERROR" || level == "WARNING" {
 		return nil
 	}
-	return fmt.Errorf("The format of level is invalid. Expected INFO/DEBUG/ERROR/WARNING, got this %v", level)
+	return fmt.Errorf("the format of level is invalid. Expected INFO/DEBUG/ERROR/WARNING, got this %v", level)
 }
 
 // NewGRPCOption adds in the config options and returns tags for logging middleware.

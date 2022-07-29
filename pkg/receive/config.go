@@ -10,10 +10,11 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -26,6 +27,14 @@ var (
 	errParseConfigurationFile = errors.New("configuration file is not parsable")
 	// An errEmptyConfigurationFile is returned by the ConfigWatcher when attempting to load an empty configuration file.
 	errEmptyConfigurationFile = errors.New("configuration file is empty")
+)
+
+type ReceiverMode string
+
+const (
+	RouterOnly     ReceiverMode = "RouterOnly"
+	IngestorOnly   ReceiverMode = "IngestorOnly"
+	RouterIngestor ReceiverMode = "RouterIngestor"
 )
 
 // HashringConfig represents the configuration for a hashring
@@ -141,7 +150,7 @@ func (cw *ConfigWatcher) Run(ctx context.Context) {
 		case event := <-cw.watcher.Events:
 			// fsnotify sometimes sends a bunch of events without name or operation.
 			// It's unclear what they are and why they are sent - filter them out.
-			if len(event.Name) == 0 {
+			if event.Name == "" {
 				break
 			}
 			// Everything but a CHMOD requires rereading.
@@ -267,7 +276,7 @@ func loadConfig(logger log.Logger, path string) ([]HashringConfig, float64, erro
 
 // readFile reads the configuration file and returns content of configuration file.
 func readFile(logger log.Logger, path string) ([]byte, error) {
-	fd, err := os.Open(path)
+	fd, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil, err
 	}

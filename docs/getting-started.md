@@ -1,16 +1,8 @@
----
-title: Getting Started
-type: docs
-menu: thanos
-weight: 1
----
-
 # Getting started
 
 Thanos provides a global query view, high availability, data backup with historical, cheap data access as its core features in a single binary.
 
-Those features can be deployed independently of each other. This allows you to have a subset of Thanos features ready
-for immediate benefit or testing, while also making it flexible for gradual roll outs in more complex environments.
+Those features can be deployed independently of each other. This allows you to have a subset of Thanos features ready for immediate benefit or testing, while also making it flexible for gradual roll outs in more complex environments.
 
 In this quick-start guide, we will explain:
 
@@ -32,8 +24,7 @@ Thanos aims for a simple deployment and maintenance model. The only dependencies
 
 You can find the latest Thanos release [here](https://github.com/thanos-io/thanos/releases).
 
-Main should be stable and usable. Every commit to main builds docker image named `main-<data>-<sha>` in
-[quay.io/thanos/thanos](https://quay.io/repository/thanos/thanos) and [thanosio/thanos dockerhub (mirror)](https://hub.docker.com/r/thanosio/thanos)
+Main should be stable and usable. Every commit to main builds docker image named `main-<data>-<sha>` in [quay.io/thanos/thanos](https://quay.io/repository/thanos/thanos) and [thanosio/thanos dockerhub (mirror)](https://hub.docker.com/r/thanosio/thanos)
 
 We also perform minor releases every 6 weeks.
 
@@ -43,33 +34,36 @@ See [release process docs](release-process.md) for details.
 
 ## Building from source:
 
-Thanos is built purely in [Golang](https://golang.org/), thus allowing to run Thanos on various x64 operating systems.
+Thanos is built purely in [Golang](https://go.dev/), thus allowing to run Thanos on various x64 operating systems.
 
-If you want to build Thanos from source you would need a working installation of the Go 1.16+ [toolchain](https://github.com/golang/tools) (`GOPATH`, `PATH=${GOPATH}/bin:${PATH}`).
+Thanos can **not** be downloaded nor installed via the `go get` or `go install` methods. Starting in Go 1.17, installing executables with `go get` is deprecated. `go install` may be used instead. However, in order to avoid ambiguity, when go install is used with a version suffix, all arguments must refer to main packages in the same module at the same version. If that module has a `go.mod` file, it must not contain directives like *replace* or *exclude* that would cause it to be interpreted differently if it were the main module.
 
-Thanos can be downloaded and built by running:
+Thanos uses the directive *replace*. The reason is to provide a way to unblock ourselves promptly while also being flexible in the packages that we (re)use. Support for `go install` is not likely at this point.
 
-```bash
-go get github.com/thanos-io/thanos/cmd/thanos
+If you want to build Thanos from source you would need a working installation of the Go 1.17+ [toolchain](https://github.com/golang/tools) (`GOPATH`, `PATH=${GOPATH}/bin:${PATH}`). Next one should make a clone of our repository:
+
+```
+git clone git@github.com:thanos-io/thanos.git
 ```
 
-The `thanos` binary should now be in your `$PATH` and is the only thing required to deploy any of its components.
+When you have access to the source code locally, we have prepared a `Makefile`. Invoke this by using `make` in your CLI. For example `make help` will list all options. For building Thanos one could use `make build`
+
+The `thanos` binary should now be in your project folder and is the only thing required to deploy any of its components.
 
 ## Contributing
 
-Contributions are very welcome! See our [CONTRIBUTING.md](/CONTRIBUTING.md) for more information.
+Contributions are very welcome! See our [CONTRIBUTING.md](../CONTRIBUTING.md) for more information.
 
 ## Community
 
-Thanos is an open source project and we value and welcome new contributors and members
-of the community. Here are ways to get in touch with the community:
+Thanos is an open source project and we value and welcome new contributors and members of the community. Here are ways to get in touch with the community:
 
 * Slack: [#thanos](https://slack.cncf.io/)
 * Issue Tracker: [GitHub Issues](https://github.com/thanos-io/thanos/issues)
 
 ## Maintainers
 
-See [MAINTAINERS.md](/MAINTAINERS.md).
+See [MAINTAINERS.md](../MAINTAINERS.md).
 
 ## Community Thanos Kubernetes Applications
 
@@ -85,16 +79,15 @@ If you want to add yourself to this list, let us know!
 
 ## Deploying Thanos
 
-* [WIP] Detailed, free, in-browser interactive tutorial [as Katacoda Thanos Course](https://katacoda.com/thanos/courses/thanos/1-globalview)
-* [Quick Tutorial](./quick-tutorial.md) on Thanos website.
+* [Quick Tutorial](quick-tutorial.md) on Thanos website.
 
 ## Operating
 
-See up to date [jsonnet mixins](https://github.com/thanos-io/thanos/tree/main/mixin/README.md)
-We also have example Grafana dashboards [here](/examples/dashboards/dashboards.md) and some [alerts](/examples/alerts/alerts.md) to get you started.
+See up to date [jsonnet mixins](https://github.com/thanos-io/thanos/tree/main/mixin/README.md) We also have example Grafana dashboards [here](https://github.com/thanos-io/thanos/blob/main/examples/dashboards/dashboards.md) and some [alerts](https://github.com/thanos-io/thanos/blob/main/examples/alerts/alerts.md) to get you started.
 
 ## Talks
 
+* 10.2021: [Adopting Thanos gradually across all of LastPass infrastructures](https://www.youtube.com/watch?v=Ddq8m04594A)
 * 12.2020: [Absorbing Thanos Infinite Powers for Multi-Cluster Telemetry](https://www.youtube.com/watch?v=6Nx2BFyr7qQ)
 * 12.2020: [Turn It Up to a Million: Ingesting Millions of Metrics with Thanos Receive](https://www.youtube.com/watch?v=5MJqdJq41Ms)
 * 02.2018: [Very first Prometheus Meetup Slides](https://www.slideshare.net/BartomiejPotka/thanos-global-durable-prometheus-monitoring)
@@ -106,6 +99,14 @@ We also have example Grafana dashboards [here](/examples/dashboards/dashboards.m
 * 2019: [Prometheus in Practice: HA with Thanos](https://www.slideshare.net/ThomasRiley45/prometheus-in-practice-high-availability-with-thanos-devopsdays-edinburgh-2019)
 
 ## Blog posts
+
+* 2022:
+
+  * [Leveraging Consul for Thanos Query Discovery](https://nicolastakashi.medium.com/leveraging-consul-for-thanos-query-discovery-34212d496c88)
+
+* 2021:
+
+  * [Adopting Thanos at LastPass](https://krisztianfekete.org/adopting-thanos-at-lastpass/)
 
 * 2020:
 
@@ -119,12 +120,12 @@ We also have example Grafana dashboards [here](/examples/dashboards/dashboards.m
   * [HelloFresh blog posts part 1](https://engineering.hellofresh.com/monitoring-at-hellofresh-part-1-architecture-677b4bd6b728)
   * [HelloFresh blog posts part 2](https://engineering.hellofresh.com/monitoring-at-hellofresh-part-2-operating-the-monitoring-system-8175cd939c1d)
   * [Thanos deployment](https://www.metricfire.com/blog/ha-kubernetes-monitoring-using-prometheus-and-thanos)
-  * [Taboola user story](https://engineering.taboola.com/monitoring-and-metering-scale/)
+  * [Taboola user story](https://blog.taboola.com/monitoring-and-metering-scale/)
   * [Thanos via Prometheus Operator](https://kkc.github.io/2019/02/10/prometheus-operator-with-thanos/)
 
 * 2018:
 
-  * [Introduction blog post](https://improbable.io/games/blog/thanos-prometheus-at-scale)
+  * [Introduction blog post](https://improbable.io/blog/thanos-prometheus-at-scale)
   * [Monzo user story](https://monzo.com/blog/2018/07/27/how-we-monitor-monzo)
   * [Banzai Cloud hand's on](https://banzaicloud.com/blog/hands-on-thanos/)
   * [uSwitch user story](https://medium.com/uswitch-labs/making-prometheus-more-awesome-with-thanos-fbec8c6c28ad)
@@ -132,19 +133,16 @@ We also have example Grafana dashboards [here](/examples/dashboards/dashboards.m
 
 ## Integrations
 
-See [Integrations page](./integrations.md).
+See [Integrations page](integrations.md).
 
 ## Testing Thanos on Single Host
 
-We don't recommend running Thanos on a single node on production.
-Thanos is designed and built to run as a distributed system.
-Vanilla Prometheus might be totally enough for small setups.
+We don't recommend running Thanos on a single node on production. Thanos is designed and built to run as a distributed system. Vanilla Prometheus might be totally enough for small setups.
 
-However, in case you want to play and run Thanos components
-on a single node, we recommend following the port layout:
+However, in case you want to play and run Thanos components on a single node, we recommend following the port layout:
 
 | Component      | Interface               | Port  |
-| -------------- | ----------------------- | ----- |
+|----------------|-------------------------|-------|
 | Sidecar        | gRPC                    | 10901 |
 | Sidecar        | HTTP                    | 10902 |
 | Query          | gRPC                    | 10903 |
@@ -159,4 +157,4 @@ on a single node, we recommend following the port layout:
 | Compact        | HTTP                    | 10912 |
 | Query Frontend | HTTP                    | 10913 |
 
-You can see example one-node setup [here](/scripts/quickstart.sh).
+You can see example one-node setup [here](../scripts/quickstart.sh).

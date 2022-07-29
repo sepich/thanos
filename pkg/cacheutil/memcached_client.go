@@ -13,14 +13,15 @@ import (
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
+	memcacheDiscovery "github.com/thanos-io/thanos/pkg/discovery/memcache"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/model"
@@ -28,6 +29,7 @@ import (
 
 const (
 	opSet                 = "set"
+	opSetMulti            = "setmulti"
 	opGetMulti            = "getmulti"
 	reasonMaxItemSize     = "max-item-size"
 	reasonAsyncBufferFull = "async-buffer-full"
@@ -53,12 +55,18 @@ var (
 		MaxGetMultiConcurrency:    100,
 		MaxGetMultiBatchSize:      0,
 		DNSProviderUpdateInterval: 10 * time.Second,
+		AutoDiscovery:             false,
 	}
 )
 
-// MemcachedClient is a high level client to interact with memcached.
-type MemcachedClient interface {
-	// GetMulti fetches multiple keys at once from memcached. In case of error,
+var (
+	_ RemoteCacheClient = (*memcachedClient)(nil)
+	_ RemoteCacheClient = (*RedisClient)(nil)
+)
+
+// RemoteCacheClient is a high level client to interact with remote cache.
+type RemoteCacheClient interface {
+	// GetMulti fetches multiple keys at once from remoteCache. In case of error,
 	// an empty map is returned and the error tracked/logged.
 	GetMulti(ctx context.Context, keys []string) map[string][]byte
 
@@ -71,13 +79,31 @@ type MemcachedClient interface {
 	Stop()
 }
 
+// MemcachedClient for compatible.
+type MemcachedClient = RemoteCacheClient
+
 // memcachedClientBackend is an interface used to mock the underlying client in tests.
 type memcachedClientBackend interface {
 	GetMulti(keys []string) (map[string]*memcache.Item, error)
 	Set(item *memcache.Item) error
 }
 
-// MemcachedClientConfig is the config accepted by MemcachedClient.
+// updatableServerSelector extends the interface used for picking a memcached server
+// for a key to allow servers to be updated at runtime. It allows the selector used
+// by the client to be mocked in tests.
+type updatableServerSelector interface {
+	memcache.ServerSelector
+
+	// SetServers changes a ServerSelector's set of servers at runtime
+	// and is safe for concurrent use by multiple goroutines.
+	//
+	// SetServers returns an error if any of the server names fail to
+	// resolve. No attempt is made to connect to the server. If any
+	// error occurs, no changes are made to the internal server list.
+	SetServers(servers ...string) error
+}
+
+// MemcachedClientConfig is the config accepted by RemoteCacheClient.
 type MemcachedClientConfig struct {
 	// Addresses specifies the list of memcached addresses. The addresses get
 	// resolved with the DNS provider.
@@ -114,6 +140,9 @@ type MemcachedClientConfig struct {
 
 	// DNSProviderUpdateInterval specifies the DNS discovery update interval.
 	DNSProviderUpdateInterval time.Duration `yaml:"dns_provider_update_interval"`
+
+	// AutoDiscovery configures memached client to perform auto-discovery instead of DNS resolution
+	AutoDiscovery bool `yaml:"auto_discovery"`
 }
 
 func (c *MemcachedClientConfig) validate() error {
@@ -148,13 +177,13 @@ type memcachedClient struct {
 	logger   log.Logger
 	config   MemcachedClientConfig
 	client   memcachedClientBackend
-	selector *MemcachedJumpHashSelector
+	selector updatableServerSelector
 
 	// Name provides an identifier for the instantiated Client
 	name string
 
-	// DNS provider used to keep the memcached servers list updated.
-	dnsProvider *dns.Provider
+	// Address provider used to keep the memcached servers list updated.
+	addressProvider AddressProvider
 
 	// Channel used to notify internal goroutines when they should quit.
 	stop chan struct{}
@@ -177,12 +206,21 @@ type memcachedClient struct {
 	dataSize   *prometheus.HistogramVec
 }
 
+// AddressProvider performs node address resolution given a list of clusters.
+type AddressProvider interface {
+	// Resolves the provided list of memcached cluster to the actual nodes
+	Resolve(context.Context, []string) error
+
+	// Returns the nodes
+	Addresses() []string
+}
+
 type memcachedGetMultiResult struct {
 	items map[string]*memcache.Item
 	err   error
 }
 
-// NewMemcachedClient makes a new MemcachedClient.
+// NewMemcachedClient makes a new RemoteCacheClient.
 func NewMemcachedClient(logger log.Logger, name string, conf []byte, reg prometheus.Registerer) (*memcachedClient, error) {
 	config, err := parseMemcachedClientConfig(conf)
 	if err != nil {
@@ -192,7 +230,7 @@ func NewMemcachedClient(logger log.Logger, name string, conf []byte, reg prometh
 	return NewMemcachedClientWithConfig(logger, name, config, reg)
 }
 
-// NewMemcachedClientWithConfig makes a new MemcachedClient.
+// NewMemcachedClientWithConfig makes a new RemoteCacheClient.
 func NewMemcachedClientWithConfig(logger log.Logger, name string, config MemcachedClientConfig, reg prometheus.Registerer) (*memcachedClient, error) {
 	if err := config.validate(); err != nil {
 		return nil, err
@@ -215,25 +253,36 @@ func NewMemcachedClientWithConfig(logger log.Logger, name string, config Memcach
 func newMemcachedClient(
 	logger log.Logger,
 	client memcachedClientBackend,
-	selector *MemcachedJumpHashSelector,
+	selector updatableServerSelector,
 	config MemcachedClientConfig,
 	reg prometheus.Registerer,
 	name string,
 ) (*memcachedClient, error) {
-	dnsProvider := dns.NewProvider(
-		logger,
-		extprom.WrapRegistererWithPrefix("thanos_memcached_", reg),
-		dns.GolangResolverType,
-	)
+	promRegisterer := extprom.WrapRegistererWithPrefix("thanos_memcached_", reg)
+
+	var addressProvider AddressProvider
+	if config.AutoDiscovery {
+		addressProvider = memcacheDiscovery.NewProvider(
+			logger,
+			promRegisterer,
+			config.Timeout,
+		)
+	} else {
+		addressProvider = dns.NewProvider(
+			logger,
+			extprom.WrapRegistererWithPrefix("thanos_memcached_", reg),
+			dns.MiekgdnsResolverType,
+		)
+	}
 
 	c := &memcachedClient{
-		logger:      log.With(logger, "name", name),
-		config:      config,
-		client:      client,
-		selector:    selector,
-		dnsProvider: dnsProvider,
-		asyncQueue:  make(chan func(), config.MaxAsyncBufferSize),
-		stop:        make(chan struct{}, 1),
+		logger:          log.With(logger, "name", name),
+		config:          config,
+		client:          client,
+		selector:        selector,
+		addressProvider: addressProvider,
+		asyncQueue:      make(chan func(), config.MaxAsyncBufferSize),
+		stop:            make(chan struct{}, 1),
 		getMultiGate: gate.New(
 			extprom.WrapRegistererWithPrefix("thanos_memcached_getmulti_", reg),
 			config.MaxGetMultiConcurrency,
@@ -408,6 +457,16 @@ func (c *memcachedClient) GetMulti(ctx context.Context, keys []string) map[strin
 func (c *memcachedClient) getMultiBatched(ctx context.Context, keys []string) ([]map[string]*memcache.Item, error) {
 	// Do not batch if the input keys are less than the max batch size.
 	if (c.config.MaxGetMultiBatchSize <= 0) || (len(keys) <= c.config.MaxGetMultiBatchSize) {
+		// Even if we're not splitting the input into batches, make sure that our single request
+		// still counts against the concurrency limit.
+		if c.config.MaxGetMultiConcurrency > 0 {
+			if err := c.getMultiGate.Start(ctx); err != nil {
+				return nil, errors.Wrapf(err, "failed to wait for turn. Instance: %s", c.name)
+			}
+
+			defer c.getMultiGate.Done()
+		}
+
 		items, err := c.getMultiSingle(ctx, keys)
 		if err != nil {
 			return nil, err
@@ -423,29 +482,38 @@ func (c *memcachedClient) getMultiBatched(ctx context.Context, keys []string) ([
 		numResults++
 	}
 
-	// Spawn a goroutine for each batch request. The max concurrency will be
-	// enforced by getMultiSingle().
+	// If max concurrency is disabled, use a nil gate for the doWithBatch method which will
+	// not apply any limit to the number goroutines started to make batch requests in that case.
+	var getMultiGate gate.Gate
+	if c.config.MaxGetMultiConcurrency > 0 {
+		getMultiGate = c.getMultiGate
+	}
+
+	// Sort keys based on which memcached server they will be sharded to. Sorting keys that
+	// are on the same server together before splitting into batches reduces the number of
+	// connections required and increases the number of "gets" per connection.
+	sortedKeys := c.sortKeysByServer(keys)
+
+	// Allocate a channel to store results for each batch request. The max concurrency will be
+	// enforced by doWithBatch.
 	results := make(chan *memcachedGetMultiResult, numResults)
 	defer close(results)
 
-	for batchStart := 0; batchStart < len(keys); batchStart += batchSize {
-		batchEnd := batchStart + batchSize
-		if batchEnd > len(keys) {
-			batchEnd = len(keys)
-		}
+	// Ignore the error here since it can only be returned by our provided function which
+	// always returns nil. NOTE also we are using a background context here for the doWithBatch
+	// method. This is to ensure that it runs the expected number of batches _even if_ our
+	// context (`ctx`) is canceled since we expect a certain number of batches to be read
+	// from `results` below. The wrapped `getMultiSingle` method will still check our context
+	// and short-circuit if it has been canceled.
+	_ = doWithBatch(context.Background(), len(keys), c.config.MaxGetMultiBatchSize, getMultiGate, func(startIndex, endIndex int) error {
+		batchKeys := sortedKeys[startIndex:endIndex]
 
-		batchKeys := keys[batchStart:batchEnd]
+		res := &memcachedGetMultiResult{}
+		res.items, res.err = c.getMultiSingle(ctx, batchKeys)
 
-		c.workers.Add(1)
-		go func() {
-			defer c.workers.Done()
-
-			res := &memcachedGetMultiResult{}
-			res.items, res.err = c.getMultiSingle(ctx, batchKeys)
-
-			results <- res
-		}()
-	}
+		results <- res
+		return nil
+	})
 
 	// Wait for all batch results. In case of error, we keep
 	// track of the last error occurred.
@@ -466,18 +534,18 @@ func (c *memcachedClient) getMultiBatched(ctx context.Context, keys []string) ([
 }
 
 func (c *memcachedClient) getMultiSingle(ctx context.Context, keys []string) (items map[string]*memcache.Item, err error) {
-	// Wait until we get a free slot from the gate, if the max
-	// concurrency should be enforced.
-	if c.config.MaxGetMultiConcurrency > 0 {
-		if err := c.getMultiGate.Start(ctx); err != nil {
-			return nil, errors.Wrapf(err, "failed to wait for turn. Instance: %s", c.name)
-		}
-		defer c.getMultiGate.Done()
-	}
-
 	start := time.Now()
 	c.operations.WithLabelValues(opGetMulti).Inc()
-	items, err = c.client.GetMulti(keys)
+
+	select {
+	case <-ctx.Done():
+		// Make sure our context hasn't been canceled before fetching cache items using
+		// cache client backend.
+		return nil, ctx.Err()
+	default:
+		items, err = c.client.GetMulti(keys)
+	}
+
 	if err != nil {
 		level.Debug(c.logger).Log("msg", "failed to get multiple items from memcached", "err", err)
 		c.trackError(opGetMulti, err)
@@ -491,6 +559,35 @@ func (c *memcachedClient) getMultiSingle(ctx context.Context, keys []string) (it
 	}
 
 	return items, err
+}
+
+// sortKeysByServer sorts cache keys within a slice based on which server they are
+// sharded to using a memcache.ServerSelector instance. The keys are ordered so keys
+// on the same server are next to each other. Any errors encountered determining which
+// server a key should be on will result in returning keys unsorted (in the same order
+// they were supplied in). Note that output is not guaranteed to be any particular order
+// *except* that keys sharded to the same server will be together. The order of keys
+// returned may change from call to call.
+func (c *memcachedClient) sortKeysByServer(keys []string) []string {
+	bucketed := make(map[string][]string)
+
+	for _, key := range keys {
+		addr, err := c.selector.PickServer(key)
+		// If we couldn't determine the correct server, return keys in existing order
+		if err != nil {
+			return keys
+		}
+
+		addrString := addr.String()
+		bucketed[addrString] = append(bucketed[addrString], key)
+	}
+
+	var out []string
+	for srv := range bucketed {
+		out = append(out, bucketed[srv]...)
+	}
+
+	return out
 }
 
 func (c *memcachedClient) trackError(op string, err error) {
@@ -561,11 +658,11 @@ func (c *memcachedClient) resolveAddrs() error {
 	defer cancel()
 
 	// If some of the dns resolution fails, log the error.
-	if err := c.dnsProvider.Resolve(ctx, c.config.Addresses); err != nil {
+	if err := c.addressProvider.Resolve(ctx, c.config.Addresses); err != nil {
 		level.Error(c.logger).Log("msg", "failed to resolve addresses for memcached", "addresses", strings.Join(c.config.Addresses, ","), "err", err)
 	}
 	// Fail in case no server address is resolved.
-	servers := c.dnsProvider.Addresses()
+	servers := c.addressProvider.Addresses()
 	if len(servers) == 0 {
 		return fmt.Errorf("no server address resolved for %s", c.name)
 	}

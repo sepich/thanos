@@ -12,10 +12,11 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/relabel"
 	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
-	http_util "github.com/thanos-io/thanos/pkg/http"
+	"github.com/thanos-io/thanos/pkg/httpconfig"
 )
 
 type AlertingConfig struct {
@@ -24,10 +25,10 @@ type AlertingConfig struct {
 
 // AlertmanagerConfig represents a client to a cluster of Alertmanager endpoints.
 type AlertmanagerConfig struct {
-	HTTPClientConfig http_util.ClientConfig    `yaml:"http_config"`
-	EndpointsConfig  http_util.EndpointsConfig `yaml:",inline"`
-	Timeout          model.Duration            `yaml:"timeout"`
-	APIVersion       APIVersion                `yaml:"api_version"`
+	HTTPClientConfig httpconfig.ClientConfig    `yaml:"http_config"`
+	EndpointsConfig  httpconfig.EndpointsConfig `yaml:",inline"`
+	Timeout          model.Duration             `yaml:"timeout"`
+	APIVersion       APIVersion                 `yaml:"api_version"`
 }
 
 // APIVersion represents the API version of the Alertmanager endpoint.
@@ -60,10 +61,10 @@ func (v *APIVersion) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 func DefaultAlertmanagerConfig() AlertmanagerConfig {
 	return AlertmanagerConfig{
-		EndpointsConfig: http_util.EndpointsConfig{
+		EndpointsConfig: httpconfig.EndpointsConfig{
 			Scheme:          "http",
 			StaticAddresses: []string{},
-			FileSDConfigs:   []http_util.FileSDConfig{},
+			FileSDConfigs:   []httpconfig.FileSDConfig{},
 		},
 		Timeout:    model.Duration(time.Second * 10),
 		APIVersion: APIv1,
@@ -94,7 +95,15 @@ func BuildAlertmanagerConfig(address string, timeout time.Duration) (Alertmanage
 	}
 
 	scheme := parsed.Scheme
+	if scheme == "" {
+		return AlertmanagerConfig{}, errors.New("alertmanagers.url contains empty scheme")
+	}
+
 	host := parsed.Host
+	if host == "" {
+		return AlertmanagerConfig{}, errors.New("alertmanagers.url contains empty host")
+	}
+
 	for _, qType := range []dns.QType{dns.A, dns.SRV, dns.SRVNoA} {
 		prefix := string(qType) + "+"
 		if strings.HasPrefix(strings.ToLower(scheme), prefix) {
@@ -110,7 +119,7 @@ func BuildAlertmanagerConfig(address string, timeout time.Duration) (Alertmanage
 			break
 		}
 	}
-	var basicAuth http_util.BasicAuth
+	var basicAuth httpconfig.BasicAuth
 	if parsed.User != nil && parsed.User.String() != "" {
 		basicAuth.Username = parsed.User.Username()
 		pw, _ := parsed.User.Password()
@@ -118,10 +127,10 @@ func BuildAlertmanagerConfig(address string, timeout time.Duration) (Alertmanage
 	}
 
 	return AlertmanagerConfig{
-		HTTPClientConfig: http_util.ClientConfig{
+		HTTPClientConfig: httpconfig.ClientConfig{
 			BasicAuth: basicAuth,
 		},
-		EndpointsConfig: http_util.EndpointsConfig{
+		EndpointsConfig: httpconfig.EndpointsConfig{
 			PathPrefix:      parsed.Path,
 			Scheme:          scheme,
 			StaticAddresses: []string{host},
@@ -129,4 +138,13 @@ func BuildAlertmanagerConfig(address string, timeout time.Duration) (Alertmanage
 		Timeout:    model.Duration(timeout),
 		APIVersion: APIv1,
 	}, nil
+}
+
+// LoadRelabelConfigs loads a list of relabel.Config from YAML data.
+func LoadRelabelConfigs(confYaml []byte) ([]*relabel.Config, error) {
+	var cfg []*relabel.Config
+	if err := yaml.UnmarshalStrict(confYaml, &cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }

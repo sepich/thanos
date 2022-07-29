@@ -7,9 +7,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"io/ioutil"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 )
 
@@ -31,18 +35,18 @@ func NewServerConfig(logger log.Logger, cert, key, clientCA string) (*tls.Config
 	}
 
 	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS13,
 	}
 
-	tlsCert, err := tls.LoadX509KeyPair(cert, key)
-	if err != nil {
-		return nil, errors.Wrap(err, "server credentials")
+	mngr := &serverTLSManager{
+		srvCertPath: cert,
+		srvKeyPath:  key,
 	}
 
-	tlsCfg.Certificates = []tls.Certificate{tlsCert}
+	tlsCfg.GetCertificate = mngr.getCertificate
 
 	if clientCA != "" {
-		caPEM, err := ioutil.ReadFile(clientCA)
+		caPEM, err := ioutil.ReadFile(filepath.Clean(clientCA))
 		if err != nil {
 			return nil, errors.Wrap(err, "reading client CA")
 		}
@@ -60,11 +64,46 @@ func NewServerConfig(logger log.Logger, cert, key, clientCA string) (*tls.Config
 	return tlsCfg, nil
 }
 
+type serverTLSManager struct {
+	srvCertPath string
+	srvKeyPath  string
+
+	mtx            sync.Mutex
+	srvCert        *tls.Certificate
+	srvCertModTime time.Time
+	srvKeyModTime  time.Time
+}
+
+func (m *serverTLSManager) getCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	statCert, err := os.Stat(m.srvCertPath)
+	if err != nil {
+		return nil, err
+	}
+	statKey, err := os.Stat(m.srvKeyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if m.srvCert == nil || !statCert.ModTime().Equal(m.srvCertModTime) || !statKey.ModTime().Equal(m.srvKeyModTime) {
+		cert, err := tls.LoadX509KeyPair(m.srvCertPath, m.srvKeyPath)
+		if err != nil {
+			return nil, errors.Wrap(err, "server credentials")
+		}
+		m.srvCertModTime = statCert.ModTime()
+		m.srvKeyModTime = statKey.ModTime()
+		m.srvCert = &cert
+	}
+	return m.srvCert, nil
+}
+
 // NewClientConfig provides new client TLS configuration.
 func NewClientConfig(logger log.Logger, cert, key, caCert, serverName string, skipVerify bool) (*tls.Config, error) {
 	var certPool *x509.CertPool
 	if caCert != "" {
-		caPEM, err := ioutil.ReadFile(caCert)
+		caPEM, err := ioutil.ReadFile(filepath.Clean(caCert))
 		if err != nil {
 			return nil, errors.Wrap(err, "reading client CA")
 		}
@@ -100,12 +139,49 @@ func NewClientConfig(logger log.Logger, cert, key, caCert, serverName string, sk
 	}
 
 	if cert != "" {
-		cert, err := tls.LoadX509KeyPair(cert, key)
-		if err != nil {
-			return nil, errors.Wrap(err, "client credentials")
+		mngr := &clientTLSManager{
+			certPath: cert,
+			keyPath:  key,
 		}
-		tlsCfg.Certificates = []tls.Certificate{cert}
+		tlsCfg.GetClientCertificate = mngr.getClientCertificate
+
 		level.Info(logger).Log("msg", "TLS client authentication enabled")
 	}
 	return tlsCfg, nil
+}
+
+type clientTLSManager struct {
+	certPath string
+	keyPath  string
+
+	mtx         sync.Mutex
+	cert        *tls.Certificate
+	certModTime time.Time
+	keyModTime  time.Time
+}
+
+func (m *clientTLSManager) getClientCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	statCert, err := os.Stat(m.certPath)
+	if err != nil {
+		return nil, err
+	}
+	statKey, err := os.Stat(m.keyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if m.cert == nil || !statCert.ModTime().Equal(m.certModTime) || !statKey.ModTime().Equal(m.keyModTime) {
+		cert, err := tls.LoadX509KeyPair(m.certPath, m.keyPath)
+		if err != nil {
+			return nil, errors.Wrap(err, "client credentials")
+		}
+		m.certModTime = statCert.ModTime()
+		m.keyModTime = statKey.ModTime()
+		m.cert = &cert
+	}
+
+	return m.cert, nil
 }

@@ -15,10 +15,9 @@ import QueryStatsView, { QueryStats } from './QueryStatsView';
 import { Store } from '../../thanos/pages/stores/store';
 import PathPrefixProps from '../../types/PathPrefixProps';
 import { QueryParams } from '../../types/types';
-import { parseRange } from '../../utils/index';
-import CMExpressionInput from './CMExpressionInput';
+import { parseDuration } from '../../utils';
 
-interface PanelProps {
+export interface PanelProps {
   id: string;
   options: PanelOptions;
   onOptionsChanged: (opts: PanelOptions) => void;
@@ -28,7 +27,6 @@ interface PanelProps {
   removePanel: () => void;
   onExecuteQuery: (query: string) => void;
   stores: Store[];
-  useExperimentalEditor: boolean;
   enableAutocomplete: boolean;
   enableHighlighting: boolean;
   enableLinter: boolean;
@@ -47,7 +45,7 @@ interface PanelState {
 export interface PanelOptions {
   expr: string;
   type: PanelType;
-  range: number; // Range in seconds.
+  range: number; // Range in milliseconds.
   endTime: number | null; // Timestamp in milliseconds.
   resolution: number | null; // Resolution in seconds.
   stacked: boolean;
@@ -65,7 +63,7 @@ export enum PanelType {
 export const PanelDefaultOptions: PanelOptions = {
   type: PanelType.Table,
   expr: '',
-  range: 3600,
+  range: 60 * 60 * 1000,
   endTime: null,
   resolution: null,
   stacked: false,
@@ -95,7 +93,7 @@ class Panel extends Component<PanelProps & PathPrefixProps, PanelState> {
     this.handleStoreMatchChange = this.handleStoreMatchChange.bind(this);
   }
 
-  componentDidUpdate({ options: prevOpts }: PanelProps) {
+  componentDidUpdate({ options: prevOpts }: PanelProps): void {
     const {
       endTime,
       range,
@@ -120,7 +118,7 @@ class Panel extends Component<PanelProps & PathPrefixProps, PanelState> {
     }
   }
 
-  componentDidMount() {
+  componentDidMount(): void {
     this.executeQuery();
   }
 
@@ -145,10 +143,10 @@ class Panel extends Component<PanelProps & PathPrefixProps, PanelState> {
     this.setState({ loading: true });
 
     const endTime = this.getEndTime().valueOf() / 1000; // TODO: shouldn't valueof only work when it's a moment?
-    const startTime = endTime - this.props.options.range;
+    const startTime = endTime - this.props.options.range / 1000;
     const resolution =
       this.props.options.resolution ||
-      Math.max(Math.floor(this.props.options.range / 250), parseRange(this.props.defaultStep) as number);
+      Math.max(Math.floor(this.props.options.range / 250000), (parseDuration(this.props.defaultStep) || 0) / 1000);
     const params: URLSearchParams = new URLSearchParams({
       query: expr,
       dedup: this.props.options.useDeduplication.toString(),
@@ -249,24 +247,24 @@ class Panel extends Component<PanelProps & PathPrefixProps, PanelState> {
     return this.props.options.endTime;
   };
 
-  handleChangeEndTime = (endTime: number | null) => {
+  handleChangeEndTime = (endTime: number | null): void => {
     this.setOptions({ endTime: endTime });
   };
 
-  handleChangeResolution = (resolution: number | null) => {
+  handleChangeResolution = (resolution: number | null): void => {
     this.setOptions({ resolution: resolution });
   };
 
-  handleChangeMaxSourceResolution = (maxSourceResolution: string) => {
+  handleChangeMaxSourceResolution = (maxSourceResolution: string): void => {
     this.setOptions({ maxSourceResolution });
   };
 
-  handleChangeType = (type: PanelType) => {
+  handleChangeType = (type: PanelType): void => {
     this.setState({ data: null });
     this.setOptions({ type: type });
   };
 
-  handleChangeStacking = (stacked: boolean) => {
+  handleChangeStacking = (stacked: boolean): void => {
     this.setOptions({ stacked: stacked });
   };
 
@@ -282,42 +280,36 @@ class Panel extends Component<PanelProps & PathPrefixProps, PanelState> {
     this.setOptions({ storeMatches: selectedStores || [] });
   };
 
-  render() {
+  handleToggleAlert = (): void => {
+    this.setState({ error: null });
+  };
+
+  render(): JSX.Element {
     const { pastQueries, metricNames, options, id, stores } = this.props;
     return (
       <div className="panel">
         <Row>
           <Col>
-            {this.props.useExperimentalEditor ? (
-              <CMExpressionInput
-                pathPrefix={this.props.pathPrefix}
-                value={this.state.exprInputValue}
-                onExpressionChange={this.handleExpressionChange}
-                executeQuery={this.executeQuery}
-                loading={this.state.loading}
-                enableAutocomplete={this.props.enableAutocomplete}
-                enableHighlighting={this.props.enableHighlighting}
-                enableLinter={this.props.enableLinter}
-                queryHistory={pastQueries}
-                metricNames={metricNames}
-              />
-            ) : (
-              <ExpressionInput
-                value={this.state.exprInputValue}
-                onExpressionChange={this.handleExpressionChange}
-                executeQuery={this.executeQuery}
-                loading={this.state.loading}
-                enableAutocomplete={this.props.enableAutocomplete}
-                autocompleteSections={{
-                  'Query History': pastQueries,
-                  'Metric Names': metricNames,
-                }}
-              />
-            )}
+            <ExpressionInput
+              pathPrefix={this.props.pathPrefix}
+              value={this.state.exprInputValue}
+              onExpressionChange={this.handleExpressionChange}
+              executeQuery={this.executeQuery}
+              loading={this.state.loading}
+              enableAutocomplete={this.props.enableAutocomplete}
+              enableHighlighting={this.props.enableHighlighting}
+              enableLinter={this.props.enableLinter}
+              queryHistory={pastQueries}
+              metricNames={metricNames}
+            />
           </Col>
         </Row>
         <Row>
-          <Col>{this.state.error && <UncontrolledAlert color="danger">{this.state.error}</UncontrolledAlert>}</Col>
+          <Col>
+            <UncontrolledAlert isOpen={this.state.error || false} toggle={this.handleToggleAlert} color="danger">
+              {this.state.error}
+            </UncontrolledAlert>
+          </Col>
         </Row>
         <Row>
           <Col>
@@ -351,7 +343,15 @@ class Panel extends Component<PanelProps & PathPrefixProps, PanelState> {
                   getOptionLabel={(option: Store) => option.name}
                   getOptionValue={(option: Store) => option.name}
                   closeMenuOnSelect={false}
-                  styles={{ container: (provided, state) => ({ ...provided, marginBottom: 20, zIndex: 3, width: '100%' }) }}
+                  styles={{
+                    container: (provided, state) => ({
+                      ...provided,
+                      marginBottom: 20,
+                      zIndex: 3,
+                      width: '100%',
+                      color: '#000',
+                    }),
+                  }}
                   onChange={this.handleStoreMatchChange}
                 />
               </div>

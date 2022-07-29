@@ -22,11 +22,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/index"
@@ -94,7 +94,7 @@ func NewTSDB() (*tsdb.DB, error) {
 	}
 	opts := tsdb.DefaultOptions()
 	opts.RetentionDuration = math.MaxInt64
-	return tsdb.Open(dir, nil, nil, opts)
+	return tsdb.Open(dir, nil, nil, opts, nil)
 }
 
 func ForeachPrometheus(t *testing.T, testFn func(t testing.TB, p *Prometheus)) {
@@ -128,7 +128,7 @@ func NewPrometheusOnPath(prefix string) (*Prometheus, error) {
 	return newPrometheus("", prefix)
 }
 
-func newPrometheus(binPath string, prefix string) (*Prometheus, error) {
+func newPrometheus(binPath, prefix string) (*Prometheus, error) {
 	if binPath == "" {
 		binPath = PrometheusBinary()
 	}
@@ -297,7 +297,7 @@ func (p *Prometheus) Appender() storage.Appender {
 
 // CreateEmptyBlock produces empty block like it was the case before fix: https://github.com/prometheus/tsdb/pull/374.
 // (Prometheus pre v2.7.0).
-func CreateEmptyBlock(dir string, mint int64, maxt int64, extLset labels.Labels, resolution int64) (ulid.ULID, error) {
+func CreateEmptyBlock(dir string, mint, maxt int64, extLset labels.Labels, resolution int64) (ulid.ULID, error) {
 	entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
 	uid := ulid.MustNew(ulid.Now(), entropy)
 
@@ -430,7 +430,7 @@ func createBlock(
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = filepath.Join(dir, "chunks")
 	headOpts.ChunkRange = 10000000000
-	h, err := tsdb.NewHead(nil, nil, nil, headOpts)
+	h, err := tsdb.NewHead(nil, nil, nil, headOpts, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "create head block")
 	}
@@ -480,7 +480,7 @@ func createBlock(
 	if err := g.Wait(); err != nil {
 		return id, err
 	}
-	c, err := tsdb.NewLeveledCompactor(ctx, nil, log.NewNopLogger(), []int64{maxt - mint}, nil)
+	c, err := tsdb.NewLeveledCompactor(ctx, nil, log.NewNopLogger(), []int64{maxt - mint}, nil, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "create compactor")
 	}

@@ -5,6 +5,7 @@ package storepb
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"sort"
 	"strconv"
@@ -12,7 +13,8 @@ import (
 
 	"github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
+
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 )
 
@@ -319,7 +321,7 @@ func (x *PartialResponseStrategy) UnmarshalJSON(entry []byte) error {
 		return errors.Wrapf(err, fmt.Sprintf("failed to unqote %v, in order to unmarshal as 'partial_response_strategy'. Possible values are %s", string(entry), strings.Join(PartialResponseStrategyValues, ",")))
 	}
 
-	if len(fieldStr) == 0 {
+	if fieldStr == "" {
 		// NOTE: For Rule default is abort as this is recommended for alerting.
 		*x = PartialResponseStrategy_ABORT
 		return nil
@@ -455,4 +457,87 @@ func CompareLabels(a, b []Label) int {
 // TODO(bwplotka): Remove this once Cortex dep will stop using it.
 func LabelsToPromLabelsUnsafe(lset []Label) labels.Labels {
 	return labelpb.ZLabelsToPromLabels(lset)
+}
+
+// XORNumSamples return number of samples. Returns 0 if it's not XOR chunk.
+func (m *Chunk) XORNumSamples() int {
+	if m.Type == Chunk_XOR {
+		return int(binary.BigEndian.Uint16(m.Data))
+	}
+	return 0
+}
+
+type SeriesStatsCounter struct {
+	lastSeriesHash uint64
+
+	Series  int
+	Chunks  int
+	Samples int
+}
+
+func (c *SeriesStatsCounter) CountSeries(seriesLabels []labelpb.ZLabel) {
+	seriesHash := labelpb.HashWithPrefix("", seriesLabels)
+	if c.lastSeriesHash != 0 || seriesHash != c.lastSeriesHash {
+		c.lastSeriesHash = seriesHash
+		c.Series++
+	}
+}
+
+func (c *SeriesStatsCounter) Count(series *Series) {
+	c.CountSeries(series.Labels)
+	for _, chk := range series.Chunks {
+		if chk.Raw != nil {
+			c.Chunks++
+			c.Samples += chk.Raw.XORNumSamples()
+		}
+
+		if chk.Count != nil {
+			c.Chunks++
+			c.Samples += chk.Count.XORNumSamples()
+		}
+
+		if chk.Counter != nil {
+			c.Chunks++
+			c.Samples += chk.Counter.XORNumSamples()
+		}
+
+		if chk.Max != nil {
+			c.Chunks++
+			c.Samples += chk.Max.XORNumSamples()
+		}
+
+		if chk.Min != nil {
+			c.Chunks++
+			c.Samples += chk.Min.XORNumSamples()
+		}
+
+		if chk.Sum != nil {
+			c.Chunks++
+			c.Samples += chk.Sum.XORNumSamples()
+		}
+	}
+}
+
+func (m *SeriesRequest) ToPromQL() string {
+	return m.QueryHints.toPromQL(m.Matchers)
+}
+
+// IsSafeToExecute returns true if the function or aggregation from the query hint
+// can be safely executed by the underlying Prometheus instance without affecting the
+// result of the query.
+func (m *QueryHints) IsSafeToExecute() bool {
+	distributiveOperations := []string{
+		"max",
+		"max_over_time",
+		"min",
+		"min_over_time",
+		"group",
+	}
+	for _, op := range distributiveOperations {
+		if m.Func.Name == op {
+			return true
+		}
+	}
+
+	return false
 }

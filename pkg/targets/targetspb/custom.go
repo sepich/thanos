@@ -8,7 +8,8 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
+
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 )
 
@@ -34,7 +35,7 @@ func (x *TargetHealth) UnmarshalJSON(entry []byte) error {
 		return errors.Wrapf(err, "targetHealth: unquote %v", string(entry))
 	}
 
-	if len(fieldStr) == 0 {
+	if fieldStr == "" {
 		return errors.New("empty targetHealth")
 	}
 

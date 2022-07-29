@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/pkg/errors"
+
 	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
@@ -40,7 +42,7 @@ func (oh *ObjectHash) Equal(other *ObjectHash) bool {
 func CalculateHash(p string, hf HashFunc, logger log.Logger) (ObjectHash, error) {
 	switch hf {
 	case SHA256Func:
-		f, err := os.Open(p)
+		f, err := os.Open(filepath.Clean(p))
 		if err != nil {
 			return ObjectHash{}, errors.Wrap(err, "opening file")
 		}

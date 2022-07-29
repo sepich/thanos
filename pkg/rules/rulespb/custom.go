@@ -11,7 +11,8 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
+
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 )
 
@@ -274,7 +275,7 @@ func (x *AlertState) UnmarshalJSON(entry []byte) error {
 		return errors.Wrapf(err, "alertState: unquote %v", string(entry))
 	}
 
-	if len(fieldStr) == 0 {
+	if fieldStr == "" {
 		return errors.New("empty alertState")
 	}
 

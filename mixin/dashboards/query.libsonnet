@@ -7,7 +7,7 @@ local utils = import '../lib/utils.libsonnet';
     selector: error 'must provide selector for Thanos Query dashboard',
     title: error 'must provide title for Thanos Query dashboard',
     dashboard:: {
-      selector: std.join(', ', thanos.dashboard.selector + ['job="$job"']),
+      selector: std.join(', ', thanos.dashboard.selector + ['job=~"$job"']),
       dimensions: std.join(', ', thanos.dashboard.dimensions + ['job']),
     },
   },
@@ -100,7 +100,7 @@ local utils = import '../lib/utils.libsonnet';
         g.resourceUtilizationRow(thanos.query.dashboard.selector, thanos.query.dashboard.dimensions)
       ),
 
-    __overviewRows__+:: [
+    __overviewRows__+:: if thanos.query == null then [] else [
       g.row('Instant Query')
       .addPanel(
         g.panel('Requests Rate', 'Shows rate of requests against /query for the given time.') +

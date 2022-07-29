@@ -12,7 +12,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -26,6 +26,8 @@ const (
 	labelValuesOp  = "label_values"
 	seriesOp       = "series"
 )
+
+var labelValuesPattern = regexp.MustCompile("/api/v1/label/.+/values$")
 
 // NewTripperware returns a Tripperware which sends requests to different sub tripperwares based on the query type.
 func NewTripperware(config Config, reg prometheus.Registerer, logger log.Logger) (queryrange.Tripperware, error) {
@@ -51,13 +53,13 @@ func NewTripperware(config Config, reg prometheus.Registerer, logger log.Logger)
 	labelsCodec := NewThanosLabelsCodec(config.LabelsConfig.PartialResponseStrategy, config.DefaultTimeRange)
 
 	queryRangeTripperware, err := newQueryRangeTripperware(config.QueryRangeConfig, queryRangeLimits, queryRangeCodec,
-		prometheus.WrapRegistererWith(prometheus.Labels{"tripperware": "query_range"}, reg), logger)
+		prometheus.WrapRegistererWith(prometheus.Labels{"tripperware": "query_range"}, reg), logger, config.ForwardHeaders)
 	if err != nil {
 		return nil, err
 	}
 
 	labelsTripperware, err := newLabelsTripperware(config.LabelsConfig, labelsLimits, labelsCodec,
-		prometheus.WrapRegistererWith(prometheus.Labels{"tripperware": "labels"}, reg), logger)
+		prometheus.WrapRegistererWith(prometheus.Labels{"tripperware": "labels"}, reg), logger, config.ForwardHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -120,8 +122,7 @@ func getOperation(r *http.Request) string {
 		case strings.HasSuffix(r.URL.Path, "/api/v1/series"):
 			return seriesOp
 		default:
-			matched, err := regexp.MatchString("/api/v1/label/.+/values$", r.URL.Path)
-			if err == nil && matched {
+			if labelValuesPattern.MatchString(r.URL.Path) {
 				return labelValuesOp
 			}
 		}
@@ -138,6 +139,7 @@ func newQueryRangeTripperware(
 	codec *queryRangeCodec,
 	reg prometheus.Registerer,
 	logger log.Logger,
+	forwardHeaders []string,
 ) (queryrange.Tripperware, error) {
 	queryRangeMiddleware := []queryrange.Middleware{queryrange.NewLimitsMiddleware(limits)}
 	m := queryrange.NewInstrumentMiddlewareMetrics(reg)
@@ -203,7 +205,7 @@ func newQueryRangeTripperware(
 	}
 
 	return func(next http.RoundTripper) http.RoundTripper {
-		rt := queryrange.NewRoundTripper(next, codec, queryRangeMiddleware...)
+		rt := queryrange.NewRoundTripper(next, codec, forwardHeaders, queryRangeMiddleware...)
 		return queryrange.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
 			return rt.RoundTrip(r)
 		})
@@ -218,6 +220,7 @@ func newLabelsTripperware(
 	codec *labelsCodec,
 	reg prometheus.Registerer,
 	logger log.Logger,
+	forwardHeaders []string,
 ) (queryrange.Tripperware, error) {
 	labelsMiddleware := []queryrange.Middleware{}
 	m := queryrange.NewInstrumentMiddlewareMetrics(reg)
@@ -265,17 +268,25 @@ func newLabelsTripperware(
 		)
 	}
 	return func(next http.RoundTripper) http.RoundTripper {
-		rt := queryrange.NewRoundTripper(next, codec, labelsMiddleware...)
+		rt := queryrange.NewRoundTripper(next, codec, forwardHeaders, labelsMiddleware...)
 		return queryrange.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
 			return rt.RoundTrip(r)
 		})
 	}, nil
 }
 
-// Don't go to response cache if StoreMatchers are set.
+// shouldCache controls what kind of Thanos request should be cached.
+// For more information about requests that skip caching logic, please visit
+// the query-frontend documentation.
 func shouldCache(r queryrange.Request) bool {
-	if thanosReq, ok := r.(ThanosRequest); ok {
-		if len(thanosReq.GetStoreMatchers()) > 0 {
+	if thanosReqStoreMatcherGettable, ok := r.(ThanosRequestStoreMatcherGetter); ok {
+		if len(thanosReqStoreMatcherGettable.GetStoreMatchers()) > 0 {
+			return false
+		}
+	}
+
+	if thanosReqDedup, ok := r.(ThanosRequestDedup); ok {
+		if !thanosReqDedup.IsDedupEnabled() {
 			return false
 		}
 	}

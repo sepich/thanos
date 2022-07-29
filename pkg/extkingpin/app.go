@@ -9,7 +9,7 @@ import (
 	"sort"
 	"text/template"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -104,14 +104,14 @@ func NewApp(app *kingpin.Application) *App {
 func (a *App) Parse() (cmd string, setup SetupFunc) {
 	cmd, err := a.app.Parse(os.Args[1:])
 	if err != nil {
-		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "error parsing commandline arguments: %v", os.Args))
 		a.app.Usage(os.Args[1:])
+		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "error parsing commandline arguments: %v", os.Args))
 		os.Exit(2)
 	}
 	return cmd, a.setups[cmd]
 }
 
-func (a *App) Command(cmd string, help string) AppClause {
+func (a *App) Command(cmd, help string) AppClause {
 	c := a.app.Command(cmd, help)
 	return &appClause{
 		c:          c,
@@ -129,7 +129,7 @@ type appClause struct {
 	prefix string
 }
 
-func (a *appClause) Command(cmd string, help string) AppClause {
+func (a *appClause) Command(cmd, help string) AppClause {
 	c := a.c.Command(cmd, help)
 	return &appClause{
 		c:          c,

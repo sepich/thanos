@@ -19,8 +19,10 @@ import (
 	"github.com/pkg/errors"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
+	thanoscache "github.com/thanos-io/thanos/pkg/cache"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/store/cache/cachekey"
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
@@ -125,9 +127,12 @@ func TestChunksCaching(t *testing.T) {
 			expectedCachedBytes:  7 * subrangeSize,
 			init: func() {
 				// Delete first 3 subranges.
-				delete(cache.cache, cachingKeyObjectSubrange(name, 0*subrangeSize, 1*subrangeSize))
-				delete(cache.cache, cachingKeyObjectSubrange(name, 1*subrangeSize, 2*subrangeSize))
-				delete(cache.cache, cachingKeyObjectSubrange(name, 2*subrangeSize, 3*subrangeSize))
+				objectSubrange := cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: 0 * subrangeSize, End: 1 * subrangeSize}
+				delete(cache.cache, objectSubrange.String())
+				objectSubrange = cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: 1 * subrangeSize, End: 2 * subrangeSize}
+				delete(cache.cache, objectSubrange.String())
+				objectSubrange = cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: 2 * subrangeSize, End: 3 * subrangeSize}
+				delete(cache.cache, objectSubrange.String())
 			},
 		},
 
@@ -140,9 +145,12 @@ func TestChunksCaching(t *testing.T) {
 			expectedCachedBytes:  7 * subrangeSize,
 			init: func() {
 				// Delete last 3 subranges.
-				delete(cache.cache, cachingKeyObjectSubrange(name, 7*subrangeSize, 8*subrangeSize))
-				delete(cache.cache, cachingKeyObjectSubrange(name, 8*subrangeSize, 9*subrangeSize))
-				delete(cache.cache, cachingKeyObjectSubrange(name, 9*subrangeSize, 10*subrangeSize))
+				objectSubrange := cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: 7 * subrangeSize, End: 8 * subrangeSize}
+				delete(cache.cache, objectSubrange.String())
+				objectSubrange = cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: 8 * subrangeSize, End: 9 * subrangeSize}
+				delete(cache.cache, objectSubrange.String())
+				objectSubrange = cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: 9 * subrangeSize, End: 10 * subrangeSize}
+				delete(cache.cache, objectSubrange.String())
 			},
 		},
 
@@ -155,9 +163,12 @@ func TestChunksCaching(t *testing.T) {
 			expectedCachedBytes:  7 * subrangeSize,
 			init: func() {
 				// Delete 3 subranges in the middle.
-				delete(cache.cache, cachingKeyObjectSubrange(name, 3*subrangeSize, 4*subrangeSize))
-				delete(cache.cache, cachingKeyObjectSubrange(name, 4*subrangeSize, 5*subrangeSize))
-				delete(cache.cache, cachingKeyObjectSubrange(name, 5*subrangeSize, 6*subrangeSize))
+				objectSubrange := cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: 3 * subrangeSize, End: 4 * subrangeSize}
+				delete(cache.cache, objectSubrange.String())
+				objectSubrange = cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: 4 * subrangeSize, End: 5 * subrangeSize}
+				delete(cache.cache, objectSubrange.String())
+				objectSubrange = cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: 5 * subrangeSize, End: 6 * subrangeSize}
+				delete(cache.cache, objectSubrange.String())
 			},
 		},
 
@@ -174,7 +185,8 @@ func TestChunksCaching(t *testing.T) {
 					if i > 0 && i%3 == 0 {
 						continue
 					}
-					delete(cache.cache, cachingKeyObjectSubrange(name, i*subrangeSize, (i+1)*subrangeSize))
+					objectSubrange := cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: i * subrangeSize, End: (i + 1) * subrangeSize}
+					delete(cache.cache, objectSubrange.String())
 				}
 			},
 		},
@@ -194,7 +206,8 @@ func TestChunksCaching(t *testing.T) {
 					if i == 3 || i == 5 || i == 7 {
 						continue
 					}
-					delete(cache.cache, cachingKeyObjectSubrange(name, i*subrangeSize, (i+1)*subrangeSize))
+					objectSubrange := cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: i * subrangeSize, End: (i + 1) * subrangeSize}
+					delete(cache.cache, objectSubrange.String())
 				}
 			},
 		},
@@ -213,7 +226,8 @@ func TestChunksCaching(t *testing.T) {
 					if i == 5 || i == 6 || i == 7 {
 						continue
 					}
-					delete(cache.cache, cachingKeyObjectSubrange(name, i*subrangeSize, (i+1)*subrangeSize))
+					objectSubrange := cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: i * subrangeSize, End: (i + 1) * subrangeSize}
+					delete(cache.cache, objectSubrange.String())
 				}
 			},
 		},
@@ -223,7 +237,7 @@ func TestChunksCaching(t *testing.T) {
 				tc.init()
 			}
 
-			cfg := NewCachingBucketConfig()
+			cfg := thanoscache.NewCachingBucketConfig()
 			cfg.CacheGetRange("chunks", cache, isTSDBChunkFile, subrangeSize, time.Hour, time.Hour, tc.maxGetRangeRequests)
 
 			cachingBucket, err := NewCachingBucket(inmem, cfg, nil, nil)
@@ -237,7 +251,7 @@ func TestChunksCaching(t *testing.T) {
 	}
 }
 
-func verifyGetRange(t *testing.T, cachingBucket *CachingBucket, name string, offset, length int64, expectedLength int64) {
+func verifyGetRange(t *testing.T, cachingBucket *CachingBucket, name string, offset, length, expectedLength int64) {
 	r, err := cachingBucket.GetRange(context.Background(), name, offset, length)
 	testutil.Ok(t, err)
 
@@ -295,6 +309,10 @@ func (m *mockCache) Fetch(_ context.Context, keys []string) map[string][]byte {
 	return found
 }
 
+func (m *mockCache) Name() string {
+	return "mockCache"
+}
+
 func (m *mockCache) flush() {
 	m.cache = map[string]cacheItem{}
 }
@@ -337,7 +355,7 @@ func TestMergeRanges(t *testing.T) {
 func TestInvalidOffsetAndLength(t *testing.T) {
 	b := &testBucket{objstore.NewInMemBucket()}
 
-	cfg := NewCachingBucketConfig()
+	cfg := thanoscache.NewCachingBucketConfig()
 	cfg.CacheGetRange("chunks", newMockCache(), func(string) bool { return true }, 10000, time.Hour, time.Hour, 3)
 
 	c, err := NewCachingBucket(b, cfg, nil, nil)
@@ -381,7 +399,7 @@ func TestCachedIter(t *testing.T) {
 	cache := newMockCache()
 
 	const cfgName = "dirs"
-	cfg := NewCachingBucketConfig()
+	cfg := thanoscache.NewCachingBucketConfig()
 	cfg.CacheIter(cfgName, cache, func(string) bool { return true }, 5*time.Minute, JSONIterCodec{})
 
 	cb, err := NewCachingBucket(inmem, cfg, nil, nil)
@@ -443,7 +461,7 @@ func TestExists(t *testing.T) {
 	// We reuse cache between tests (!)
 	cache := newMockCache()
 
-	cfg := NewCachingBucketConfig()
+	cfg := thanoscache.NewCachingBucketConfig()
 	const cfgName = "test"
 	cfg.CacheExists(cfgName, cache, matchAll, 10*time.Minute, 2*time.Minute)
 
@@ -469,7 +487,7 @@ func TestExistsCachingDisabled(t *testing.T) {
 	// We reuse cache between tests (!)
 	cache := newMockCache()
 
-	cfg := NewCachingBucketConfig()
+	cfg := thanoscache.NewCachingBucketConfig()
 	const cfgName = "test"
 	cfg.CacheExists(cfgName, cache, func(string) bool { return false }, 10*time.Minute, 2*time.Minute)
 
@@ -485,7 +503,7 @@ func TestExistsCachingDisabled(t *testing.T) {
 	verifyExists(t, cb, testFilename, false, false, cfgName)
 }
 
-func verifyExists(t *testing.T, cb *CachingBucket, file string, exists bool, fromCache bool, cfgName string) {
+func verifyExists(t *testing.T, cb *CachingBucket, file string, exists, fromCache bool, cfgName string) {
 	t.Helper()
 	hitsBefore := int(promtest.ToFloat64(cb.operationHits.WithLabelValues(objstore.OpExists, cfgName)))
 	ok, err := cb.Exists(context.Background(), file)
@@ -506,7 +524,7 @@ func TestGet(t *testing.T) {
 	// We reuse cache between tests (!)
 	cache := newMockCache()
 
-	cfg := NewCachingBucketConfig()
+	cfg := thanoscache.NewCachingBucketConfig()
 	const cfgName = "metafile"
 	cfg.CacheGet(cfgName, cache, matchAll, 1024, 10*time.Minute, 10*time.Minute, 2*time.Minute)
 	cfg.CacheExists(cfgName, cache, matchAll, 10*time.Minute, 2*time.Minute)
@@ -537,7 +555,7 @@ func TestGetTooBigObject(t *testing.T) {
 	// We reuse cache between tests (!)
 	cache := newMockCache()
 
-	cfg := NewCachingBucketConfig()
+	cfg := thanoscache.NewCachingBucketConfig()
 	const cfgName = "metafile"
 	// Only allow 5 bytes to be cached.
 	cfg.CacheGet(cfgName, cache, matchAll, 5, 10*time.Minute, 10*time.Minute, 2*time.Minute)
@@ -560,7 +578,7 @@ func TestGetPartialRead(t *testing.T) {
 
 	cache := newMockCache()
 
-	cfg := NewCachingBucketConfig()
+	cfg := thanoscache.NewCachingBucketConfig()
 	const cfgName = "metafile"
 	cfg.CacheGet(cfgName, cache, matchAll, 1024, 10*time.Minute, 10*time.Minute, 2*time.Minute)
 	cfg.CacheExists(cfgName, cache, matchAll, 10*time.Minute, 2*time.Minute)
@@ -619,7 +637,7 @@ func TestAttributes(t *testing.T) {
 	// We reuse cache between tests (!)
 	cache := newMockCache()
 
-	cfg := NewCachingBucketConfig()
+	cfg := thanoscache.NewCachingBucketConfig()
 	const cfgName = "test"
 	cfg.CacheAttributes(cfgName, cache, matchAll, time.Minute)
 

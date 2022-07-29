@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,12 +17,13 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/teststorage"
+
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/testutil"
@@ -104,7 +106,7 @@ func newTest(t testing.TB, input string) (*test, error) {
 }
 
 func newTestFromFile(t testing.TB, filename string) (*test, error) {
-	content, err := ioutil.ReadFile(filename)
+	content, err := ioutil.ReadFile(filepath.Clean(filename))
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +163,7 @@ func parse(input string) (cmds []interface{}, err error) {
 	// Scan for steps line by line.
 	for i := 0; i < len(lines); i++ {
 		l := lines[i]
-		if len(l) == 0 {
+		if l == "" {
 			continue
 		}
 		var cmd interface{}
@@ -296,7 +298,7 @@ func ParseLoad(lines []string, i int) (int, *loadCmd, error) {
 	for i+1 < len(lines) {
 		i++
 		defLine := lines[i]
-		if len(defLine) == 0 {
+		if defLine == "" {
 			i--
 			break
 		}
@@ -352,7 +354,7 @@ func ParseEval(lines []string, i int) (int, *evalCmd, error) {
 	for j := 1; i+1 < len(lines); j++ {
 		i++
 		defLine := lines[i]
-		if len(defLine) == 0 {
+		if defLine == "" {
 			i--
 			break
 		}
@@ -645,7 +647,7 @@ func (i inProcessClient) LabelSets() []labels.Labels {
 	return []labels.Labels{i.extLset}
 }
 
-func (i inProcessClient) TimeRange() (mint int64, maxt int64) {
+func (i inProcessClient) TimeRange() (mint, maxt int64) {
 	r, err := i.Info(context.TODO(), &storepb.InfoRequest{})
 	testutil.Ok(i.t, err)
 	return r.MinTime, r.MaxTime

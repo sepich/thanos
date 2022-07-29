@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thanos-io/thanos/pkg/objstore/bos"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/objstore/filesystem"
 
@@ -23,7 +24,7 @@ import (
 )
 
 // IsObjStoreSkipped returns true if given provider ID is found in THANOS_TEST_OBJSTORE_SKIP array delimited by comma e.g:
-// THANOS_TEST_OBJSTORE_SKIP=GCS,S3,AZURE,SWIFT,COS,ALIYUNOSS.
+// THANOS_TEST_OBJSTORE_SKIP=GCS,S3,AZURE,SWIFT,COS,ALIYUNOSS,BOS.
 func IsObjStoreSkipped(t *testing.T, provider client.ObjProvider) bool {
 	if e, ok := os.LookupEnv("THANOS_TEST_OBJSTORE_SKIP"); ok {
 		obstores := strings.Split(e, ",")
@@ -63,6 +64,7 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 		b, err := filesystem.NewBucket(dir)
 		testutil.Ok(t, err)
 		testFn(t, b)
+		testFn(t, objstore.NewPrefixedBucket(b, "some_prefix"))
 	})
 
 	// Optional GCS.
@@ -76,6 +78,7 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 
 			// TODO(bwplotka): Add goleak when https://github.com/GoogleCloudPlatform/google-cloud-go/issues/1025 is resolved.
 			testFn(t, bkt)
+			testFn(t, objstore.NewPrefixedBucket(bkt, "some_prefix"))
 		})
 	}
 
@@ -94,6 +97,7 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 			// This needs to be investigated more.
 
 			testFn(t, bkt)
+			testFn(t, objstore.NewPrefixedBucket(bkt, "some_prefix"))
 		})
 	}
 
@@ -107,6 +111,7 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 			defer closeFn()
 
 			testFn(t, bkt)
+			testFn(t, objstore.NewPrefixedBucket(bkt, "some_prefix"))
 		})
 	}
 
@@ -120,6 +125,7 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 			defer closeFn()
 
 			testFn(t, container)
+			testFn(t, objstore.NewPrefixedBucket(container, "some_prefix"))
 		})
 	}
 
@@ -133,6 +139,7 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 			defer closeFn()
 
 			testFn(t, bkt)
+			testFn(t, objstore.NewPrefixedBucket(bkt, "some_prefix"))
 		})
 	}
 
@@ -146,6 +153,21 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 			defer closeFn()
 
 			testFn(t, bkt)
+			testFn(t, objstore.NewPrefixedBucket(bkt, "some_prefix"))
+		})
+	}
+
+	// Optional BOS.
+	if !IsObjStoreSkipped(t, client.BOS) {
+		t.Run("Baidu BOS", func(t *testing.T) {
+			bkt, closeFn, err := bos.NewTestBucket(t)
+			testutil.Ok(t, err)
+
+			t.Parallel()
+			defer closeFn()
+
+			testFn(t, bkt)
+			testFn(t, objstore.NewPrefixedBucket(bkt, "some_prefix"))
 		})
 	}
 }

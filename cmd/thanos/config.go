@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/thanos-io/thanos/pkg/extflag"
+	extflag "github.com/efficientgo/tools/extkingpin"
 
 	"github.com/prometheus/common/model"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
@@ -44,6 +44,7 @@ func (gc *grpcConfig) registerFlag(cmd extkingpin.FlagClause) *grpcConfig {
 
 type httpConfig struct {
 	bindAddress string
+	tlsConfig   string
 	gracePeriod model.Duration
 }
 
@@ -54,12 +55,17 @@ func (hc *httpConfig) registerFlag(cmd extkingpin.FlagClause) *httpConfig {
 	cmd.Flag("http-grace-period",
 		"Time to wait after an interrupt received for HTTP Server.").
 		Default("2m").SetValue(&hc.gracePeriod)
+	cmd.Flag(
+		"http.config",
+		"[EXPERIMENTAL] Path to the configuration file that can enable TLS or authentication for all HTTP endpoints.",
+	).Default("").StringVar(&hc.tlsConfig)
 	return hc
 }
 
 type prometheusConfig struct {
 	url          *url.URL
 	readyTimeout time.Duration
+	httpClient   *extflag.PathOrContent
 }
 
 func (pc *prometheusConfig) registerFlag(cmd extkingpin.FlagClause) *prometheusConfig {
@@ -69,22 +75,13 @@ func (pc *prometheusConfig) registerFlag(cmd extkingpin.FlagClause) *prometheusC
 	cmd.Flag("prometheus.ready_timeout",
 		"Maximum time to wait for the Prometheus instance to start up").
 		Default("10m").DurationVar(&pc.readyTimeout)
+	pc.httpClient = extflag.RegisterPathOrContent(
+		cmd,
+		"prometheus.http-client",
+		"YAML file or string with http client configs. see Format details : ...",
+	)
+
 	return pc
-}
-
-type connConfig struct {
-	maxIdleConns        int
-	maxIdleConnsPerHost int
-}
-
-func (cc *connConfig) registerFlag(cmd extkingpin.FlagClause) *connConfig {
-	cmd.Flag("receive.connection-pool-size",
-		"Controls the http MaxIdleConns. Default is 0, which is unlimited").
-		IntVar(&cc.maxIdleConns)
-	cmd.Flag("receive.connection-pool-size-per-host",
-		"Controls the http MaxIdleConnsPerHost").
-		Default("100").IntVar(&cc.maxIdleConnsPerHost)
-	return cc
 }
 
 type tsdbConfig struct {
@@ -181,7 +178,7 @@ type queryConfig struct {
 func (qc *queryConfig) registerFlag(cmd extkingpin.FlagClause) *queryConfig {
 	cmd.Flag("query", "Addresses of statically configured query API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect query API servers through respective DNS lookups.").
 		PlaceHolder("<query>").StringsVar(&qc.addrs)
-	qc.configPath = extflag.RegisterPathOrContent(cmd, "query.config", "YAML file that contains query API servers configuration. See format details: https://thanos.io/tip/components/rule.md/#configuration. If defined, it takes precedence over the '--query' and '--query.sd-files' flags.", false)
+	qc.configPath = extflag.RegisterPathOrContent(cmd, "query.config", "YAML file that contains query API servers configuration. See format details: https://thanos.io/tip/components/rule.md/#configuration. If defined, it takes precedence over the '--query' and '--query.sd-files' flags.", extflag.WithEnvSubstitution())
 	cmd.Flag("query.sd-files", "Path to file that contains addresses of query API servers. The path can be a glob pattern (repeatable).").
 		PlaceHolder("<path>").StringsVar(&qc.sdFiles)
 	cmd.Flag("query.sd-interval", "Refresh interval to re-read file SD files. (used as a fallback)").
@@ -202,10 +199,11 @@ type alertMgrConfig struct {
 	alertmgrsDNSSDInterval time.Duration
 	alertExcludeLabels     []string
 	alertQueryURL          *string
+	alertRelabelConfigPath *extflag.PathOrContent
 }
 
 func (ac *alertMgrConfig) registerFlag(cmd extflag.FlagClause) *alertMgrConfig {
-	ac.configPath = extflag.RegisterPathOrContent(cmd, "alertmanagers.config", "YAML file that contains alerting configuration. See format details: https://thanos.io/tip/components/rule.md/#configuration. If defined, it takes precedence over the '--alertmanagers.url' and '--alertmanagers.send-timeout' flags.", false)
+	ac.configPath = extflag.RegisterPathOrContent(cmd, "alertmanagers.config", "YAML file that contains alerting configuration. See format details: https://thanos.io/tip/components/rule.md/#configuration. If defined, it takes precedence over the '--alertmanagers.url' and '--alertmanagers.send-timeout' flags.", extflag.WithEnvSubstitution())
 	cmd.Flag("alertmanagers.url", "Alertmanager replica URLs to push firing alerts. Ruler claims success if push to at least one alertmanager from discovered succeeds. The scheme should not be empty e.g `http` might be used. The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect Alertmanager IPs through respective DNS lookups. The port defaults to 9093 or the SRV record's value. The URL path is used as a prefix for the regular Alertmanager API path.").
 		StringsVar(&ac.alertmgrURLs)
 	cmd.Flag("alertmanagers.send-timeout", "Timeout for sending alerts to Alertmanager").Default("10s").
@@ -215,5 +213,6 @@ func (ac *alertMgrConfig) registerFlag(cmd extflag.FlagClause) *alertMgrConfig {
 	ac.alertQueryURL = cmd.Flag("alert.query-url", "The external Thanos Query URL that would be set in all alerts 'Source' field").String()
 	cmd.Flag("alert.label-drop", "Labels by name to drop before sending to alertmanager. This allows alert to be deduplicated on replica label (repeated). Similar Prometheus alert relabelling").
 		StringsVar(&ac.alertExcludeLabels)
+	ac.alertRelabelConfigPath = extflag.RegisterPathOrContent(cmd, "alert.relabel-config", "YAML file that contains alert relabelling configuration.", extflag.WithEnvSubstitution())
 	return ac
 }

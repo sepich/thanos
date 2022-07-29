@@ -5,32 +5,33 @@ package receive
 
 import (
 	"context"
-	"fmt"
-	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"sync"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"go.uber.org/atomic"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/errutil"
+	"github.com/thanos-io/thanos/pkg/exemplars"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"go.uber.org/atomic"
-	"golang.org/x/sync/errgroup"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 )
+
+type GetStatsFunc func(tenantID, statsByLabelName string) *tsdb.Stats
 
 type MultiTSDB struct {
 	dataDir         string
@@ -80,9 +81,10 @@ func NewMultiTSDB(
 }
 
 type tenant struct {
-	readyS    *ReadyStorage
-	storeTSDB *store.TSDBStore
-	ship      *shipper.Shipper
+	readyS        *ReadyStorage
+	storeTSDB     *store.TSDBStore
+	exemplarsTSDB *exemplars.TSDB
+	ship          *shipper.Shipper
 
 	mtx *sync.RWMutex
 }
@@ -104,22 +106,29 @@ func (t *tenant) store() *store.TSDBStore {
 	return t.storeTSDB
 }
 
+func (t *tenant) exemplars() *exemplars.TSDB {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	return t.exemplarsTSDB
+}
+
 func (t *tenant) shipper() *shipper.Shipper {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 	return t.ship
 }
 
-func (t *tenant) set(storeTSDB *store.TSDBStore, tenantTSDB *tsdb.DB, ship *shipper.Shipper) {
+func (t *tenant) set(storeTSDB *store.TSDBStore, tenantTSDB *tsdb.DB, ship *shipper.Shipper, exemplarsTSDB *exemplars.TSDB) {
 	t.readyS.Set(tenantTSDB)
 	t.mtx.Lock()
 	t.storeTSDB = storeTSDB
 	t.ship = ship
+	t.exemplarsTSDB = exemplarsTSDB
 	t.mtx.Unlock()
 }
 
 func (t *MultiTSDB) Open() error {
-	if err := os.MkdirAll(t.dataDir, 0777); err != nil {
+	if err := os.MkdirAll(t.dataDir, 0750); err != nil {
 		return err
 	}
 
@@ -134,13 +143,9 @@ func (t *MultiTSDB) Open() error {
 		if !f.IsDir() {
 			continue
 		}
-		lset, err := t.loadExtLabels(path.Join(t.dataDir, f.Name()))
-		if err != nil {
-			level.Error(t.logger).Log("msg", err)
-		}
 
 		g.Go(func() error {
-			_, err := t.getOrLoadTenant(f.Name(), true, lset)
+			_, err := t.getOrLoadTenant(f.Name(), true)
 			return err
 		})
 	}
@@ -258,11 +263,11 @@ func (t *MultiTSDB) RemoveLockFilesIfAny() error {
 	return merr.Err()
 }
 
-func (t *MultiTSDB) TSDBStores() map[string]storepb.StoreServer {
+func (t *MultiTSDB) TSDBStores() map[string]store.InfoStoreServer {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 
-	res := make(map[string]storepb.StoreServer, len(t.tenants))
+	res := make(map[string]store.InfoStoreServer, len(t.tenants))
 	for k, tenant := range t.tenants {
 		s := tenant.store()
 		if s != nil {
@@ -272,43 +277,52 @@ func (t *MultiTSDB) TSDBStores() map[string]storepb.StoreServer {
 	return res
 }
 
-func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant, extLabels labels.Labels) error {
+func (t *MultiTSDB) TSDBExemplars() map[string]*exemplars.TSDB {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+
+	res := make(map[string]*exemplars.TSDB, len(t.tenants))
+	for k, tenant := range t.tenants {
+		e := tenant.exemplars()
+		if e != nil {
+			res[k] = e
+		}
+	}
+	return res
+}
+
+func (t *MultiTSDB) Stats(tenantID, statsByLabelName string) *tsdb.Stats {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+
+	tenant, ok := t.tenants[tenantID]
+	if !ok {
+		return nil
+	}
+
+	return tenant.readyS.get().db.Head().Stats(statsByLabelName)
+}
+
+func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant) error {
 	reg := prometheus.WrapRegistererWith(prometheus.Labels{"tenant": tenantID}, t.reg)
 	lset := labelpb.ExtendSortedLabels(t.labels, labels.FromStrings(t.tenantLabelName, tenantID))
-	lset = labelpb.ExtendSortedLabels(lset, extLabels)
 	dataDir := t.defaultTenantDataDir(tenantID)
 
-	level.Info(logger).Log("extLabels", lset, "msg", "opening TSDB")
+	level.Info(logger).Log("msg", "opening TSDB")
 	opts := *t.tsdbOpts
 	s, err := tsdb.Open(
 		dataDir,
 		logger,
 		&UnRegisterer{Registerer: reg},
 		&opts,
+		nil,
 	)
-	// check if error relates to mmap
-	if err != nil {
-		errText := fmt.Sprintf("%+v", err)
-		level.Error(t.logger).Log("msg", errText, "startTSDB", "error")
-		r := *regexp.MustCompile(`mmap files, file: ([^:]+): mmap`)
-		res := r.FindStringSubmatch(errText)
-		if len(res) > 0 {
-			level.Error(t.logger).Log("msg", fmt.Sprintf("drop mmap data: %s", res[1]))
-			_ = os.Remove(res[1])
-			_ = os.Remove(path.Join(dataDir, "lock"))
-			s, err = tsdb.Open(dataDir, logger, &UnRegisterer{Registerer: reg}, &opts)
-		}
-	}
-	if err == nil {
-		err = t.saveExtLabels(dataDir, extLabels)
-	}
 	if err != nil {
 		t.mtx.Lock()
 		delete(t.tenants, tenantID)
 		t.mtx.Unlock()
 		return err
 	}
-
 	var ship *shipper.Shipper
 	if t.bucket != nil {
 		ship = shipper.New(
@@ -323,7 +337,7 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 			t.hashFunc,
 		)
 	}
-	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset), s, ship)
+	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset), s, ship, exemplars.NewTSDB(s, lset))
 	level.Info(logger).Log("msg", "TSDB is now ready")
 	return nil
 }
@@ -332,7 +346,7 @@ func (t *MultiTSDB) defaultTenantDataDir(tenantID string) string {
 	return path.Join(t.dataDir, tenantID)
 }
 
-func (t *MultiTSDB) getOrLoadTenant(tenantID string, blockingStart bool, extLabels labels.Labels) (*tenant, error) {
+func (t *MultiTSDB) getOrLoadTenant(tenantID string, blockingStart bool) (*tenant, error) {
 	// Fast path, as creating tenants is a very rare operation.
 	t.mtx.RLock()
 	tenant, exist := t.tenants[tenantID]
@@ -358,36 +372,21 @@ func (t *MultiTSDB) getOrLoadTenant(tenantID string, blockingStart bool, extLabe
 	logger := log.With(t.logger, "tenant", tenantID)
 	if !blockingStart {
 		go func() {
-			if err := t.startTSDB(logger, tenantID, tenant, extLabels); err != nil {
+			if err := t.startTSDB(logger, tenantID, tenant); err != nil {
 				level.Error(logger).Log("msg", "failed to start tsdb asynchronously", "err", err)
 			}
 		}()
 		return tenant, nil
 	}
-	return tenant, t.startTSDB(logger, tenantID, tenant, extLabels)
+	return tenant, t.startTSDB(logger, tenantID, tenant)
 }
 
-func (t *MultiTSDB) TenantAppendable(tenantID string, extLabels labels.Labels) (Appendable, error) {
-	tenant, err := t.getOrLoadTenant(tenantID, false, extLabels)
+func (t *MultiTSDB) TenantAppendable(tenantID string) (Appendable, error) {
+	tenant, err := t.getOrLoadTenant(tenantID, false)
 	if err != nil {
 		return nil, err
 	}
 	return tenant.readyStorage(), nil
-}
-
-// loadExtLabels loads thanos Labels from meta.json in tsdb dir
-func (t *MultiTSDB) loadExtLabels(dir string) (extLabels labels.Labels, err error) {
-	m, err := metadata.ReadFromDir(dir)
-	if err == nil {
-		extLabels = labelpb.ExtendSortedLabels(extLabels, labels.FromMap(m.Thanos.Labels))
-	}
-	return extLabels, err
-}
-
-// saveExtLabels saves Labels provided to dir/meta.json
-func (t *MultiTSDB) saveExtLabels(dir string, extLabels labels.Labels) error {
-	meta := metadata.Meta{Thanos: metadata.Thanos{Labels: extLabels.Map()}, BlockMeta: tsdb.BlockMeta{Version: 1}}
-	return meta.WriteToDir(t.logger, dir)
 }
 
 // ErrNotReady is returned if the underlying storage is not ready yet.
@@ -437,6 +436,14 @@ func (s *ReadyStorage) Querier(ctx context.Context, mint, maxt int64) (storage.Q
 	return nil, ErrNotReady
 }
 
+// ExemplarQuerier implements the Storage interface.
+func (s *ReadyStorage) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	if x := s.get(); x != nil {
+		return x.ExemplarQuerier(ctx)
+	}
+	return nil, ErrNotReady
+}
+
 // Appender implements the Storage interface.
 func (s *ReadyStorage) Appender(ctx context.Context) (storage.Appender, error) {
 	if x := s.get(); x != nil {
@@ -464,11 +471,11 @@ func (a adapter) StartTime() (int64, error) {
 }
 
 func (a adapter) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-	q, err := a.db.Querier(ctx, mint, maxt)
-	if err != nil {
-		return nil, err
-	}
-	return q, nil
+	return a.db.Querier(ctx, mint, maxt)
+}
+
+func (a adapter) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	return a.db.ExemplarQuerier(ctx)
 }
 
 // Appender returns a new appender against the storage.
