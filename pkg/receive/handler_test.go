@@ -196,7 +196,7 @@ func newFakeTenantAppendable(f *fakeAppendable) *fakeTenantAppendable {
 	return &fakeTenantAppendable{f: f}
 }
 
-func (t *fakeTenantAppendable) TenantAppendable(_ string) (Appendable, error) {
+func (t *fakeTenantAppendable) TenantAppendable(_ string, extLabels labels.Labels) (Appendable, error) {
 	return t.f, nil
 }
 
@@ -315,7 +315,7 @@ func newTestHandlerHashring(appendables []*fakeAppendable, replicationFactor uin
 			ReplicaHeader:     DefaultReplicaHeader,
 			ReplicationFactor: replicationFactor,
 			ForwardTimeout:    5 * time.Second,
-			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i])),
+			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i]), false, DefaultTenantLabel, []byte{}),
 		})
 		handlers = append(handlers, h)
 		h.peers = peers
@@ -412,6 +412,148 @@ func TestReceiveQuorum(t *testing.T) {
 				},
 				{
 					appender: newFakeAppender(nil, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 success with replication",
+			status:            http.StatusOK,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(nil, nil, nil),
+				},
+				{
+					appender: newFakeAppender(nil, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 commit error",
+			status:            http.StatusInternalServerError,
+			replicationFactor: 1,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 commit error with replication",
+			status:            http.StatusInternalServerError,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 appender error with replication",
+			status:            http.StatusInternalServerError,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender:    newFakeAppender(nil, nil, nil),
+					appenderErr: appenderErrFn,
+				},
+				{
+					appender:    newFakeAppender(nil, nil, nil),
+					appenderErr: appenderErrFn,
+				},
+			},
+		},
+		{
+			name:              "size 2 conflict with replication",
+			status:            http.StatusConflict,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(conflictErrFn, nil, nil),
+				},
+				{
+					appender: newFakeAppender(conflictErrFn, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 conflict and commit error with replication",
+			status:            http.StatusConflict,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
+				},
+				{
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 with replication and one faulty",
+			status:            http.StatusOK,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
+				},
+				{
+					appender: newFakeAppender(nil, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 with replication and one commit error",
+			status:            http.StatusOK,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+				{
+					appender: newFakeAppender(nil, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 with replication and two conflicts",
+			status:            http.StatusConflict,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
+				},
+				{
+					appender: newFakeAppender(conflictErrFn, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 with replication one conflict and one commit error",
+			status:            http.StatusConflict,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
+				},
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -626,10 +768,12 @@ func TestReceiveQuorum(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			handlers, hashring := newTestHandlerHashring(tc.appendables, tc.replicationFactor)
 			tenant := "test"
+			var quorum int
 			// Test from the point of view of every node
 			// so that we know status code does not depend
 			// on which node is erroring and which node is receiving.
 			for i, handler := range handlers {
+				quorum = handler.writeQuorum()
 				// Test that the correct status is returned.
 				rec, err := makeRequest(handler, tenant, tc.wreq)
 				if err != nil {
@@ -656,7 +800,7 @@ func TestReceiveQuorum(t *testing.T) {
 					if a.appenderErr == nil && endpointHit(t, hashring, tc.replicationFactor, handlers[j].options.Endpoint, tenant, &ts) {
 						// We have len(handlers) copies of each sample because the test case
 						// is run once for each handler and they all use the same appender.
-						expectedMin = int((tc.replicationFactor/2)+1) * len(ts.Samples)
+						expectedMin = quorum * len(ts.Samples)
 					}
 					if uint64(expectedMin) > got {
 						t.Errorf("handler: %d, labels %q: expected minimum of %d samples, got %d", j, lset.String(), expectedMin, got)
@@ -748,6 +892,148 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 				},
 				{
 					appender: newFakeAppender(nil, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 success with replication",
+			status:            http.StatusOK,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(nil, nil, nil),
+				},
+				{
+					appender: newFakeAppender(nil, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 commit error",
+			status:            http.StatusInternalServerError,
+			replicationFactor: 1,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 commit error with replication",
+			status:            http.StatusInternalServerError,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 appender error with replication",
+			status:            http.StatusInternalServerError,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender:    newFakeAppender(nil, nil, nil),
+					appenderErr: appenderErrFn,
+				},
+				{
+					appender:    newFakeAppender(nil, nil, nil),
+					appenderErr: appenderErrFn,
+				},
+			},
+		},
+		{
+			name:              "size 2 conflict with replication",
+			status:            http.StatusConflict,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(conflictErrFn, nil, nil),
+				},
+				{
+					appender: newFakeAppender(conflictErrFn, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 conflict and commit error with replication",
+			status:            http.StatusConflict,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
+				},
+				{
+					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 with replication and one faulty",
+			status:            http.StatusOK,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
+				},
+				{
+					appender: newFakeAppender(nil, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 with replication and one commit error",
+			status:            http.StatusOK,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
+				},
+				{
+					appender: newFakeAppender(nil, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 with replication and two conflicts",
+			status:            http.StatusConflict,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
+				},
+				{
+					appender: newFakeAppender(conflictErrFn, nil, nil),
+				},
+			},
+		},
+		{
+			name:              "size 2 with replication one conflict and one commit error",
+			status:            http.StatusConflict,
+			replicationFactor: 2,
+			wreq:              wreq1,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(cycleErrors([]error{storage.ErrOutOfBounds, storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp}), nil, nil),
+				},
+				{
+					appender: newFakeAppender(nil, commitErrFn, nil),
 				},
 			},
 		},
@@ -1009,6 +1295,33 @@ func TestReceiveWithConsistencyDelay(t *testing.T) {
 	}
 }
 
+func Test_writeQuorum(t *testing.T) {
+	for _, tcase := range []struct {
+		replicas       uint64
+		expectedQuorum int
+	}{
+		{replicas: 1, expectedQuorum: 1},
+		{replicas: 2, expectedQuorum: 1}, // issue#3194
+		{replicas: 3, expectedQuorum: 2},
+		{replicas: 4, expectedQuorum: 3},
+		{replicas: 5, expectedQuorum: 3},
+	} {
+		t.Run(fmt.Sprint(tcase.replicas), func(t *testing.T) {
+			h := NewHandler(nil, &Options{
+				TenantHeader:      DefaultTenantHeader,
+				ReplicaHeader:     DefaultReplicaHeader,
+				ReplicationFactor: tcase.replicas,
+				ForwardTimeout:    5 * time.Second,
+				Writer:            nil,
+			})
+			res := h.writeQuorum()
+			if tcase.expectedQuorum != res {
+				t.Errorf("replicationFactor: %d, expected quorum: %d, got %d", tcase.replicas, tcase.expectedQuorum, res)
+			}
+		})
+	}
+}
+
 // endpointHit is a helper to determine if a given endpoint in a hashring would be selected
 // for a given time series, tenant, and replication factor.
 func endpointHit(t *testing.T, h Hashring, rf uint64, endpoint, tenant string, timeSeries *prompb.TimeSeries) bool {
@@ -1086,8 +1399,8 @@ type tsOverrideTenantStorage struct {
 	interval int64
 }
 
-func (s *tsOverrideTenantStorage) TenantAppendable(tenant string) (Appendable, error) {
-	a, err := s.TenantStorage.TenantAppendable(tenant)
+func (s *tsOverrideTenantStorage) TenantAppendable(tenant string, extLabels labels.Labels) (Appendable, error) {
+	a, err := s.TenantStorage.TenantAppendable(tenant, extLabels)
 	return &tsOverrideAppendable{Appendable: a, interval: s.interval}, err
 }
 
@@ -1163,7 +1476,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 		metadata.NoneFunc,
 	)
 	defer func() { testutil.Ok(b, m.Close()) }()
-	handler.writer = NewWriter(logger, m)
+	handler.writer = NewWriter(logger, m, false, DefaultTenantLabel, []byte{})
 
 	testutil.Ok(b, m.Flush())
 	testutil.Ok(b, m.Open())
@@ -1225,7 +1538,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 
 			// It takes time to create new tenant, wait for it.
 			{
-				app, err := m.TenantAppendable(handler.options.DefaultTenantID)
+				app, err := m.TenantAppendable(handler.options.DefaultTenantID, labels.Labels{})
 				testutil.Ok(b, err)
 
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1252,7 +1565,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 
 			// It takes time to create new tenant, wait for it.
 			{
-				app, err := m.TenantAppendable(handler.options.DefaultTenantID)
+				app, err := m.TenantAppendable(handler.options.DefaultTenantID, labels.Labels{})
 				testutil.Ok(b, err)
 
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1668,6 +1981,235 @@ func TestRelabel(t *testing.T) {
 
 			h.relabel(&tcase.writeRequest)
 			testutil.Equals(t, tcase.expectedWriteRequest, tcase.writeRequest)
+		})
+	}
+}
+
+func TestExtractLabels(t *testing.T) {
+	wreq1 := &prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []labelpb.ZLabel{},
+				Samples: []prompb.Sample{
+					{Value: 1, Timestamp: 1},
+					{Value: 2, Timestamp: 2},
+					{Value: 3, Timestamp: 3},
+				},
+			},
+		},
+	}
+	for _, tc := range []struct {
+		name         string
+		sentLabels   []labelpb.ZLabel
+		lookupLabels labels.Labels
+		found        bool
+	}{
+		{
+			name:         "basic",
+			sentLabels:   []labelpb.ZLabel{{Name: "foo", Value: "bar"}},
+			lookupLabels: labels.Labels{{Name: "foo", Value: "bar"}},
+			found:        true,
+		},
+		{
+			name: "with ext-lables",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "site", Value: "dev"},
+				{Name: "location", Value: "dc1"},
+			},
+			lookupLabels: labels.Labels{{Name: "foo", Value: "bar"}},
+			found:        true,
+		},
+		{
+			name: "with ext-lables",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "prometheus", Value: "dev"},
+				{Name: "location", Value: "dc1"},
+			},
+			lookupLabels: labels.Labels{{Name: "location", Value: "dc1"}},
+			found:        false,
+		},
+		{
+			name: "with ext-lables",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "site", Value: "dev"},
+				{Name: "location", Value: "dc1"},
+			},
+			lookupLabels: labels.Labels{{Name: "foo", Value: "bar"}, {Name: "site", Value: "dev"}},
+			found:        false,
+		},
+		{
+			name: "with tenant-id",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "prometheus", Value: "dev"},
+				{Name: "baz", Value: "b1"},
+			},
+			lookupLabels: labels.Labels{{Name: "foo", Value: "bar"}, {Name: "baz", Value: "b1"}},
+			found:        true,
+		},
+		{
+			name: "with tenant-id negate",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "prometheus", Value: "dev"},
+				{Name: "baz", Value: "b1"},
+			},
+			lookupLabels: labels.Labels{{Name: "prometheus", Value: "dev"}},
+			found:        false,
+		},
+		{
+			name: "extra tenant-id",
+			sentLabels: []labelpb.ZLabel{
+				{Name: "foo", Value: "bar"},
+				{Name: "prometheus", Value: "extra"},
+				{Name: "location", Value: "dc1"},
+			},
+			lookupLabels: labels.Labels{{Name: "foo", Value: "bar"}, {Name: "location", Value: "dc1"}},
+			found:        true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tenant := "test"
+			cfg := []HashringConfig{{Hashring: "test"}}
+			appender := fakeAppendable{appender: newFakeAppender(nil, nil, nil)}
+			peers := &peerGroup{
+				dialOpts: nil,
+				m:        sync.RWMutex{},
+				cache:    map[string]storepb.WriteableStoreClient{},
+				dialer: func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error) {
+					return nil, errors.New("unexpected dial called in testing")
+				},
+			}
+			h := NewHandler(nil, &Options{
+				TenantHeader:      DefaultTenantHeader,
+				ReplicaHeader:     DefaultReplicaHeader,
+				ReplicationFactor: 1,
+				ForwardTimeout:    5 * time.Second,
+				Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(&appender), true, "prometheus", []byte("defaultExternalLabels: [site, location]\ntenantExternalLabels: {extra: [site]}")),
+			})
+			h.peers = peers
+			addr := randomAddr()
+			h.options.Endpoint = addr
+			peers.cache[addr] = &fakeRemoteWriteGRPCServer{h: h}
+			cfg[0].Endpoints = append(cfg[0].Endpoints, h.options.Endpoint)
+			hashring := newMultiHashring(AlgorithmHashmod, cfg)
+			h.Hashring(hashring)
+			wreq1.Timeseries[0].Labels = tc.sentLabels
+
+			rec, err := makeRequest(h, tenant, wreq1)
+			if err != nil {
+				t.Fatalf("handler unexpectedly failed making HTTP request: %v", err)
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("handler got unexpected HTTP status code: %d; body: %s", rec.Code, rec.Body.String())
+			}
+
+			n := appender.appender.(*fakeAppender).Get(tc.lookupLabels)
+			if len(n) == 3 != tc.found {
+				t.Errorf("Labels: %v found: %v, expected: %v", tc.lookupLabels, len(n) == 3, tc.found)
+			}
+
+			// test empty request
+			rec, err = makeRequest(h, tenant, &prompb.WriteRequest{})
+			if err != nil {
+				t.Fatalf("handler failed with empty request: %v", err)
+			}
+		})
+	}
+}
+
+func TestTenantPrefix(t *testing.T) {
+	wreq1 := &prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []labelpb.ZLabel{{Name: "foo", Value: "bar"}},
+				Samples: []prompb.Sample{
+					{Value: 1, Timestamp: 1},
+					{Value: 2, Timestamp: 2},
+					{Value: 3, Timestamp: 3},
+				},
+			},
+		},
+	}
+	for _, tc := range []struct {
+		name              string
+		extractLabelsYaml string
+		headerUser        string
+		status            int
+	}{
+		{
+			name:              "no extract",
+			extractLabelsYaml: "",
+			headerUser:        "",
+			status:            http.StatusOK,
+		},
+		{
+			name:              "no prefix configured",
+			extractLabelsYaml: "defaultExternalLabels: [site]",
+			headerUser:        "foo",
+			status:            http.StatusOK,
+		},
+		{
+			name:              "prefix allow",
+			extractLabelsYaml: "tenantLabelPrefixes: {foo: ba}",
+			headerUser:        "foo",
+			status:            http.StatusOK,
+		},
+		{
+			name:              "full label allow",
+			extractLabelsYaml: "tenantLabelPrefixes: {foo: bar}",
+			headerUser:        "foo",
+			status:            http.StatusOK,
+		},
+		{
+			name:              "prefix deny",
+			extractLabelsYaml: "tenantLabelPrefixes: {foo: barr}",
+			headerUser:        "foo",
+			status:            http.StatusForbidden,
+		},
+		{
+			name:              "empty header",
+			extractLabelsYaml: "tenantLabelPrefixes: {foo: barr}",
+			headerUser:        "",
+			status:            http.StatusOK,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := []HashringConfig{{Hashring: "test"}}
+			appender := fakeAppendable{appender: newFakeAppender(nil, nil, nil)}
+			peers := &peerGroup{
+				dialOpts: nil,
+				m:        sync.RWMutex{},
+				cache:    map[string]storepb.WriteableStoreClient{},
+				dialer: func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error) {
+					return nil, errors.New("unexpected dial called in testing")
+				},
+			}
+			h := NewHandler(nil, &Options{
+				TenantHeader:      "X-Forwarded-User", // used in makeRequest
+				ReplicaHeader:     DefaultReplicaHeader,
+				ReplicationFactor: 1,
+				ForwardTimeout:    5 * time.Second,
+				Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(&appender), true, "foo", []byte(tc.extractLabelsYaml)),
+			})
+			h.peers = peers
+			addr := randomAddr()
+			h.options.Endpoint = addr
+			peers.cache[addr] = &fakeRemoteWriteGRPCServer{h: h}
+			cfg[0].Endpoints = append(cfg[0].Endpoints, h.options.Endpoint)
+			hashring := newMultiHashring(AlgorithmHashmod, cfg)
+			h.Hashring(hashring)
+
+			rec, err := makeRequest(h, tc.headerUser, wreq1)
+			if err != nil {
+				t.Fatalf("handler unexpectedly failed making HTTP request: %v", err)
+			}
+			if rec.Code != tc.status {
+				t.Fatalf("handler got HTTP status code: %d; expect: %d", rec.Code, tc.status)
+			}
 		})
 	}
 }

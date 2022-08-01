@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -334,22 +335,6 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	span, ctx := tracing.StartSpan(r.Context(), "receive_http")
 	defer span.Finish()
 
-	tenant := r.Header.Get(h.options.TenantHeader)
-	if tenant == "" {
-		tenant = h.options.DefaultTenantID
-	}
-
-	if h.options.TenantField != "" {
-		tenant, err = h.getTenantFromCertificate(r)
-		if err != nil {
-			// This must hard fail to ensure hard tenancy when feature is enabled.
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-	}
-
-	tLogger := log.With(h.logger, "tenant", tenant)
-
 	// ioutil.ReadAll dynamically adjust the byte slice for read data, starting from 512B.
 	// Since this is receive hot path, grow upfront saving allocations and CPU time.
 	compressed := bytes.Buffer{}
@@ -366,7 +351,7 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	reqBuf, err := s2.Decode(nil, compressed.Bytes())
 	if err != nil {
-		level.Error(tLogger).Log("msg", "snappy decode error", "err", err)
+		level.Error(h.logger).Log("msg", "snappy decode error", "err", err)
 		http.Error(w, errors.Wrap(err, "snappy decode error").Error(), http.StatusBadRequest)
 		return
 	}
@@ -395,12 +380,46 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 		// TODO(yeya24): Handle remote write metadata.
 		if len(wreq.Metadata) > 0 {
 			// TODO(bwplotka): Do we need this error message?
-			level.Debug(tLogger).Log("msg", "only metadata from client; metadata ingestion not supported; skipping")
+			level.Debug(h.logger).Log("msg", "only metadata from client; metadata ingestion not supported; skipping")
 			return
 		}
-		level.Debug(tLogger).Log("msg", "empty remote write request; client bug or newer remote write protocol used?; skipping")
+		level.Debug(h.logger).Log("msg", "empty remote write request; client bug or newer remote write protocol used?; skipping")
 		return
 	}
+
+	var tenant string
+	if h.options.Writer.tenantExtract {
+		labelpb.ReAllocZLabelsStrings(&wreq.Timeseries[0].Labels)
+		// All metrics from same src should have same external_labels
+		for _, l := range wreq.Timeseries[0].Labels {
+			if l.Name == h.options.Writer.tenantLabelName {
+				tenant = l.Value
+				break
+			}
+		}
+		u := r.Header.Get("X-Forwarded-User")
+		if prefix, ok := h.options.Writer.extractorConfig.TenantLabelPrefixes[u]; ok {
+			if !strings.HasPrefix(tenant, prefix) {
+				level.Debug(h.logger).Log("msg", "tenant label value has wrong prefix", "tenant", tenant, "prefix", prefix)
+				http.Error(w, "Wrong tenant label value", http.StatusForbidden)
+				return
+			}
+		}
+	} else if h.options.TenantField != "" {
+		tenant, err = h.getTenantFromCertificate(r)
+		if err != nil {
+			// This must hard fail to ensure hard tenancy when feature is enabled.
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else {
+		tenant = r.Header.Get(h.options.TenantHeader)
+	}
+	if tenant == "" {
+		tenant = h.options.DefaultTenantID
+	}
+
+	tLogger := log.With(h.logger, "tenant", tenant)
 
 	// Apply relabeling configs.
 	h.relabel(&wreq)
@@ -481,6 +500,10 @@ func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *p
 
 // writeQuorum returns minimum number of replicas that has to confirm write success before claiming replication success.
 func (h *Handler) writeQuorum() int {
+	// special case for 2 replicas: to be available when one replica down (#3194)
+	if h.options.ReplicationFactor == 2 {
+		return 1
+	}
 	return int((h.options.ReplicationFactor / 2) + 1)
 }
 

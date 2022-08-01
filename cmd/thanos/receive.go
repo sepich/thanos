@@ -185,6 +185,12 @@ func runReceive(
 		return errors.Wrap(err, "parse relabel configuration")
 	}
 
+	extractLabelsYaml, err := conf.extractLabels.Content()
+	if err != nil {
+		return err
+	}
+	tenantExtract := len(extractLabelsYaml) > 0
+
 	dbs := receive.NewMultiTSDB(
 		conf.dataDir,
 		logger,
@@ -196,7 +202,7 @@ func runReceive(
 		conf.allowOutOfOrderUpload,
 		hashFunc,
 	)
-	writer := receive.NewWriter(log.With(logger, "component", "receive-writer"), dbs)
+	writer := receive.NewWriter(log.With(logger, "component", "receive-writer"), dbs, tenantExtract, conf.tenantLabelName, extractLabelsYaml)
 	webHandler := receive.NewHandler(log.With(logger, "component", "receive-handler"), &receive.Options{
 		Writer:            writer,
 		ListenAddress:     conf.rwAddress,
@@ -728,6 +734,7 @@ type receiveConfig struct {
 	tenantHeader      string
 	tenantField       string
 	tenantLabelName   string
+	extractLabels     *extflag.PathOrContent
 	defaultTenantID   string
 	replicaHeader     string
 	replicationFactor uint64
@@ -801,6 +808,7 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("receive.default-tenant-id", "Default tenant ID to use when none is provided via a header.").Default(receive.DefaultTenant).StringVar(&rc.defaultTenantID)
 
 	cmd.Flag("receive.tenant-label-name", "Label name through which the tenant will be announced.").Default(receive.DefaultTenantLabel).StringVar(&rc.tenantLabelName)
+	rc.extractLabels = extkingpin.RegisterExtractLabelsFlags(cmd)
 
 	cmd.Flag("receive.replica-header", "HTTP header specifying the replica number of a write request.").Default(receive.DefaultReplicaHeader).StringVar(&rc.replicaHeader)
 

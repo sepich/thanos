@@ -10,6 +10,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 
@@ -24,18 +25,24 @@ type Appendable interface {
 }
 
 type TenantStorage interface {
-	TenantAppendable(string) (Appendable, error)
+	TenantAppendable(string, labels.Labels) (Appendable, error)
 }
 
 type Writer struct {
-	logger    log.Logger
-	multiTSDB TenantStorage
+	logger          log.Logger
+	multiTSDB       TenantStorage
+	tenantExtract   bool
+	tenantLabelName string
+	extractorConfig ExtractorConfig
 }
 
-func NewWriter(logger log.Logger, multiTSDB TenantStorage) *Writer {
+func NewWriter(logger log.Logger, multiTSDB TenantStorage, tenantExtract bool, tenantLabelName string, extractLabelsYaml []byte) *Writer {
 	return &Writer{
-		logger:    logger,
-		multiTSDB: multiTSDB,
+		logger:          logger,
+		multiTSDB:       multiTSDB,
+		tenantExtract:   tenantExtract,
+		tenantLabelName: tenantLabelName,
+		extractorConfig: ParseExtractorConfig(extractLabelsYaml, logger),
 	}
 }
 
@@ -51,7 +58,13 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		numExemplarsLabelLength = 0
 	)
 
-	s, err := r.multiTSDB.TenantAppendable(tenantID)
+	eset := r.extractorConfig.DefaultExternalLabels
+	if _, ok := r.extractorConfig.TenantExternalLabels[tenantID]; ok {
+		eset = r.extractorConfig.TenantExternalLabels[tenantID]
+	}
+	extLabels := getExtLabels(wreq.Timeseries[0].Labels, eset)
+
+	s, err := r.multiTSDB.TenantAppendable(tenantID, extLabels)
 	if err != nil {
 		return errors.Wrap(err, "get tenant appendable")
 	}
@@ -70,7 +83,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		errs errutil.MultiError
 	)
 	for _, t := range wreq.Timeseries {
-		lset := labelpb.ZLabelsToPromLabels(t.Labels)
+		lset := filterLabels(r, t, eset)
 
 		// Check if the TSDB has cached reference for those labels.
 		ref, lset = getRef.GetRef(lset)
@@ -78,7 +91,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 			// If not, copy labels, as TSDB will hold those strings long term. Given no
 			// copy unmarshal we don't want to keep memory for whole protobuf, only for labels.
 			labelpb.ReAllocZLabelsStrings(&t.Labels)
-			lset = labelpb.ZLabelsToPromLabels(t.Labels)
+			lset = filterLabels(r, t, eset)
 		}
 
 		// Append as many valid samples as possible, but keep track of the errors.
@@ -134,7 +147,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		errs.Add(errors.Wrapf(storage.ErrOutOfOrderSample, "add %d samples", numOutOfOrder))
 	}
 	if numDuplicates > 0 {
-		level.Warn(tLogger).Log("msg", "Error on ingesting samples with different value but same timestamp", "numDropped", numDuplicates)
+		level.Debug(tLogger).Log("msg", "Error on ingesting samples with different value but same timestamp", "numDropped", numDuplicates)
 		errs.Add(errors.Wrapf(storage.ErrDuplicateSampleForTimestamp, "add %d samples", numDuplicates))
 	}
 	if numOutOfBounds > 0 {

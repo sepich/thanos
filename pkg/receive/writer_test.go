@@ -149,7 +149,7 @@ func TestWriter(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			app, err := m.TenantAppendable(DefaultTenant)
+			app, err := m.TenantAppendable(DefaultTenant, labels.Labels{})
 			testutil.Ok(t, err)
 
 			testutil.Ok(t, runutil.Retry(1*time.Second, ctx.Done(), func() error {
@@ -157,7 +157,7 @@ func TestWriter(t *testing.T) {
 				return err
 			}))
 
-			w := NewWriter(logger, m)
+			w := NewWriter(logger, m, false, "", []byte{})
 
 			for idx, req := range testData.reqs {
 				err = w.Write(context.Background(), DefaultTenant, req)
