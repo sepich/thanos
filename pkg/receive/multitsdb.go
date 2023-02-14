@@ -209,8 +209,12 @@ func (t *MultiTSDB) Open() error {
 			continue
 		}
 
+		lset, err := t.loadExtLabels(path.Join(t.dataDir, f.Name()))
+		if err != nil {
+			level.Error(t.logger).Log("msg", err)
+		}
 		g.Go(func() error {
-			_, err := t.getOrLoadTenant(f.Name(), true)
+			_, err := t.getOrLoadTenant(f.Name(), true, lset)
 			return err
 		})
 	}
@@ -500,14 +504,15 @@ func (t *MultiTSDB) TenantStats(statsByLabelName string, tenantIDs ...string) []
 	return result
 }
 
-func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant) error {
+func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant, extLabels labels.Labels) error {
 	reg := prometheus.WrapRegistererWith(prometheus.Labels{"tenant": tenantID}, t.reg)
 	reg = NewUnRegisterer(reg)
 
 	lset := labelpb.ExtendSortedLabels(t.labels, labels.FromStrings(t.tenantLabelName, tenantID))
+	lset = labelpb.ExtendSortedLabels(lset, extLabels)
 	dataDir := t.defaultTenantDataDir(tenantID)
 
-	level.Info(logger).Log("msg", "opening TSDB")
+	level.Info(logger).Log("extLabels", lset, "msg", "opening TSDB")
 	opts := *t.tsdbOpts
 	s, err := tsdb.Open(
 		dataDir,
@@ -516,12 +521,17 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 		&opts,
 		nil,
 	)
+
+	if err == nil {
+		err = t.saveExtLabels(dataDir, extLabels)
+	}
 	if err != nil {
 		t.mtx.Lock()
 		delete(t.tenants, tenantID)
 		t.mtx.Unlock()
 		return err
 	}
+
 	var ship *shipper.Shipper
 	if t.bucket != nil {
 		ship = shipper.New(
@@ -545,7 +555,7 @@ func (t *MultiTSDB) defaultTenantDataDir(tenantID string) string {
 	return path.Join(t.dataDir, tenantID)
 }
 
-func (t *MultiTSDB) getOrLoadTenant(tenantID string, blockingStart bool) (*tenant, error) {
+func (t *MultiTSDB) getOrLoadTenant(tenantID string, blockingStart bool, extLabels labels.Labels) (*tenant, error) {
 	// Fast path, as creating tenants is a very rare operation.
 	t.mtx.RLock()
 	tenant, exist := t.tenants[tenantID]
@@ -571,21 +581,37 @@ func (t *MultiTSDB) getOrLoadTenant(tenantID string, blockingStart bool) (*tenan
 	logger := log.With(t.logger, "tenant", tenantID)
 	if !blockingStart {
 		go func() {
-			if err := t.startTSDB(logger, tenantID, tenant); err != nil {
+			if err := t.startTSDB(logger, tenantID, tenant, extLabels); err != nil {
 				level.Error(logger).Log("msg", "failed to start tsdb asynchronously", "err", err)
 			}
 		}()
 		return tenant, nil
 	}
-	return tenant, t.startTSDB(logger, tenantID, tenant)
+	return tenant, t.startTSDB(logger, tenantID, tenant, extLabels)
 }
 
-func (t *MultiTSDB) TenantAppendable(tenantID string) (Appendable, error) {
-	tenant, err := t.getOrLoadTenant(tenantID, false)
+func (t *MultiTSDB) TenantAppendable(tenantID string, extLabels labels.Labels) (Appendable, error) {
+	tenant, err := t.getOrLoadTenant(tenantID, false, extLabels)
 	if err != nil {
 		return nil, err
 	}
 	return tenant.readyStorage(), nil
+}
+
+// loadExtLabels loads thanos Labels from meta.json in tsdb dir
+func (t *MultiTSDB) loadExtLabels(dir string) (extLabels labels.Labels, err error) {
+	m, err := metadata.ReadFromDir(dir)
+	if err == nil {
+		// TODO: why not just return m.Labels?
+		extLabels = labelpb.ExtendSortedLabels(extLabels, labels.FromMap(m.Thanos.Labels))
+	}
+	return extLabels, err
+}
+
+// saveExtLabels saves Labels provided to dir/meta.json
+func (t *MultiTSDB) saveExtLabels(dir string, extLabels labels.Labels) error {
+	meta := metadata.Meta{Thanos: metadata.Thanos{Labels: extLabels.Map()}, BlockMeta: tsdb.BlockMeta{Version: 1}}
+	return meta.WriteToDir(t.logger, dir)
 }
 
 // ErrNotReady is returned if the underlying storage is not ready yet.

@@ -56,7 +56,7 @@ func TestMultiTSDB(t *testing.T) {
 		testutil.Ok(t, m.Flush())
 		testutil.Ok(t, m.Open())
 
-		app, err := m.TenantAppendable("foo")
+		app, err := m.TenantAppendable("foo", labels.Labels{})
 		testutil.Ok(t, err)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -85,17 +85,17 @@ func TestMultiTSDB(t *testing.T) {
 		testutil.Ok(t, a.Commit())
 
 		// Check if not leaking.
-		_, err = m.TenantAppendable("foo")
+		_, err = m.TenantAppendable("foo", labels.Labels{})
 		testutil.Ok(t, err)
-		_, err = m.TenantAppendable("foo")
+		_, err = m.TenantAppendable("foo", labels.Labels{})
 		testutil.Ok(t, err)
-		_, err = m.TenantAppendable("foo")
+		_, err = m.TenantAppendable("foo", labels.Labels{})
 		testutil.Ok(t, err)
 
 		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		app, err = m.TenantAppendable("bar")
+		app, err = m.TenantAppendable("bar", labels.Labels{})
 		testutil.Ok(t, err)
 
 		testutil.Ok(t, runutil.Retry(1*time.Second, ctx.Done(), func() error {
@@ -141,7 +141,7 @@ func TestMultiTSDB(t *testing.T) {
 		testutil.Ok(t, m.Open())
 
 		// Get appender just for test.
-		app, err := m.TenantAppendable("foo")
+		app, err := m.TenantAppendable("foo", labels.Labels{})
 		testutil.Ok(t, err)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -153,11 +153,11 @@ func TestMultiTSDB(t *testing.T) {
 		}))
 
 		// Check if not leaking.
-		_, err = m.TenantAppendable("foo")
+		_, err = m.TenantAppendable("foo", labels.Labels{})
 		testutil.Ok(t, err)
-		_, err = m.TenantAppendable("foo")
+		_, err = m.TenantAppendable("foo", labels.Labels{})
 		testutil.Ok(t, err)
-		_, err = m.TenantAppendable("foo")
+		_, err = m.TenantAppendable("foo", labels.Labels{})
 		testutil.Ok(t, err)
 
 		testMulitTSDBSeries(t, m)
@@ -541,7 +541,7 @@ func TestMultiTSDBWithNilStore(t *testing.T) {
 	defer func() { testutil.Ok(t, m.Close()) }()
 
 	const tenantID = "test-tenant"
-	_, err := m.TenantAppendable(tenantID)
+	_, err := m.TenantAppendable(tenantID, nil)
 	testutil.Ok(t, err)
 
 	// Get LabelSets of newly created TSDB.
@@ -559,7 +559,7 @@ func appendSample(m *MultiTSDB, tenant string, timestamp time.Time) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	app, err := m.TenantAppendable(tenant)
+	app, err := m.TenantAppendable(tenant, nil)
 	if err != nil {
 		return err
 	}
@@ -599,7 +599,7 @@ func BenchmarkMultiTSDB(b *testing.B) {
 	testutil.Ok(b, m.Flush())
 	testutil.Ok(b, m.Open())
 
-	app, err := m.TenantAppendable("foo")
+	app, err := m.TenantAppendable("foo", labels.Labels{})
 	testutil.Ok(b, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

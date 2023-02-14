@@ -150,3 +150,12 @@ func RegisterSelectorRelabelFlags(cmd FlagClause) *extflag.PathOrContent {
 		extflag.WithEnvSubstitution(),
 	)
 }
+
+func RegisterExtractLabelsFlags(cmd FlagClause) *extflag.PathOrContent {
+	return extflag.RegisterPathOrContent(
+		cmd,
+		"receive.extract-labels-config",
+		"YAML config for external_labels extraction from received metrics. Also enables tenant extraction from label set in receive.tenant-label-name",
+		extflag.WithEnvSubstitution(),
+	)
+}

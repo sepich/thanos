@@ -15,6 +15,7 @@ import (
 	"path"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -536,6 +537,25 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.options.Writer.tenantExtract {
+		labelpb.ReAllocZLabelsStrings(&wreq.Timeseries[0].Labels, false)
+		// All metrics from same src should have same external_labels
+		for _, l := range wreq.Timeseries[0].Labels {
+			if l.Name == h.options.Writer.tenantLabelName {
+				tenant = l.Value
+				break
+			}
+		}
+		u := r.Header.Get("X-Forwarded-User")
+		if prefix, ok := h.options.Writer.extractorConfig.TenantLabelPrefixes[u]; ok {
+			if !strings.HasPrefix(tenant, prefix) {
+				level.Debug(h.logger).Log("msg", "tenant label value has wrong prefix", "tenant", tenant, "prefix", prefix)
+				http.Error(w, "Wrong tenant label value", http.StatusForbidden)
+				return
+			}
+		}
+	}
+
 	// Apply relabeling configs.
 	h.relabel(&wreq)
 	if len(wreq.Timeseries) == 0 {
@@ -622,6 +642,10 @@ func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *p
 
 // writeQuorum returns minimum number of replicas that has to confirm write success before claiming replication success.
 func (h *Handler) writeQuorum() int {
+	// special case for 2 replicas: to be available when one replica down (#3194)
+	if h.options.ReplicationFactor == 2 {
+		return 1
+	}
 	return int((h.options.ReplicationFactor / 2) + 1)
 }
 

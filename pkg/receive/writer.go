@@ -10,6 +10,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 
@@ -24,20 +25,26 @@ type Appendable interface {
 }
 
 type TenantStorage interface {
-	TenantAppendable(string) (Appendable, error)
+	TenantAppendable(string, labels.Labels) (Appendable, error)
 }
 
 type Writer struct {
-	logger    log.Logger
-	multiTSDB TenantStorage
-	intern    bool
+	logger          log.Logger
+	multiTSDB       TenantStorage
+	intern          bool
+	tenantExtract   bool
+	tenantLabelName string
+	extractorConfig ExtractorConfig
 }
 
-func NewWriter(logger log.Logger, multiTSDB TenantStorage, intern bool) *Writer {
+func NewWriter(logger log.Logger, multiTSDB TenantStorage, intern bool, tenantExtract bool, tenantLabelName string, extractLabelsYaml []byte) *Writer {
 	return &Writer{
-		logger:    logger,
-		multiTSDB: multiTSDB,
-		intern:    intern,
+		logger:          logger,
+		multiTSDB:       multiTSDB,
+		intern:          intern,
+		tenantExtract:   tenantExtract,
+		tenantLabelName: tenantLabelName,
+		extractorConfig: ParseExtractorConfig(extractLabelsYaml, logger),
 	}
 }
 
@@ -59,7 +66,13 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		numExemplarsLabelLength = 0
 	)
 
-	s, err := r.multiTSDB.TenantAppendable(tenantID)
+	eset := r.extractorConfig.DefaultExternalLabels
+	if _, ok := r.extractorConfig.TenantExternalLabels[tenantID]; ok {
+		eset = r.extractorConfig.TenantExternalLabels[tenantID]
+	}
+	extLabels := getExtLabels(wreq.Timeseries[0].Labels, eset)
+
+	s, err := r.multiTSDB.TenantAppendable(tenantID, extLabels)
 	if err != nil {
 		return errors.Wrap(err, "get tenant appendable")
 	}
@@ -99,7 +112,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 			continue
 		}
 
-		lset := labelpb.ZLabelsToPromLabels(t.Labels)
+		lset := filterLabels(r, t, eset)
 
 		// Check if the TSDB has cached reference for those labels.
 		ref, lset = getRef.GetRef(lset, lset.Hash())
@@ -107,7 +120,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 			// If not, copy labels, as TSDB will hold those strings long term. Given no
 			// copy unmarshal we don't want to keep memory for whole protobuf, only for labels.
 			labelpb.ReAllocZLabelsStrings(&t.Labels, r.intern)
-			lset = labelpb.ZLabelsToPromLabels(t.Labels)
+			lset = filterLabels(r, t, eset)
 		}
 
 		// Append as many valid samples as possible, but keep track of the errors.

@@ -291,7 +291,7 @@ func TestWriter(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			app, err := m.TenantAppendable(DefaultTenant)
+			app, err := m.TenantAppendable(DefaultTenant, labels.Labels{})
 			testutil.Ok(t, err)
 
 			testutil.Ok(t, runutil.Retry(1*time.Second, ctx.Done(), func() error {
@@ -299,7 +299,7 @@ func TestWriter(t *testing.T) {
 				return err
 			}))
 
-			w := NewWriter(logger, m, false)
+			w := NewWriter(logger, m, false, false, "", []byte{})
 
 			for idx, req := range testData.reqs {
 				err = w.Write(context.Background(), DefaultTenant, req)
@@ -380,7 +380,7 @@ func benchmarkWriter(b *testing.B, labelsNum int, seriesNum int, generateHistogr
 	testutil.Ok(b, m.Flush())
 	testutil.Ok(b, m.Open())
 
-	app, err := m.TenantAppendable("foo")
+	app, err := m.TenantAppendable("foo", nil)
 	testutil.Ok(b, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -398,7 +398,7 @@ func benchmarkWriter(b *testing.B, labelsNum int, seriesNum int, generateHistogr
 	}
 
 	b.Run("without interning", func(b *testing.B) {
-		w := NewWriter(logger, m, false)
+		w := NewWriter(logger, m, false, false, "", []byte{})
 
 		b.ReportAllocs()
 		b.ResetTimer()
@@ -409,7 +409,7 @@ func benchmarkWriter(b *testing.B, labelsNum int, seriesNum int, generateHistogr
 	})
 
 	b.Run("with interning", func(b *testing.B) {
-		w := NewWriter(logger, m, true)
+		w := NewWriter(logger, m, true, false, "", []byte{})
 
 		b.ReportAllocs()
 		b.ResetTimer()
