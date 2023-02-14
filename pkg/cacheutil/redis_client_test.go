@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func TestRedisClient(t *testing.T) {
@@ -135,4 +135,96 @@ func TestRedisClient(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateRedisConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		config     func() RedisClientConfig
+		expect_err bool // func(*testing.T, interface{}, error)
+	}{
+		{
+			name: "simpleConfig",
+			config: func() RedisClientConfig {
+				cfg := DefaultRedisClientConfig
+				cfg.Addr = "127.0.0.1:6789"
+				cfg.Username = "user"
+				cfg.Password = "1234"
+				return cfg
+			},
+			expect_err: false,
+		},
+		{
+			name: "tlsConfigDefaults",
+			config: func() RedisClientConfig {
+				cfg := DefaultRedisClientConfig
+				cfg.Addr = "127.0.0.1:6789"
+				cfg.Username = "user"
+				cfg.Password = "1234"
+				cfg.TLSEnabled = true
+				return cfg
+			},
+			expect_err: false,
+		},
+		{
+			name: "tlsClientCertConfig",
+			config: func() RedisClientConfig {
+				cfg := DefaultRedisClientConfig
+				cfg.Addr = "127.0.0.1:6789"
+				cfg.Username = "user"
+				cfg.Password = "1234"
+				cfg.TLSEnabled = true
+				cfg.TLSConfig = TLSConfig{
+					CertFile: "cert/client.pem",
+					KeyFile:  "cert/client.key",
+				}
+				return cfg
+			},
+			expect_err: false,
+		},
+		{
+			name: "tlsInvalidClientCertConfig",
+			config: func() RedisClientConfig {
+				cfg := DefaultRedisClientConfig
+				cfg.Addr = "127.0.0.1:6789"
+				cfg.Username = "user"
+				cfg.Password = "1234"
+				cfg.TLSEnabled = true
+				cfg.TLSConfig = TLSConfig{
+					CertFile: "cert/client.pem",
+				}
+				return cfg
+			},
+			expect_err: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.config()
+
+			if tt.expect_err {
+				testutil.NotOk(t, cfg.validate())
+			} else {
+				testutil.Ok(t, cfg.validate())
+			}
+		})
+	}
+
+}
+
+func TestMultipleRedisClient(t *testing.T) {
+	s, err := miniredis.Run()
+	if err != nil {
+		testutil.Ok(t, err)
+	}
+	defer s.Close()
+	cfg := DefaultRedisClientConfig
+	cfg.Addr = s.Addr()
+	logger := log.NewLogfmtLogger(os.Stderr)
+	reg := prometheus.NewRegistry()
+	_, err = NewRedisClientWithConfig(logger, "test1", cfg, reg)
+	testutil.Ok(t, err)
+	_, err = NewRedisClientWithConfig(logger, "test2", cfg, reg)
+	testutil.Ok(t, err)
 }

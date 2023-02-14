@@ -18,7 +18,7 @@ package api
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -29,9 +29,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/route"
 
+	"github.com/efficientgo/core/testutil"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/logging"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func TestRespondSuccess(t *testing.T) {
@@ -44,7 +44,7 @@ func TestRespondSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error on test request: %s", err)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	defer func() { testutil.Ok(t, resp.Body.Close()) }()
 	if err != nil {
 		t.Fatalf("Error reading response body: %s", err)
@@ -81,7 +81,7 @@ func TestRespondError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error on test request: %s", err)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	defer func() { testutil.Ok(t, resp.Body.Close()) }()
 	if err != nil {
 		t.Fatalf("Error reading response body: %s", err)

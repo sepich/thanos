@@ -8,7 +8,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -40,9 +40,10 @@ const (
 // HashringConfig represents the configuration for a hashring
 // a receive node knows about.
 type HashringConfig struct {
-	Hashring  string   `json:"hashring,omitempty"`
-	Tenants   []string `json:"tenants,omitempty"`
-	Endpoints []string `json:"endpoints"`
+	Hashring  string            `json:"hashring,omitempty"`
+	Tenants   []string          `json:"tenants,omitempty"`
+	Endpoints []string          `json:"endpoints"`
+	Algorithm HashringAlgorithm `json:"algorithm,omitempty"`
 }
 
 // ConfigWatcher is able to watch a file containing a hashring configuration
@@ -286,7 +287,7 @@ func readFile(logger log.Logger, path string) ([]byte, error) {
 		}
 	}()
 
-	return ioutil.ReadAll(fd)
+	return io.ReadAll(fd)
 }
 
 // parseConfig parses the raw configuration content and returns a HashringConfig.

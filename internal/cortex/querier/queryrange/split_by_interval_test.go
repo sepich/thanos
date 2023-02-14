@@ -87,6 +87,23 @@ func TestSplitQuery(t *testing.T) {
 		},
 		{
 			input: &PrometheusRequest{
+				Start: 60 * 60 * seconds,
+				End:   60 * 60 * seconds,
+				Step:  15 * seconds,
+				Query: "foo",
+			},
+			expected: []Request{
+				&PrometheusRequest{
+					Start: 60 * 60 * seconds,
+					End:   60 * 60 * seconds,
+					Step:  15 * seconds,
+					Query: "foo",
+				},
+			},
+			interval: day,
+		},
+		{
+			input: &PrometheusRequest{
 				Start: 0,
 				End:   60 * 60 * seconds,
 				Step:  15 * seconds,
@@ -366,7 +383,7 @@ func Test_evaluateAtModifier(t *testing.T) {
 		tt := tt
 		t.Run(tt.in, func(t *testing.T) {
 			t.Parallel()
-			out, err := evaluateAtModifierFunction(tt.in, start, end)
+			out, err := EvaluateAtModifierFunction(tt.in, start, end)
 			if tt.expectedErrorCode != 0 {
 				require.Error(t, err)
 				httpResp, ok := httpgrpc.HTTPResponseFromError(err)

@@ -234,7 +234,7 @@ func runCompact(
 	consistencyDelayMetaFilter := block.NewConsistencyDelayMetaFilter(logger, conf.consistencyDelay, extprom.WrapRegistererWithPrefix("thanos_", reg))
 	timePartitionMetaFilter := block.NewTimePartitionMetaFilter(conf.filterConf.MinTime, conf.filterConf.MaxTime)
 
-	baseMetaFetcher, err := block.NewBaseFetcher(logger, conf.blockMetaFetchConcurrency, bkt, "", extprom.WrapRegistererWithPrefix("thanos_", reg))
+	baseMetaFetcher, err := block.NewBaseFetcher(logger, conf.blockMetaFetchConcurrency, bkt, conf.dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg))
 	if err != nil {
 		return errors.Wrap(err, "create meta fetcher")
 	}
@@ -406,7 +406,6 @@ func runCompact(
 		defer cleanMtx.Unlock()
 
 		if err := sy.SyncMetas(ctx); err != nil {
-			cancel()
 			return errors.Wrap(err, "syncing metas")
 		}
 
@@ -438,7 +437,7 @@ func runCompact(
 				downsampleMetrics.downsamples.WithLabelValues(groupKey)
 				downsampleMetrics.downsampleFailures.WithLabelValues(groupKey)
 			}
-			if err := downsampleBucket(ctx, logger, downsampleMetrics, bkt, sy.Metas(), downsamplingDir, conf.downsampleConcurrency, metadata.HashFunc(conf.hashFunc)); err != nil {
+			if err := downsampleBucket(ctx, logger, downsampleMetrics, bkt, sy.Metas(), downsamplingDir, conf.downsampleConcurrency, metadata.HashFunc(conf.hashFunc), conf.acceptMalformedIndex); err != nil {
 				return errors.Wrap(err, "first pass of downsampling failed")
 			}
 
@@ -446,7 +445,7 @@ func runCompact(
 			if err := sy.SyncMetas(ctx); err != nil {
 				return errors.Wrap(err, "sync before second pass of downsampling")
 			}
-			if err := downsampleBucket(ctx, logger, downsampleMetrics, bkt, sy.Metas(), downsamplingDir, conf.downsampleConcurrency, metadata.HashFunc(conf.hashFunc)); err != nil {
+			if err := downsampleBucket(ctx, logger, downsampleMetrics, bkt, sy.Metas(), downsamplingDir, conf.downsampleConcurrency, metadata.HashFunc(conf.hashFunc), conf.acceptMalformedIndex); err != nil {
 				return errors.Wrap(err, "second pass of downsampling failed")
 			}
 			level.Info(logger).Log("msg", "downsampling iterations done")
@@ -509,34 +508,67 @@ func runCompact(
 	})
 
 	if conf.wait {
-		r := route.New()
+		if !conf.disableWeb {
+			r := route.New()
 
-		ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
+			ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
 
-		global := ui.NewBucketUI(logger, conf.webConf.externalPrefix, conf.webConf.prefixHeaderName, component)
-		global.Register(r, ins)
+			global := ui.NewBucketUI(logger, conf.webConf.externalPrefix, conf.webConf.prefixHeaderName, component)
+			global.Register(r, ins)
 
-		// Configure Request Logging for HTTP calls.
-		opts := []logging.Option{logging.WithDecider(func(_ string, _ error) logging.Decision {
-			return logging.NoLogCall
-		})}
-		logMiddleware := logging.NewHTTPServerMiddleware(logger, opts...)
-		api.Register(r.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
+			// Configure Request Logging for HTTP calls.
+			opts := []logging.Option{logging.WithDecider(func(_ string, _ error) logging.Decision {
+				return logging.NoLogCall
+			})}
+			logMiddleware := logging.NewHTTPServerMiddleware(logger, opts...)
+			api.Register(r.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
 
-		// Separate fetcher for global view.
-		// TODO(bwplotka): Allow Bucket UI to visualize the state of the block as well.
-		f := baseMetaFetcher.NewMetaFetcher(extprom.WrapRegistererWithPrefix("thanos_bucket_ui", reg), nil, "component", "globalBucketUI")
-		f.UpdateOnChange(func(blocks []metadata.Meta, err error) {
-			api.SetGlobal(blocks, err)
-		})
+			// Separate fetcher for global view.
+			// TODO(bwplotka): Allow Bucket UI to visualize the state of the block as well.
+			f := baseMetaFetcher.NewMetaFetcher(extprom.WrapRegistererWithPrefix("thanos_bucket_ui", reg), nil, "component", "globalBucketUI")
+			f.UpdateOnChange(func(blocks []metadata.Meta, err error) {
+				api.SetGlobal(blocks, err)
+			})
 
-		srv.Handle("/", r)
+			srv.Handle("/", r)
+
+			g.Add(func() error {
+				iterCtx, iterCancel := context.WithTimeout(ctx, conf.blockViewerSyncBlockTimeout)
+				_, _, _ = f.Fetch(iterCtx)
+				iterCancel()
+
+				// For /global state make sure to fetch periodically.
+				return runutil.Repeat(conf.blockViewerSyncBlockInterval, ctx.Done(), func() error {
+					return runutil.RetryWithLog(logger, time.Minute, ctx.Done(), func() error {
+						iterCtx, iterCancel := context.WithTimeout(ctx, conf.blockViewerSyncBlockTimeout)
+						defer iterCancel()
+
+						_, _, err := f.Fetch(iterCtx)
+						return err
+					})
+				})
+			}, func(error) {
+				cancel()
+			})
+		}
 
 		// Periodically remove partial blocks and blocks marked for deletion
 		// since one iteration potentially could take a long time.
 		if conf.cleanupBlocksInterval > 0 {
 			g.Add(func() error {
-				return runutil.Repeat(conf.cleanupBlocksInterval, ctx.Done(), cleanPartialMarked)
+				return runutil.Repeat(conf.cleanupBlocksInterval, ctx.Done(), func() error {
+					err := cleanPartialMarked()
+					if err != nil && compact.IsRetryError(err) {
+						// The RetryError signals that we hit an retriable error (transient error, no connection).
+						// You should alert on this being triggered too frequently.
+						level.Error(logger).Log("msg", "retriable error", "err", err)
+						compactMetrics.retried.Inc()
+
+						return nil
+					}
+
+					return err
+				})
 			}, func(error) {
 				cancel()
 			})
@@ -555,6 +587,15 @@ func runCompact(
 				return runutil.Repeat(conf.progressCalculateInterval, ctx.Done(), func() error {
 
 					if err := sy.SyncMetas(ctx); err != nil {
+						// The RetryError signals that we hit an retriable error (transient error, no connection).
+						// You should alert on this being triggered too frequently.
+						if compact.IsRetryError(err) {
+							level.Error(logger).Log("msg", "retriable error", "err", err)
+							compactMetrics.retried.Inc()
+
+							return nil
+						}
+
 						return errors.Wrapf(err, "could not sync metas")
 					}
 
@@ -593,25 +634,6 @@ func runCompact(
 				cancel()
 			})
 		}
-
-		g.Add(func() error {
-			iterCtx, iterCancel := context.WithTimeout(ctx, conf.blockViewerSyncBlockTimeout)
-			_, _, _ = f.Fetch(iterCtx)
-			iterCancel()
-
-			// For /global state make sure to fetch periodically.
-			return runutil.Repeat(conf.blockViewerSyncBlockInterval, ctx.Done(), func() error {
-				return runutil.RetryWithLog(logger, time.Minute, ctx.Done(), func() error {
-					iterCtx, iterCancel := context.WithTimeout(ctx, conf.blockViewerSyncBlockTimeout)
-					defer iterCancel()
-
-					_, _, err := f.Fetch(iterCtx)
-					return err
-				})
-			})
-		}, func(error) {
-			cancel()
-		})
 	}
 
 	level.Info(logger).Log("msg", "starting compact node")
@@ -642,6 +664,7 @@ type compactConfig struct {
 	deleteDelay                                    model.Duration
 	dedupReplicaLabels                             []string
 	selectorRelabelConf                            extflag.PathOrContent
+	disableWeb                                     bool
 	webConf                                        webConfig
 	label                                          string
 	maxBlockIndexSize                              units.Base2Bytes
@@ -657,7 +680,7 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("debug.halt-on-error", "Halt the process if a critical compaction error is detected.").
 		Hidden().Default("true").BoolVar(&cc.haltOnError)
 	cmd.Flag("debug.accept-malformed-index",
-		"Compaction index verification will ignore out of order label names.").
+		"Compaction and downsampling index verification will ignore out of order label names.").
 		Hidden().Default("false").BoolVar(&cc.acceptMalformedIndex)
 	cmd.Flag("debug.max-compaction-level", fmt.Sprintf("Maximum compaction level, default is %d: %s", compactions.maxLevel(), compactions.String())).
 		Hidden().Default(strconv.Itoa(compactions.maxLevel())).IntVar(&cc.maxCompactionLevel)
@@ -751,6 +774,8 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 		Default("0000-01-01T00:00:00Z").SetValue(&cc.filterConf.MinTime)
 	cmd.Flag("max-time", "End of time range limit to compact. Thanos Compactor will compact only blocks, which happened earlier than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("9999-12-31T23:59:59Z").SetValue(&cc.filterConf.MaxTime)
+
+	cmd.Flag("web.disable", "Disable Block Viewer UI.").Default("false").BoolVar(&cc.disableWeb)
 
 	cc.selectorRelabelConf = *extkingpin.RegisterSelectorRelabelFlags(cmd)
 

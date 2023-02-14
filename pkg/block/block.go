@@ -9,7 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -206,10 +206,10 @@ func MarkForDeletion(ctx context.Context, logger log.Logger, bkt objstore.Bucket
 
 // Delete removes directory that is meant to be block directory.
 // NOTE: Always prefer this method for deleting blocks.
-//  * We have to delete block's files in the certain order (meta.json first and deletion-mark.json last)
-//  to ensure we don't end up with malformed partial blocks. Thanos system handles well partial blocks
-//  only if they don't have meta.json. If meta.json is present Thanos assumes valid block.
-//  * This avoids deleting empty dir (whole bucket) by mistake.
+//   - We have to delete block's files in the certain order (meta.json first and deletion-mark.json last)
+//     to ensure we don't end up with malformed partial blocks. Thanos system handles well partial blocks
+//     only if they don't have meta.json. If meta.json is present Thanos assumes valid block.
+//   - This avoids deleting empty dir (whole bucket) by mistake.
 func Delete(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid.ULID) error {
 	metaFile := path.Join(id.String(), MetaFilename)
 	deletionMarkFile := path.Join(id.String(), metadata.DeletionMarkFilename)
@@ -283,7 +283,7 @@ func DownloadMeta(ctx context.Context, logger log.Logger, bkt objstore.Bucket, i
 
 	var m metadata.Meta
 
-	obj, err := ioutil.ReadAll(rc)
+	obj, err := io.ReadAll(rc)
 	if err != nil {
 		return metadata.Meta{}, errors.Wrapf(err, "read meta.json for block %s", id.String())
 	}
@@ -303,7 +303,7 @@ func IsBlockDir(path string) (id ulid.ULID, ok bool) {
 // GetSegmentFiles returns list of segment files for given block. Paths are relative to the chunks directory.
 // In case of errors, nil is returned.
 func GetSegmentFiles(blockDir string) []string {
-	files, err := ioutil.ReadDir(filepath.Join(blockDir, ChunksDirname))
+	files, err := os.ReadDir(filepath.Join(blockDir, ChunksDirname))
 	if err != nil {
 		return nil
 	}
@@ -318,14 +318,19 @@ func GetSegmentFiles(blockDir string) []string {
 
 // GatherFileStats returns metadata.File entry for files inside TSDB block (index, chunks, meta.json).
 func GatherFileStats(blockDir string, hf metadata.HashFunc, logger log.Logger) (res []metadata.File, _ error) {
-	files, err := ioutil.ReadDir(filepath.Join(blockDir, ChunksDirname))
+	files, err := os.ReadDir(filepath.Join(blockDir, ChunksDirname))
 	if err != nil {
 		return nil, errors.Wrapf(err, "read dir %v", filepath.Join(blockDir, ChunksDirname))
 	}
 	for _, f := range files {
+		fi, err := f.Info()
+		if err != nil {
+			return nil, errors.Wrapf(err, "getting file info %v", filepath.Join(ChunksDirname, f.Name()))
+		}
+
 		mf := metadata.File{
 			RelPath:   filepath.Join(ChunksDirname, f.Name()),
-			SizeBytes: f.Size(),
+			SizeBytes: fi.Size(),
 		}
 		if hf != metadata.NoneFunc && !f.IsDir() {
 			h, err := metadata.CalculateHash(filepath.Join(blockDir, ChunksDirname, f.Name()), hf, logger)
@@ -395,5 +400,55 @@ func MarkForNoCompact(ctx context.Context, logger log.Logger, bkt objstore.Bucke
 	}
 	markedForNoCompact.Inc()
 	level.Info(logger).Log("msg", "block has been marked for no compaction", "block", id)
+	return nil
+}
+
+// MarkForNoDownsample creates a file which marks block to be not downsampled.
+func MarkForNoDownsample(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid.ULID, reason metadata.NoDownsampleReason, details string, markedForNoDownsample prometheus.Counter) error {
+	m := path.Join(id.String(), metadata.NoDownsampleMarkFilename)
+	noDownsampleMarkExists, err := bkt.Exists(ctx, m)
+	if err != nil {
+		return errors.Wrapf(err, "check exists %s in bucket", m)
+	}
+	if noDownsampleMarkExists {
+		level.Warn(logger).Log("msg", "requested to mark for no deletion, but file already exists; this should not happen; investigate", "err", errors.Errorf("file %s already exists in bucket", m))
+		return nil
+	}
+	noDownsampleMark, err := json.Marshal(metadata.NoDownsampleMark{
+		ID:      id,
+		Version: metadata.NoDownsampleMarkVersion1,
+
+		NoDownsampleTime: time.Now().Unix(),
+		Reason:           reason,
+		Details:          details,
+	})
+	if err != nil {
+		return errors.Wrap(err, "json encode no downsample mark")
+	}
+
+	if err := bkt.Upload(ctx, m, bytes.NewBuffer(noDownsampleMark)); err != nil {
+		return errors.Wrapf(err, "upload file %s to bucket", m)
+	}
+	markedForNoDownsample.Inc()
+	level.Info(logger).Log("msg", "block has been marked for no downsample", "block", id)
+	return nil
+}
+
+// RemoveMark removes the file which marked the block for deletion, no-downsample or no-compact.
+func RemoveMark(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid.ULID, removeMark prometheus.Counter, markedFilename string) error {
+	markedFile := path.Join(id.String(), markedFilename)
+	markedFileExists, err := bkt.Exists(ctx, markedFile)
+	if err != nil {
+		return errors.Wrapf(err, "check if %s file exists in bucket", markedFile)
+	}
+	if !markedFileExists {
+		level.Warn(logger).Log("msg", "requested to remove the mark, but file does not exist", "err", errors.Errorf("file %s does not exist in bucket", markedFile))
+		return nil
+	}
+	if err := bkt.Delete(ctx, markedFile); err != nil {
+		return errors.Wrapf(err, "delete file %s from bucket", markedFile)
+	}
+	removeMark.Inc()
+	level.Info(logger).Log("msg", "mark has been removed from the block", "block", id)
 	return nil
 }

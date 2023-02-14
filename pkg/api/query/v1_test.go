@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	"net/http"
@@ -31,10 +30,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/route"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
@@ -42,13 +43,12 @@ import (
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	promgate "github.com/prometheus/prometheus/util/gate"
 	"github.com/prometheus/prometheus/util/stats"
-
-	"github.com/thanos-io/thanos/pkg/compact"
-
 	baseAPI "github.com/thanos-io/thanos/pkg/api"
+	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/query"
@@ -56,13 +56,13 @@ import (
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/custom"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 	"github.com/thanos-io/thanos/pkg/testutil/testpromcompatibility"
 )
 
 func TestMain(m *testing.M) {
-	testutil.TolerantVerifyLeakMain(m)
+	custom.TolerantVerifyLeakMain(m)
 }
 
 type endpointTestCase struct {
@@ -110,7 +110,8 @@ func testEndpoint(t *testing.T, test endpointTestCase, name string, responseComp
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
 
-		resp, _, apiErr := test.endpoint(req.WithContext(ctx))
+		resp, _, apiErr, releaseResources := test.endpoint(req.WithContext(ctx))
+		defer releaseResources()
 		if apiErr != nil {
 			if test.errType == baseAPI.ErrorNone {
 				t.Fatalf("Unexpected error: %s", apiErr)
@@ -191,15 +192,15 @@ func TestQueryEndpoints(t *testing.T) {
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
 		},
-		queryableCreate: query.NewQueryableCreator(nil, nil, store.NewTSDBStore(nil, db, component.Query, nil), 2, timeout),
-		queryEngine: func(int64) *promql.Engine {
-			return qe
-		},
-		gate:                  gate.New(nil, 4),
+		queryableCreate:       query.NewQueryableCreator(nil, nil, store.NewTSDBStore(nil, db, component.Query, nil), 2, timeout),
+		queryEngine:           qe,
+		lookbackDeltaCreate:   func(m int64) time.Duration { return time.Duration(0) },
+		gate:                  gate.New(nil, 4, gate.Queries),
 		defaultRangeQueryStep: time.Second,
 		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
 			Name: "query_range_hist",
 		}),
+		seriesStatsAggregator: &store.NoopSeriesStatsAggregator{},
 	}
 
 	start := time.Unix(0, 0)
@@ -680,8 +681,7 @@ func TestMetadataEndpoints(t *testing.T) {
 		},
 	}
 
-	dir, err := ioutil.TempDir("", "prometheus-test")
-	testutil.Ok(t, err)
+	dir := t.TempDir()
 
 	const chunkRange int64 = 600_000
 	var series []storage.Series
@@ -699,7 +699,7 @@ func TestMetadataEndpoints(t *testing.T) {
 		series = append(series, storage.NewListSeries(lbl, samples))
 	}
 
-	_, err = tsdb.CreateBlock(series, dir, chunkRange, log.NewNopLogger())
+	_, err := tsdb.CreateBlock(series, dir, chunkRange, log.NewNopLogger())
 	testutil.Ok(t, err)
 
 	opts := tsdb.DefaultOptions()
@@ -733,28 +733,28 @@ func TestMetadataEndpoints(t *testing.T) {
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
 		},
-		queryableCreate: query.NewQueryableCreator(nil, nil, store.NewTSDBStore(nil, db, component.Query, nil), 2, timeout),
-		queryEngine: func(int64) *promql.Engine {
-			return qe
-		},
-		gate: gate.New(nil, 4),
+		queryableCreate:     query.NewQueryableCreator(nil, nil, store.NewTSDBStore(nil, db, component.Query, nil), 2, timeout),
+		queryEngine:         qe,
+		lookbackDeltaCreate: func(m int64) time.Duration { return time.Duration(0) },
+		gate:                gate.New(nil, 4, gate.Queries),
 		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
 			Name: "query_range_hist",
 		}),
+		seriesStatsAggregator: &store.NoopSeriesStatsAggregator{},
 	}
 	apiWithLabelLookback := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
 		},
-		queryableCreate: query.NewQueryableCreator(nil, nil, store.NewTSDBStore(nil, db, component.Query, nil), 2, timeout),
-		queryEngine: func(int64) *promql.Engine {
-			return qe
-		},
-		gate:                     gate.New(nil, 4),
+		queryableCreate:          query.NewQueryableCreator(nil, nil, store.NewTSDBStore(nil, db, component.Query, nil), 2, timeout),
+		queryEngine:              qe,
+		lookbackDeltaCreate:      func(m int64) time.Duration { return time.Duration(0) },
+		gate:                     gate.New(nil, 4, gate.Queries),
 		defaultMetadataTimeRange: apiLookbackDelta,
 		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
 			Name: "query_range_hist",
 		}),
+		seriesStatsAggregator: &store.NoopSeriesStatsAggregator{},
 	}
 
 	var tests = []endpointTestCase{
@@ -1461,7 +1461,7 @@ func TestParseDownsamplingParamMillis(t *testing.T) {
 	for i, test := range tests {
 		api := QueryAPI{
 			enableAutodownsampling: test.enableAutodownsampling,
-			gate:                   gate.New(nil, 4),
+			gate:                   gate.New(nil, 4, gate.Queries),
 			queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
 				Name: "query_range_hist",
 			}),
@@ -1783,7 +1783,8 @@ func TestRulesHandler(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			res, errors, apiError := endpoint(req.WithContext(ctx))
+			res, errors, apiError, releaseResources := endpoint(req.WithContext(ctx))
+			defer releaseResources()
 			if errors != nil {
 				t.Fatalf("Unexpected errors: %s", errors)
 				return
@@ -1856,4 +1857,17 @@ func (s sample) T() int64 {
 
 func (s sample) V() float64 {
 	return s.v
+}
+
+// TODO(rabenhorst): Needs to be implemented for native histogram support.
+func (s sample) H() *histogram.Histogram {
+	panic("not implemented")
+}
+
+func (s sample) FH() *histogram.FloatHistogram {
+	panic("not implemented")
+}
+
+func (s sample) Type() chunkenc.ValueType {
+	return chunkenc.ValFloat
 }

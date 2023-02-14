@@ -14,14 +14,15 @@ import (
 	"github.com/go-kit/log"
 	"github.com/prometheus/prometheus/storage"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/custom"
 )
 
 func TestMain(m *testing.M) {
-	testutil.TolerantVerifyLeakMain(m)
+	custom.TolerantVerifyLeakMain(m)
 }
 
 func TestQuerier_Proxy(t *testing.T) {
@@ -36,7 +37,7 @@ func TestQuerier_Proxy(t *testing.T) {
 			logger,
 			nil,
 			store.NewProxyStore(logger, nil, func() []store.Client { return clients },
-				component.Debug, nil, 5*time.Minute),
+				component.Debug, nil, 5*time.Minute, store.EagerRetrieval),
 			1000000,
 			5*time.Minute,
 		)
@@ -54,7 +55,16 @@ func TestQuerier_Proxy(t *testing.T) {
 					name:        fmt.Sprintf("store number %v", i),
 				})
 			}
-			return q(true, nil, nil, 0, false, false, false)
+			return q(true,
+				nil,
+				nil,
+				0,
+				false,
+				false,
+				false,
+				nil,
+				NoopSeriesStatsReporter,
+			)
 		}
 
 		for _, fn := range files {

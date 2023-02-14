@@ -216,8 +216,8 @@ func runSidecar(
 
 			// Periodically query the Prometheus config. We use this as a heartbeat as well as for updating
 			// the external labels we apply.
-			return runutil.Repeat(30*time.Second, ctx.Done(), func() error {
-				iterCtx, iterCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			return runutil.Repeat(conf.prometheus.getConfigInterval, ctx.Done(), func() error {
+				iterCtx, iterCancel := context.WithTimeout(context.Background(), conf.prometheus.getConfigTimeout)
 				defer iterCancel()
 
 				if err := m.UpdateLabels(iterCtx); err != nil {
@@ -268,8 +268,10 @@ func runSidecar(
 				if httpProbe.IsReady() {
 					mint, maxt := promStore.Timestamps()
 					return &infopb.StoreInfo{
-						MinTime: mint,
-						MaxTime: maxt,
+						MinTime:           mint,
+						MaxTime:           maxt,
+						SupportsSharding:  true,
+						SendsSortedSeries: true,
 					}
 				}
 				return nil
@@ -280,8 +282,9 @@ func runSidecar(
 			info.WithMetricMetadataInfoFunc(),
 		)
 
+		storeServer := store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, promStore), reg, conf.storeRateLimits)
 		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, tagOpts, comp, grpcProbe,
-			grpcserver.WithServer(store.RegisterStoreServer(promStore)),
+			grpcserver.WithServer(store.RegisterStoreServer(storeServer, logger)),
 			grpcserver.WithServer(rules.RegisterRulesServer(rules.NewPrometheus(conf.prometheus.url, c, m.Labels))),
 			grpcserver.WithServer(targets.RegisterTargetsServer(targets.NewPrometheus(conf.prometheus.url, c, m.Labels))),
 			grpcserver.WithServer(meta.RegisterMetadataServer(meta.NewPrometheus(conf.prometheus.url, c))),
@@ -472,15 +475,16 @@ func (s *promMetadata) Version() string {
 }
 
 type sidecarConfig struct {
-	http         httpConfig
-	grpc         grpcConfig
-	prometheus   prometheusConfig
-	tsdb         tsdbConfig
-	reloader     reloaderConfig
-	reqLogConfig *extflag.PathOrContent
-	objStore     extflag.PathOrContent
-	shipper      shipperConfig
-	limitMinTime thanosmodel.TimeOrDurationValue
+	http            httpConfig
+	grpc            grpcConfig
+	prometheus      prometheusConfig
+	tsdb            tsdbConfig
+	reloader        reloaderConfig
+	reqLogConfig    *extflag.PathOrContent
+	objStore        extflag.PathOrContent
+	shipper         shipperConfig
+	limitMinTime    thanosmodel.TimeOrDurationValue
+	storeRateLimits store.SeriesSelectLimits
 }
 
 func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
@@ -492,6 +496,7 @@ func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.reqLogConfig = extkingpin.RegisterRequestLoggingFlags(cmd)
 	sc.objStore = *extkingpin.RegisterCommonObjStoreFlags(cmd, "", false)
 	sc.shipper.registerFlag(cmd)
+	sc.storeRateLimits.RegisterFlags(cmd)
 	cmd.Flag("min-time", "Start of time range limit to serve. Thanos sidecar will serve only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("0000-01-01T00:00:00Z").SetValue(&sc.limitMinTime)
 }

@@ -6,7 +6,6 @@ package compact
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,9 +20,9 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/objstore"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 type tsdbPlannerAdapter struct {
@@ -352,7 +351,7 @@ func TestPlanners_Plan_Compatibility(t *testing.T) {
 
 			// For compatibility.
 			t.Run("tsdbPlannerAdapter", func(t *testing.T) {
-				dir, err := ioutil.TempDir("", "test-compact")
+				dir, err := os.MkdirTemp("", "test-compact")
 				testutil.Ok(t, err)
 				defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
 
@@ -436,7 +435,7 @@ func TestRangeWithFailedCompactionWontGetSelected(t *testing.T) {
 			c.metas[1].Compaction.Failed = true
 			// For compatibility.
 			t.Run("tsdbPlannerAdapter", func(t *testing.T) {
-				dir, err := ioutil.TempDir("", "test-compact")
+				dir, err := os.MkdirTemp("", "test-compact")
 				testutil.Ok(t, err)
 				defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
 
@@ -801,7 +800,7 @@ func TestLargeTotalIndexSizeFilter_Plan(t *testing.T) {
 			t.Run("from meta", func(t *testing.T) {
 				obj := bkt.Objects()
 				for o := range obj {
-					delete(obj, o)
+					testutil.Ok(t, bkt.Delete(context.Background(), o))
 				}
 
 				metasByMinTime := make([]*metadata.Meta, len(c.metas))
@@ -829,7 +828,7 @@ func TestLargeTotalIndexSizeFilter_Plan(t *testing.T) {
 			t.Run("from bkt", func(t *testing.T) {
 				obj := bkt.Objects()
 				for o := range obj {
-					delete(obj, o)
+					testutil.Ok(t, bkt.Delete(context.Background(), o))
 				}
 
 				metasByMinTime := make([]*metadata.Meta, len(c.metas))

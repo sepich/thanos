@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path"
@@ -27,10 +26,10 @@ import (
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/objtesting"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/model"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func newTestFetcherMetrics() *FetcherMetrics {
@@ -44,7 +43,7 @@ type ulidFilter struct {
 	ulidToDelete *ulid.ULID
 }
 
-func (f *ulidFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec, modified *extprom.TxGaugeVec) error {
+func (f *ulidFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
 	if _, ok := metas[*f.ulidToDelete]; ok {
 		synced.WithLabelValues("filtered").Inc()
 		delete(metas, *f.ulidToDelete)
@@ -68,9 +67,7 @@ func TestMetaFetcher_Fetch(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
-		dir, err := ioutil.TempDir("", "test-meta-fetcher")
-		testutil.Ok(t, err)
-		defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
+		dir := t.TempDir()
 
 		var ulidToDelete ulid.ULID
 		r := prometheus.NewRegistry()

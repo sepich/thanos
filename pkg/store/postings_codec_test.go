@@ -5,10 +5,8 @@ package store
 
 import (
 	"context"
-	"io/ioutil"
 	"math"
 	"math/rand"
-	"os"
 	"strconv"
 	"testing"
 
@@ -17,22 +15,20 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/index"
 
+	"github.com/efficientgo/core/testutil"
 	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func TestDiffVarintCodec(t *testing.T) {
-	chunksDir, err := ioutil.TempDir("", "diff_varint_codec")
-	testutil.Ok(t, err)
+	chunksDir := t.TempDir()
 
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = chunksDir
 	headOpts.ChunkRange = 1000
-	h, err := tsdb.NewHead(nil, nil, nil, headOpts, nil)
+	h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
 	testutil.Ok(t, err)
 	defer func() {
 		testutil.Ok(t, h.Close())
-		testutil.Ok(t, os.RemoveAll(chunksDir))
 	}()
 
 	appendTestData(t, h.Appender(context.Background()), 1e6)

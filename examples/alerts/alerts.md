@@ -409,6 +409,18 @@ rules:
   for: 10m
   labels:
     severity: critical
+- alert: ThanosQueryOverload
+  annotations:
+    description: Thanos Query {{$labels.job}} has been overloaded for more than 15 minutes. This may be a symptom of excessive simultanous complex requests, low performance of the Prometheus API, or failures within these components. Assess the health of the Thanos query instances, the connnected Prometheus instances, look for potential senders of these requests and then contact support.
+    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosqueryoverload
+    summary: Thanos query reaches its maximum capacity serving concurrent requests.
+  expr: |
+    (
+      max_over_time(thanos_query_concurrent_gate_queries_max[5m]) - avg_over_time(thanos_query_concurrent_gate_queries_in_flight[5m]) < 1
+    )
+  for: 15m
+  labels:
+    severity: warning
 ```
 
 ## Receive
@@ -518,20 +530,6 @@ rules:
   for: 3h
   labels:
     severity: critical
-- alert: ThanosReceiveTrafficBelowThreshold
-  annotations:
-    description: At Thanos Receive {{$labels.job}} in {{$labels.namespace}} , the average 1-hr avg. metrics ingestion rate  is {{$value | humanize}}% of 12-hr avg. ingestion rate.
-    runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanosreceivetrafficbelowthreshold
-    summary: Thanos Receive is experiencing low avg. 1-hr ingestion rate relative to avg. 12-hr ingestion rate.
-  expr: |
-    (
-      avg_over_time(rate(http_requests_total{job=~".*thanos-receive.*", code=~"2..", handler="receive"}[5m])[1h:5m])
-    /
-      avg_over_time(rate(http_requests_total{job=~".*thanos-receive.*", code=~"2..", handler="receive"}[5m])[12h:5m])
-    ) * 100 < 50
-  for: 1h
-  labels:
-    severity: warning
 ```
 
 ## Replicate

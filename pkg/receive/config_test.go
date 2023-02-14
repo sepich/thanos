@@ -5,13 +5,12 @@ package receive
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"testing"
 
 	"github.com/pkg/errors"
 
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/efficientgo/core/testutil"
 )
 
 func TestValidateConfig(t *testing.T) {
@@ -49,7 +48,7 @@ func TestValidateConfig(t *testing.T) {
 			content, err := json.Marshal(tc.cfg)
 			testutil.Ok(t, err)
 
-			tmpfile, err := ioutil.TempFile("", "configwatcher_test.*.json")
+			tmpfile, err := os.CreateTemp("", "configwatcher_test.*.json")
 			testutil.Ok(t, err)
 
 			defer func() {

@@ -162,6 +162,7 @@ func NewCacheConfig(logger log.Logger, confContentYaml []byte) (*cortexcache.Con
 			Redis: cortexcache.RedisConfig{
 				Endpoint:    config.Redis.Addr,
 				Timeout:     config.Redis.ReadTimeout,
+				MasterName:  config.Redis.MasterName,
 				Expiration:  config.Expiration,
 				DB:          config.Redis.DB,
 				PoolSize:    config.Redis.PoolSize,
@@ -204,6 +205,7 @@ type Config struct {
 	RequestLoggingDecision string
 	DownstreamURL          string
 	ForwardHeaders         []string
+	NumShards              int
 }
 
 // QueryRangeConfig holds the config for query range tripperware.
@@ -218,6 +220,9 @@ type QueryRangeConfig struct {
 	AlignRangeWithStep     bool
 	RequestDownsampled     bool
 	SplitQueriesByInterval time.Duration
+	MinQuerySplitInterval  time.Duration
+	MaxQuerySplitInterval  time.Duration
+	HorizontalShards       int64
 	MaxRetries             int
 	Limits                 *cortexvalidation.Limits
 }
@@ -241,11 +246,22 @@ type LabelsConfig struct {
 // Validate a fully initialized config.
 func (cfg *Config) Validate() error {
 	if cfg.QueryRangeConfig.ResultsCacheConfig != nil {
-		if cfg.QueryRangeConfig.SplitQueriesByInterval <= 0 {
-			return errors.New("split queries interval should be greater than 0 when caching is enabled")
+		if cfg.QueryRangeConfig.SplitQueriesByInterval <= 0 && !cfg.isDynamicSplitSet() {
+			return errors.New("split queries or split threshold interval should be greater than 0 when caching is enabled")
 		}
 		if err := cfg.QueryRangeConfig.ResultsCacheConfig.Validate(querier.Config{}); err != nil {
 			return errors.Wrap(err, "invalid ResultsCache config for query_range tripperware")
+		}
+	}
+
+	if cfg.isDynamicSplitSet() && cfg.isStaticSplitSet() {
+		return errors.New("split queries interval and dynamic query split interval cannot be set at the same time")
+	}
+
+	if cfg.isDynamicSplitSet() {
+
+		if err := cfg.validateDynamicSplitParams(); err != nil {
+			return err
 		}
 	}
 
@@ -267,4 +283,29 @@ func (cfg *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func (cfg *Config) validateDynamicSplitParams() error {
+	if cfg.QueryRangeConfig.HorizontalShards <= 0 {
+		return errors.New("min horizontal shards should be greater than 0 when query split threshold is enabled")
+	}
+
+	if cfg.QueryRangeConfig.MaxQuerySplitInterval <= 0 {
+		return errors.New("max query split interval should be greater than 0 when query split threshold is enabled")
+	}
+
+	if cfg.QueryRangeConfig.MinQuerySplitInterval <= 0 {
+		return errors.New("min query split interval should be greater than 0 when query split threshold is enabled")
+	}
+	return nil
+}
+
+func (cfg *Config) isStaticSplitSet() bool {
+	return cfg.QueryRangeConfig.SplitQueriesByInterval != 0
+}
+
+func (cfg *Config) isDynamicSplitSet() bool {
+	return cfg.QueryRangeConfig.MinQuerySplitInterval > 0 ||
+		cfg.QueryRangeConfig.HorizontalShards > 0 ||
+		cfg.QueryRangeConfig.MaxQuerySplitInterval > 0
 }

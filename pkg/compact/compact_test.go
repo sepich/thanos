@@ -8,7 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"path"
 	"testing"
 	"time"
@@ -22,11 +22,11 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/objstore"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/extprom"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func TestHaltError(t *testing.T) {
@@ -143,7 +143,7 @@ func TestGroupMaxMinTime(t *testing.T) {
 
 func BenchmarkGatherNoCompactionMarkFilter_Filter(b *testing.B) {
 	ctx := context.TODO()
-	logger := log.NewLogfmtLogger(ioutil.Discard)
+	logger := log.NewLogfmtLogger(io.Discard)
 
 	m := extprom.NewTxGaugeVec(nil, prometheus.GaugeOpts{}, []string{"state"})
 

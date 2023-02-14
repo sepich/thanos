@@ -6,7 +6,6 @@ package compactv2
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -27,9 +26,9 @@ import (
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func TestCompactor_WriteSeries_e2e(t *testing.T) {
@@ -589,9 +588,7 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 		},
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
-			tmpDir, err := ioutil.TempDir("", "test-series-writer")
-			testutil.Ok(t, err)
-			defer func() { testutil.Ok(t, os.RemoveAll(tmpDir)) }()
+			tmpDir := t.TempDir()
 
 			chunkPool := chunkenc.NewPool()
 
@@ -672,12 +669,12 @@ func readBlockSeries(t *testing.T, bDir string) []seriesSamples {
 		testutil.Ok(t, indexr.Series(all.At(), &s.lset, &chks))
 
 		for _, c := range chks {
-			c.Chunk, err = chunkr.Chunk(c.Ref)
+			c.Chunk, err = chunkr.Chunk(c)
 			testutil.Ok(t, err)
 
 			var chk []sample
 			iter := c.Chunk.Iterator(nil)
-			for iter.Next() {
+			for iter.Next() != chunkenc.ValNone {
 				sa := sample{}
 				sa.t, sa.v = iter.At()
 				chk = append(chk, sa)

@@ -6,7 +6,6 @@ package promclient
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path"
@@ -20,9 +19,9 @@ import (
 	"github.com/prometheus/prometheus/model/timestamp"
 	"gopkg.in/yaml.v3"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/runutil"
-	"github.com/thanos-io/thanos/pkg/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
@@ -116,7 +115,7 @@ func TestSnapshot_e2e(t *testing.T) {
 		_, err = os.Stat(path.Join(p.Dir(), dir, id.String()))
 		testutil.Ok(t, err)
 
-		files, err := ioutil.ReadDir(path.Join(p.Dir(), dir))
+		files, err := os.ReadDir(path.Join(p.Dir(), dir))
 		testutil.Ok(t, err)
 
 		for _, f := range files {

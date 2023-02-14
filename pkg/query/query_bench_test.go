@@ -6,20 +6,19 @@ package query
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 // TestQuerySelect benchmarks querier Select method. Note that this is what PromQL is using, but PromQL might invoke
@@ -40,9 +39,7 @@ func BenchmarkQuerySelect(b *testing.B) {
 }
 
 func benchQuerySelect(t testutil.TB, totalSamples, totalSeries int, dedup bool) {
-	tmpDir, err := ioutil.TempDir("", "testorbench-queryselect")
-	testutil.Ok(t, err)
-	defer func() { testutil.Ok(t, os.RemoveAll(tmpDir)) }()
+	tmpDir := t.TempDir()
 
 	const numOfReplicas = 2
 
@@ -84,12 +81,13 @@ func benchQuerySelect(t testutil.TB, totalSamples, totalSeries int, dedup bool) 
 
 	logger := log.NewNopLogger()
 	q := &querier{
-		ctx:           context.Background(),
-		logger:        logger,
-		proxy:         &mockedStoreServer{responses: resps},
-		replicaLabels: map[string]struct{}{"a_replica": {}},
-		deduplicate:   dedup,
-		selectGate:    gate.NewNoop(),
+		ctx:                 context.Background(),
+		logger:              logger,
+		proxy:               &mockedStoreServer{responses: resps},
+		replicaLabels:       map[string]struct{}{"a_replica": {}},
+		deduplicate:         dedup,
+		selectGate:          gate.NewNoop(),
+		seriesStatsReporter: NoopSeriesStatsReporter,
 	}
 	testSelect(t, q, expectedSeries)
 }
@@ -132,7 +130,7 @@ func testSelect(t testutil.TB, q *querier, expectedSeries []labels.Labels) {
 
 					// This is when resource usage should actually start growing.
 					iter := s.Iterator()
-					for iter.Next() {
+					for iter.Next() != chunkenc.ValNone {
 						testT, testV = iter.At()
 					}
 					testutil.Ok(t, iter.Err())
@@ -148,7 +146,7 @@ func testSelect(t testutil.TB, q *querier, expectedSeries []labels.Labels) {
 
 					// This is when resource usage should actually start growing.
 					iter := s.Iterator()
-					for iter.Next() {
+					for iter.Next() != chunkenc.ValNone {
 						testT, testV = iter.At()
 					}
 					testutil.Ok(t, iter.Err())

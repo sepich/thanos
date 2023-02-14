@@ -36,12 +36,12 @@ if [ -n "${MINIO_ENABLED}" ]; then
     exit 1
   fi
 
-  export MINIO_ACCESS_KEY="THANOS"
-  export MINIO_SECRET_KEY="ITSTHANOSTIME"
+  export MINIO_ROOT_USER="THANOS"
+  export MINIO_ROOT_PASSWORD="ITSTHANOSTIME"
   export MINIO_ENDPOINT="127.0.0.1:9000"
   export MINIO_BUCKET="thanos"
-  export S3_ACCESS_KEY=${MINIO_ACCESS_KEY}
-  export S3_SECRET_KEY=${MINIO_SECRET_KEY}
+  export S3_ACCESS_KEY=${MINIO_ROOT_USER}
+  export S3_SECRET_KEY=${MINIO_ROOT_USER}
   export S3_BUCKET=${MINIO_BUCKET}
   export S3_ENDPOINT=${MINIO_ENDPOINT}
   export S3_INSECURE="true"
@@ -260,14 +260,13 @@ QUERIER_JAEGER_CONFIG=$(
 
 REMOTE_WRITE_FLAGS=""
 if [ -n "${STATELESS_RULER_ENABLED}" ]; then
-  cat >/data/rule-remote-write.yaml <<-EOF
-  name: "thanos-receivers"
+  cat >data/rule-remote-write.yaml <<-EOF
   remote_write:
-    url: "http://127.0.0.1:10908/api/v1/receive"
+  - url: "http://localhost:10908/api/v1/receive"
     name: "receive-0"
 EOF
 
-  REMOTE_WRITE_FLAGS="--remote-write.config-file data/rule-remote-write.yaml"
+  REMOTE_WRITE_FLAGS="--remote-write.config-file=data/rule-remote-write.yaml"
 fi
 
 # Start Thanos Ruler.

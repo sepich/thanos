@@ -11,7 +11,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"net"
 	"os"
@@ -25,7 +24,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 
 	pb "google.golang.org/grpc/examples/features/proto/echo"
@@ -41,16 +40,12 @@ func TestGRPCServerCertAutoRotate(t *testing.T) {
 	logger := log.NewLogfmtLogger(os.Stderr)
 	expMessage := "hello world"
 
-	tmpDirClt, err := ioutil.TempDir("", "test-tls-clt")
-	testutil.Ok(t, err)
-	defer func() { testutil.Ok(t, os.RemoveAll(tmpDirClt)) }()
+	tmpDirClt := t.TempDir()
 	caClt := filepath.Join(tmpDirClt, "ca")
 	certClt := filepath.Join(tmpDirClt, "cert")
 	keyClt := filepath.Join(tmpDirClt, "key")
 
-	tmpDirSrv, err := ioutil.TempDir("", "test-tls-srv")
-	testutil.Ok(t, err)
-	defer func() { testutil.Ok(t, os.RemoveAll(tmpDirSrv)) }()
+	tmpDirSrv := t.TempDir()
 	caSrv := filepath.Join(tmpDirSrv, "ca")
 	certSrv := filepath.Join(tmpDirSrv, "cert")
 	keySrv := filepath.Join(tmpDirSrv, "key")
@@ -131,7 +126,7 @@ func genCerts(t *testing.T, certPath, privkeyPath, caPath string) {
 	// When the CA private file exists don't overwrite it but
 	// use it to extract the private key to be used for signing the certificate.
 	if _, err := os.Stat(caSrvPriv); !os.IsNotExist(err) {
-		d, err := ioutil.ReadFile(caSrvPriv)
+		d, err := os.ReadFile(caSrvPriv)
 		testutil.Ok(t, err)
 		caPrivKey, err = x509.ParsePKCS1PrivateKey(d)
 		testutil.Ok(t, err)
@@ -154,8 +149,8 @@ func genCerts(t *testing.T, certPath, privkeyPath, caPath string) {
 			Type:  "CERTIFICATE",
 			Bytes: caBytes,
 		})
-		testutil.Ok(t, ioutil.WriteFile(caPath, caPEM, 0644))
-		testutil.Ok(t, ioutil.WriteFile(caSrvPriv, x509.MarshalPKCS1PrivateKey(caPrivKey), 0644))
+		testutil.Ok(t, os.WriteFile(caPath, caPEM, 0644))
+		testutil.Ok(t, os.WriteFile(caSrvPriv, x509.MarshalPKCS1PrivateKey(caPrivKey), 0644))
 	}
 
 	if certPath != "" {
@@ -164,7 +159,7 @@ func genCerts(t *testing.T, certPath, privkeyPath, caPath string) {
 			Type:  "CERTIFICATE",
 			Bytes: certBytes,
 		}))
-		testutil.Ok(t, ioutil.WriteFile(certPath, certPEM.Bytes(), 0644))
+		testutil.Ok(t, os.WriteFile(certPath, certPEM.Bytes(), 0644))
 	}
 
 	if privkeyPath != "" {
@@ -173,7 +168,7 @@ func genCerts(t *testing.T, certPath, privkeyPath, caPath string) {
 			Type:  "RSA PRIVATE KEY",
 			Bytes: x509.MarshalPKCS1PrivateKey(certPrivKey),
 		}))
-		testutil.Ok(t, ioutil.WriteFile(privkeyPath, certPrivKeyPEM.Bytes(), 0644))
+		testutil.Ok(t, os.WriteFile(privkeyPath, certPrivKeyPEM.Bytes(), 0644))
 	}
 }
 
@@ -183,4 +178,16 @@ type ecServer struct {
 
 func (s *ecServer) UnaryEcho(ctx context.Context, req *pb.EchoRequest) (*pb.EchoResponse, error) {
 	return &pb.EchoResponse{Message: req.Message}, nil
+}
+
+func TestInvalidCertAndKey(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 10*time.Second)()
+	logger := log.NewLogfmtLogger(os.Stderr)
+	tmpDirSrv := t.TempDir()
+	caSrv := filepath.Join(tmpDirSrv, "ca")
+	certSrv := filepath.Join(tmpDirSrv, "cert")
+	keySrv := filepath.Join(tmpDirSrv, "key")
+	// Certificate and key are not present in the above path
+	_, err := thTLS.NewServerConfig(logger, certSrv, keySrv, caSrv)
+	testutil.NotOk(t, err)
 }

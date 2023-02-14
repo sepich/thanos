@@ -85,14 +85,14 @@ Flags:
       --grpc-server-tls-cert=""  TLS Certificate for gRPC server, leave blank to
                                  disable TLS
       --grpc-server-tls-client-ca=""
-                                 TLS CA to verify clients against. If no client
-                                 CA is specified, there is no client
+                                 TLS CA to verify clients against. If no
+                                 client CA is specified, there is no client
                                  verification on server side. (tls.NoClientCert)
       --grpc-server-tls-key=""   TLS Key for the gRPC server, leave blank to
                                  disable TLS
       --hash-func=               Specify which hash function to use when
-                                 calculating the hashes of produced files. If no
-                                 function has been specified, it does not
+                                 calculating the hashes of produced files.
+                                 If no function has been specified, it does not
                                  happen. This permits avoiding downloading some
                                  files twice albeit at some performance cost.
                                  Possible values are: "", "SHA256".
@@ -116,29 +116,35 @@ Flags:
                                  relative to current time, such as -1d or 2h45m.
                                  Valid duration units are ms, s, m, h, d, w, y.
       --objstore.config=<content>
-                                 Alternative to 'objstore.config-file' flag
-                                 (mutually exclusive). Content of YAML file that
-                                 contains object store configuration. See format
-                                 details:
-                                 https://thanos.io/tip/thanos/storage.md/#configuration
-      --objstore.config-file=<file-path>
-                                 Path to YAML file that contains object store
+                                 Alternative to 'objstore.config-file'
+                                 flag (mutually exclusive). Content of
+                                 YAML file that contains object store
                                  configuration. See format details:
                                  https://thanos.io/tip/thanos/storage.md/#configuration
+      --objstore.config-file=<file-path>
+                                 Path to YAML file that contains object
+                                 store configuration. See format details:
+                                 https://thanos.io/tip/thanos/storage.md/#configuration
+      --prometheus.get_config_interval=30s
+                                 How often to get Prometheus config
+      --prometheus.get_config_timeout=5s
+                                 Timeout for getting Prometheus config
       --prometheus.http-client=<content>
                                  Alternative to 'prometheus.http-client-file'
-                                 flag (mutually exclusive). Content of YAML file
-                                 or string with http client configs. see Format
-                                 details : ...
+                                 flag (mutually exclusive). Content
+                                 of YAML file or string with http
+                                 client configs. See Format details:
+                                 https://thanos.io/tip/components/sidecar.md/#configuration.
       --prometheus.http-client-file=<file-path>
-                                 Path to YAML file or string with http client
-                                 configs. see Format details : ...
+                                 Path to YAML file or string with http
+                                 client configs. See Format details:
+                                 https://thanos.io/tip/components/sidecar.md/#configuration.
       --prometheus.ready_timeout=10m
                                  Maximum time to wait for the Prometheus
                                  instance to start up
       --prometheus.url=http://localhost:9090
-                                 URL at which to reach Prometheus's API. For
-                                 better performance use local network.
+                                 URL at which to reach Prometheus's API.
+                                 For better performance use local network.
       --reloader.config-envsubst-file=""
                                  Output file for environment variable
                                  substituted config file.
@@ -154,9 +160,9 @@ Flags:
                                  rules.
       --request.logging-config=<content>
                                  Alternative to 'request.logging-config-file'
-                                 flag (mutually exclusive). Content of YAML file
-                                 with request logging configuration. See format
-                                 details:
+                                 flag (mutually exclusive). Content
+                                 of YAML file with request logging
+                                 configuration. See format details:
                                  https://thanos.io/tip/thanos/logging.md/#configuration
       --request.logging-config-file=<file-path>
                                  Path to YAML file with request logging
@@ -168,16 +174,60 @@ Flags:
                                  Works only if compaction is disabled on
                                  Prometheus. Do it once and then disable the
                                  flag when done.
+      --store.limits.request-samples=0
+                                 The maximum samples allowed for a single
+                                 Series request, The Series call fails if
+                                 this limit is exceeded. 0 means no limit.
+                                 NOTE: For efficiency the limit is internally
+                                 implemented as 'chunks limit' considering each
+                                 chunk contains a maximum of 120 samples.
+      --store.limits.request-series=0
+                                 The maximum series allowed for a single Series
+                                 request. The Series call fails if this limit is
+                                 exceeded. 0 means no limit.
       --tracing.config=<content>
                                  Alternative to 'tracing.config-file' flag
-                                 (mutually exclusive). Content of YAML file with
-                                 tracing configuration. See format details:
+                                 (mutually exclusive). Content of YAML file
+                                 with tracing configuration. See format details:
                                  https://thanos.io/tip/thanos/tracing.md/#configuration
       --tracing.config-file=<file-path>
-                                 Path to YAML file with tracing configuration.
-                                 See format details:
+                                 Path to YAML file with tracing
+                                 configuration. See format details:
                                  https://thanos.io/tip/thanos/tracing.md/#configuration
       --tsdb.path="./data"       Data directory of TSDB.
       --version                  Show application version.
 
+```
+
+## Configuration
+
+### Prometheus HTTP client
+
+You can configure the Prometheus HTTP client for Thanos sidecar with YAML, either by passing the YAML content directly to the `--prometheus.http-client` flag, or by passing the YAML file path to the `--prometheus.http-client-file` flag.
+
+The configuration format is the following:
+
+```yaml
+basic_auth:
+  username: ""
+  password: ""
+  password_file: ""
+bearer_token: ""
+bearer_token_file: ""
+proxy_url: ""
+tls_config:
+  ca_file: ""
+  cert_file: ""
+  key_file: ""
+  server_name: ""
+  insecure_skip_verify: false
+transport_config:
+  max_idle_conns: 0
+  max_idle_conns_per_host: 0
+  idle_conn_timeout: 0
+  response_header_timeout: 0
+  expect_continue_timeout: 0
+  max_conns_per_host: 0
+  disable_compression: false
+  tls_handshake_timeout: 0
 ```

@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -29,18 +29,20 @@ import (
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/runutil"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 const (
 	defaultPrometheusVersion   = "v0.37.0"
 	defaultAlertmanagerVersion = "v0.20.0"
-	defaultMinioVersion        = "RELEASE.2018-10-06T00-15-16Z"
+	defaultMinioVersion        = "RELEASE.2022-07-30T05-21-40Z"
 
 	// Space delimited list of versions.
 	promPathsEnvVar       = "THANOS_TEST_PROMETHEUS_PATHS"
@@ -88,7 +90,7 @@ type Prometheus struct {
 }
 
 func NewTSDB() (*tsdb.DB, error) {
-	dir, err := ioutil.TempDir("", "prometheus-test")
+	dir, err := os.MkdirTemp("", "prometheus-test")
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +335,7 @@ func CreateEmptyBlock(dir string, mint, maxt int64, extLset labels.Labels, resol
 		return ulid.ULID{}, err
 	}
 
-	if err := ioutil.WriteFile(path.Join(dir, uid.String(), "meta.json"), b, os.ModePerm); err != nil {
+	if err := os.WriteFile(path.Join(dir, uid.String(), "meta.json"), b, os.ModePerm); err != nil {
 		return ulid.ULID{}, errors.Wrap(err, "saving meta.json")
 	}
 
@@ -430,7 +432,7 @@ func createBlock(
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = filepath.Join(dir, "chunks")
 	headOpts.ChunkRange = 10000000000
-	h, err := tsdb.NewHead(nil, nil, nil, headOpts, nil)
+	h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "create head block")
 	}
@@ -537,4 +539,107 @@ func createBlock(
 	}
 
 	return id, nil
+}
+
+var indexFilename = "index"
+
+type indexWriterSeries struct {
+	labels labels.Labels
+	chunks []chunks.Meta // series file offset of chunks
+}
+
+type indexWriterSeriesSlice []*indexWriterSeries
+
+// PutOutOfOrderIndex updates the index in blockDir with an index containing an out-of-order chunk
+// copied from https://github.com/prometheus/prometheus/blob/b1ed4a0a663d0c62526312311c7529471abbc565/tsdb/index/index_test.go#L346
+func PutOutOfOrderIndex(blockDir string, minTime int64, maxTime int64) error {
+
+	if minTime >= maxTime || minTime+4 >= maxTime {
+		return fmt.Errorf("minTime must be at least 4 less than maxTime to not create overlapping chunks")
+	}
+
+	lbls := []labels.Labels{
+		[]labels.Label{
+			{Name: "lbl1", Value: "1"},
+		},
+	}
+
+	// Sort labels as the index writer expects series in sorted order.
+	sort.Sort(labels.Slice(lbls))
+
+	symbols := map[string]struct{}{}
+	for _, lset := range lbls {
+		for _, l := range lset {
+			symbols[l.Name] = struct{}{}
+			symbols[l.Value] = struct{}{}
+		}
+	}
+
+	var input indexWriterSeriesSlice
+
+	// Generate ChunkMetas for every label set.
+	// Ignoring gosec as it is only used for tests.
+	for _, lset := range lbls {
+		var metas []chunks.Meta
+		// only need two chunks that are out-of-order
+		chk1 := chunks.Meta{
+			MinTime: maxTime - 2,
+			MaxTime: maxTime - 1,
+			Ref:     chunks.ChunkRef(rand.Uint64()), // nolint:gosec
+			Chunk:   chunkenc.NewXORChunk(),
+		}
+		metas = append(metas, chk1)
+		chk2 := chunks.Meta{
+			MinTime: minTime + 1,
+			MaxTime: minTime + 2,
+			Ref:     chunks.ChunkRef(rand.Uint64()), // nolint:gosec
+			Chunk:   chunkenc.NewXORChunk(),
+		}
+		metas = append(metas, chk2)
+
+		input = append(input, &indexWriterSeries{
+			labels: lset,
+			chunks: metas,
+		})
+	}
+
+	iw, err := index.NewWriter(context.Background(), filepath.Join(blockDir, indexFilename))
+	if err != nil {
+		return err
+	}
+
+	syms := []string{}
+	for s := range symbols {
+		syms = append(syms, s)
+	}
+	sort.Strings(syms)
+	for _, s := range syms {
+		if err := iw.AddSymbol(s); err != nil {
+			return err
+		}
+	}
+
+	// Population procedure as done by compaction.
+	var (
+		postings = index.NewMemPostings()
+		values   = map[string]map[string]struct{}{}
+	)
+
+	for i, s := range input {
+		if err := iw.AddSeries(storage.SeriesRef(i), s.labels, s.chunks...); err != nil {
+			return err
+		}
+
+		for _, l := range s.labels {
+			valset, ok := values[l.Name]
+			if !ok {
+				valset = map[string]struct{}{}
+				values[l.Name] = valset
+			}
+			valset[l.Value] = struct{}{}
+		}
+		postings.Add(storage.SeriesRef(i), s.labels)
+	}
+
+	return iw.Close()
 }

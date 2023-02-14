@@ -7,30 +7,30 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/rand"
-	"os"
 	"sort"
 	"testing"
 
+	"github.com/cespare/xxhash"
 	"github.com/go-kit/log"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/custom"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
 const skipMessage = "Chunk behavior changed due to https://github.com/prometheus/prometheus/pull/8723. Skip for now."
 
 func TestTSDBStore_Info(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
+	defer custom.TolerantVerifyLeak(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -63,8 +63,48 @@ func TestTSDBStore_Info(t *testing.T) {
 	testutil.Equals(t, int64(math.MaxInt64), resp.MaxTime)
 }
 
+func TestTSDBStore_Series_ChunkChecksum(t *testing.T) {
+	defer custom.TolerantVerifyLeak(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	db, err := e2eutil.NewTSDB()
+	defer func() { testutil.Ok(t, db.Close()) }()
+	testutil.Ok(t, err)
+
+	tsdbStore := NewTSDBStore(nil, db, component.Rule, labels.FromStrings("region", "eu-west"))
+
+	appender := db.Appender(context.Background())
+
+	for i := 1; i <= 3; i++ {
+		_, err = appender.Append(0, labels.FromStrings("a", "1"), int64(i), float64(i))
+		testutil.Ok(t, err)
+	}
+	err = appender.Commit()
+	testutil.Ok(t, err)
+
+	srv := newStoreSeriesServer(ctx)
+
+	req := &storepb.SeriesRequest{
+		MinTime: 1,
+		MaxTime: 3,
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "1"},
+		},
+	}
+
+	err = tsdbStore.Series(req, srv)
+	testutil.Ok(t, err)
+
+	for _, chk := range srv.SeriesSet[0].Chunks {
+		want := xxhash.Sum64(chk.Raw.Data)
+		testutil.Equals(t, want, chk.Raw.Hash)
+	}
+}
+
 func TestTSDBStore_Series(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
+	defer custom.TolerantVerifyLeak(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -189,7 +229,7 @@ func TestTSDBStore_Series(t *testing.T) {
 }
 
 func TestTSDBStore_LabelAPIs(t *testing.T) {
-	t.Cleanup(func() { testutil.TolerantVerifyLeak(t) })
+	t.Cleanup(func() { custom.TolerantVerifyLeak(t) })
 	testLabelAPIs(t, func(extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
 		db, err := e2eutil.NewTSDB()
 		testutil.Ok(t, err)
@@ -204,7 +244,7 @@ func TestTSDBStore_LabelAPIs(t *testing.T) {
 
 // Regression test for https://github.com/thanos-io/thanos/issues/1038.
 func TestTSDBStore_Series_SplitSamplesIntoChunksWithMaxSizeOf120(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
+	defer custom.TolerantVerifyLeak(t)
 
 	db, err := e2eutil.NewTSDB()
 	defer func() { testutil.Ok(t, db.Close()) }()
@@ -230,11 +270,7 @@ func (s *delegatorServer) Delegate(c io.Closer) {
 func TestTSDBStore_SeriesAccessWithDelegateClosing(t *testing.T) {
 	t.Skip(skipMessage)
 
-	tmpDir, err := ioutil.TempDir("", "test")
-	testutil.Ok(t, err)
-	t.Cleanup(func() {
-		testutil.Ok(t, os.RemoveAll(tmpDir))
-	})
+	tmpDir := t.TempDir()
 
 	var (
 		random = rand.New(rand.NewSource(120))
@@ -403,11 +439,7 @@ func TestTSDBStore_SeriesAccessWithDelegateClosing(t *testing.T) {
 func TestTSDBStore_SeriesAccessWithoutDelegateClosing(t *testing.T) {
 	t.Skip(skipMessage)
 
-	tmpDir, err := ioutil.TempDir("", "test")
-	testutil.Ok(t, err)
-	t.Cleanup(func() {
-		testutil.Ok(t, os.RemoveAll(tmpDir))
-	})
+	tmpDir := t.TempDir()
 
 	var (
 		random = rand.New(rand.NewSource(120))
@@ -531,11 +563,7 @@ func BenchmarkTSDBStoreSeries(b *testing.B) {
 }
 
 func benchTSDBStoreSeries(t testutil.TB, totalSamples, totalSeries int) {
-	tmpDir, err := ioutil.TempDir("", "testorbench-testtsdbseries")
-	testutil.Ok(t, err)
-	t.Cleanup(func() {
-		testutil.Ok(t, os.RemoveAll(tmpDir))
-	})
+	tmpDir := t.TempDir()
 
 	// This means 3 blocks and the head.
 	const numOfBlocks = 4

@@ -7,6 +7,7 @@ import (
 	"context"
 
 	"github.com/pkg/errors"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
@@ -87,10 +88,17 @@ type lazyPopulatableChunk struct {
 
 type errChunkIterator struct{ err error }
 
-func (e errChunkIterator) Seek(int64) bool      { return false }
-func (e errChunkIterator) At() (int64, float64) { return 0, 0 }
-func (e errChunkIterator) Next() bool           { return false }
-func (e errChunkIterator) Err() error           { return e.err }
+func (e errChunkIterator) Seek(int64) chunkenc.ValueType { return chunkenc.ValNone }
+func (e errChunkIterator) At() (int64, float64)          { return 0, 0 }
+
+// TODO(rabenhorst): Needs to be implemented for native histogram support.
+func (e errChunkIterator) AtHistogram() (int64, *histogram.Histogram) { panic("not implemented") }
+func (e errChunkIterator) AtFloatHistogram() (int64, *histogram.FloatHistogram) {
+	panic("not implemented")
+}
+func (e errChunkIterator) AtT() int64               { return 0 }
+func (e errChunkIterator) Next() chunkenc.ValueType { return chunkenc.ValNone }
+func (e errChunkIterator) Err() error               { return e.err }
 
 type errChunk struct{ err errChunkIterator }
 
@@ -104,7 +112,7 @@ func (e errChunk) Compact()                                     {}
 func (l *lazyPopulatableChunk) populate() {
 	// TODO(bwplotka): In most cases we don't need to parse anything, just copy. Extend reader/writer for this.
 	var err error
-	l.populated, err = l.cr.Chunk(l.m.Ref)
+	l.populated, err = l.cr.Chunk(*l.m)
 	if err != nil {
 		l.m.Chunk = errChunk{err: errChunkIterator{err: errors.Wrapf(err, "cannot populate chunk %d", l.m.Ref)}}
 		return
