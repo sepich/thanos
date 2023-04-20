@@ -58,7 +58,7 @@ func registerReceive(app *extkingpin.App) {
 	conf := &receiveConfig{}
 	conf.registerFlag(cmd)
 
-	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, debugLogging bool) error {
 		lset, err := parseFlagLabels(conf.labelStrs)
 		if err != nil {
 			return errors.Wrap(err, "parse labels")
@@ -85,7 +85,7 @@ func registerReceive(app *extkingpin.App) {
 			NoLockfile:                     conf.noLockFile,
 			WALCompression:                 conf.walCompression,
 			MaxExemplars:                   conf.tsdbMaxExemplars,
-			EnableExemplarStorage:          true,
+			EnableExemplarStorage:          conf.tsdbMaxExemplars > 0,
 			HeadChunksWriteQueueSize:       int(conf.tsdbWriteQueueSize),
 			EnableMemorySnapshotOnShutdown: conf.tsdbMemorySnapshotOnShutdown,
 			EnableNativeHistograms:         conf.tsdbEnableNativeHistograms,
@@ -97,6 +97,7 @@ func registerReceive(app *extkingpin.App) {
 		return runReceive(
 			g,
 			logger,
+			debugLogging,
 			reg,
 			tracer,
 			grpcLogOpts, tagOpts,
@@ -113,6 +114,7 @@ func registerReceive(app *extkingpin.App) {
 func runReceive(
 	g *run.Group,
 	logger log.Logger,
+	debugLogging bool,
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
 	grpcLogOpts []grpc_logging.Option,
@@ -137,8 +139,8 @@ func runReceive(
 		logger,
 		reg,
 		tracer,
-		*conf.grpcCert != "",
-		*conf.grpcClientCA == "",
+		conf.grpcConfig.tlsSrvCert != "",
+		conf.grpcConfig.tlsSrvClientCA == "",
 		conf.rwClientCert,
 		conf.rwClientKey,
 		conf.rwClientServerCA,
@@ -300,9 +302,14 @@ func runReceive(
 
 	level.Debug(logger).Log("msg", "setting up gRPC server")
 	{
-		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), *conf.grpcCert, *conf.grpcKey, *conf.grpcClientCA)
+		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), conf.grpcConfig.tlsSrvCert, conf.grpcConfig.tlsSrvKey, conf.grpcConfig.tlsSrvClientCA)
 		if err != nil {
 			return errors.Wrap(err, "setup gRPC server")
+		}
+
+		options := []store.ProxyStoreOption{}
+		if debugLogging {
+			options = append(options, store.WithProxyStoreDebugLogging())
 		}
 
 		proxy := store.NewProxyStore(
@@ -313,6 +320,7 @@ func runReceive(
 			labels.Labels{},
 			0,
 			store.LazyRetrieval,
+			options...,
 		)
 		mts := store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, proxy), reg, conf.storeRateLimits)
 		rw := store.ReadWriteTSDBStore{
@@ -327,10 +335,10 @@ func runReceive(
 				if httpProbe.IsReady() {
 					minTime, maxTime := proxy.TimeRange()
 					return &infopb.StoreInfo{
-						MinTime:           minTime,
-						MaxTime:           maxTime,
-						SupportsSharding:  true,
-						SendsSortedSeries: true,
+						MinTime:                      minTime,
+						MaxTime:                      maxTime,
+						SupportsSharding:             true,
+						SupportsWithoutReplicaLabels: true,
 					}
 				}
 				return nil
@@ -343,15 +351,15 @@ func runReceive(
 			grpcserver.WithServer(store.RegisterWritableStoreServer(rw)),
 			grpcserver.WithServer(exemplars.RegisterExemplarsServer(exemplars.NewMultiTSDB(dbs.TSDBExemplars))),
 			grpcserver.WithServer(info.RegisterInfoServer(infoSrv)),
-			grpcserver.WithListen(*conf.grpcBindAddr),
-			grpcserver.WithGracePeriod(time.Duration(*conf.grpcGracePeriod)),
+			grpcserver.WithListen(conf.grpcConfig.bindAddress),
+			grpcserver.WithGracePeriod(conf.grpcConfig.gracePeriod),
+			grpcserver.WithMaxConnAge(conf.grpcConfig.maxConnectionAge),
 			grpcserver.WithTLSConfig(tlsCfg),
-			grpcserver.WithMaxConnAge(*conf.grpcMaxConnAge),
 		)
 
 		g.Add(
 			func() error {
-				level.Info(logger).Log("msg", "listening for StoreAPI and WritableStoreAPI gRPC", "address", *conf.grpcBindAddr)
+				level.Info(logger).Log("msg", "listening for StoreAPI and WritableStoreAPI gRPC", "address", conf.grpcConfig.bindAddress)
 				statusProber.Healthy()
 				return srv.ListenAndServe()
 			},
@@ -740,12 +748,7 @@ type receiveConfig struct {
 	httpGracePeriod *model.Duration
 	httpTLSConfig   *string
 
-	grpcBindAddr    *string
-	grpcGracePeriod *model.Duration
-	grpcCert        *string
-	grpcKey         *string
-	grpcClientCA    *string
-	grpcMaxConnAge  *time.Duration
+	grpcConfig grpcConfig
 
 	rwAddress          string
 	rwServerCert       string
@@ -805,7 +808,7 @@ type receiveConfig struct {
 
 func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 	rc.httpBindAddr, rc.httpGracePeriod, rc.httpTLSConfig = extkingpin.RegisterHTTPFlags(cmd)
-	rc.grpcBindAddr, rc.grpcGracePeriod, rc.grpcCert, rc.grpcKey, rc.grpcClientCA, rc.grpcMaxConnAge = extkingpin.RegisterGRPCFlags(cmd)
+	rc.grpcConfig.registerFlag(cmd)
 	rc.storeRateLimits.RegisterFlags(cmd)
 
 	cmd.Flag("remote-write.address", "Address to listen on for remote write requests.").

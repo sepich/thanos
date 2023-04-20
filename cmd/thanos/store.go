@@ -79,6 +79,7 @@ type storeConfig struct {
 	ignoreDeletionMarksDelay    commonmodel.Duration
 	disableWeb                  bool
 	webConfig                   webConfig
+	label                       string
 	postingOffsetsInMemSampling int
 	cachingBucketConfig         extflag.PathOrContent
 	reqLogConfig                *extflag.PathOrContent
@@ -91,7 +92,7 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.grpcConfig = *sc.grpcConfig.registerFlag(cmd)
 	sc.storeRateLimits.RegisterFlags(cmd)
 
-	cmd.Flag("data-dir", "Local data directory used for caching purposes (index-header, in-mem cache items and meta.jsons). If removed, no data will be lost, just store will have to rebuild the cache. NOTE: Putting raw blocks here will not cause the store to read them. For such use cases use Prometheus + sidecar. Ignored if -no-cache-index-header option is specified.").
+	cmd.Flag("data-dir", "Local data directory used for caching purposes (index-header, in-mem cache items and meta.jsons). If removed, no data will be lost, just store will have to rebuild the cache. NOTE: Putting raw blocks here will not cause the store to read them. For such use cases use Prometheus + sidecar. Ignored if --no-cache-index-header option is specified.").
 		Default("./data").StringVar(&sc.dataDir)
 
 	cmd.Flag("cache-index-header", "Cache TSDB index-headers on disk to reduce startup time. When set to true, Thanos Store will download index headers from remote object storage on startup and create a header file on disk. Use --data-dir to set the directory in which index headers will be downloaded.").
@@ -182,6 +183,8 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 
 	cmd.Flag("web.disable-cors", "Whether to disable CORS headers to be set by Thanos. By default Thanos sets CORS headers to be allowed by all.").
 		Default("false").BoolVar(&sc.webConfig.disableCORS)
+
+	cmd.Flag("bucket-web-label", "External block label to use as group title in the bucket web UI").StringVar(&sc.label)
 
 	sc.reqLogConfig = extkingpin.RegisterRequestLoggingFlags(cmd)
 }
@@ -431,10 +434,10 @@ func runStore(
 			if httpProbe.IsReady() {
 				mint, maxt := bs.TimeRange()
 				return &infopb.StoreInfo{
-					MinTime:           mint,
-					MaxTime:           maxt,
-					SupportsSharding:  true,
-					SendsSortedSeries: true,
+					MinTime:                      mint,
+					MaxTime:                      maxt,
+					SupportsSharding:             true,
+					SupportsWithoutReplicaLabels: true,
 				}
 			}
 			return nil
@@ -453,7 +456,8 @@ func runStore(
 			grpcserver.WithServer(store.RegisterStoreServer(storeServer, logger)),
 			grpcserver.WithServer(info.RegisterInfoServer(infoSrv)),
 			grpcserver.WithListen(conf.grpcConfig.bindAddress),
-			grpcserver.WithGracePeriod(time.Duration(conf.grpcConfig.gracePeriod)),
+			grpcserver.WithGracePeriod(conf.grpcConfig.gracePeriod),
+			grpcserver.WithMaxConnAge(conf.grpcConfig.maxConnectionAge),
 			grpcserver.WithTLSConfig(tlsCfg),
 		)
 
@@ -476,7 +480,7 @@ func runStore(
 
 			// Configure Request Logging for HTTP calls.
 			logMiddleware := logging.NewHTTPServerMiddleware(logger, httpLogOpts...)
-			api := blocksAPI.NewBlocksAPI(logger, conf.webConfig.disableCORS, "", flagsMap, bkt)
+			api := blocksAPI.NewBlocksAPI(logger, conf.webConfig.disableCORS, conf.label, flagsMap, bkt)
 			api.Register(r.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
 
 			metaFetcher.UpdateOnChange(func(blocks []metadata.Meta, err error) {

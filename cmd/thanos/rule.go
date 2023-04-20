@@ -612,7 +612,8 @@ func runRule(
 	options := []grpcserver.Option{
 		grpcserver.WithServer(thanosrules.RegisterRulesServer(ruleMgr)),
 		grpcserver.WithListen(conf.grpc.bindAddress),
-		grpcserver.WithGracePeriod(time.Duration(conf.grpc.gracePeriod)),
+		grpcserver.WithGracePeriod(conf.grpc.gracePeriod),
+		grpcserver.WithGracePeriod(conf.grpc.maxConnectionAge),
 		grpcserver.WithTLSConfig(tlsCfg),
 	}
 	infoOptions := []info.ServerOptionFunc{info.WithRulesInfoFunc()}
@@ -627,10 +628,10 @@ func runRule(
 				if httpProbe.IsReady() {
 					mint, maxt := tsdbStore.TimeRange()
 					return &infopb.StoreInfo{
-						MinTime:           mint,
-						MaxTime:           maxt,
-						SupportsSharding:  true,
-						SendsSortedSeries: true,
+						MinTime:                      mint,
+						MaxTime:                      maxt,
+						SupportsSharding:             true,
+						SupportsWithoutReplicaLabels: true,
 					}
 				}
 				return nil

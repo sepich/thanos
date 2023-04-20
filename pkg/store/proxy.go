@@ -53,11 +53,9 @@ type Client interface {
 	// SupportsSharding returns true if sharding is supported by the underlying store.
 	SupportsSharding() bool
 
-	// SendsSortedSeries returns true if the underlying store sends series sorded by
-	// their labels.
-	// The field can be used to indicate to the querier whether it needs to sort
-	// received series before deduplication.
-	SendsSortedSeries() bool
+	// SupportsWithoutReplicaLabels returns true if trimming replica labels
+	// and sorted response is supported by the underlying store.
+	SupportsWithoutReplicaLabels() bool
 
 	// String returns the string representation of the store client.
 	String() string
@@ -78,6 +76,7 @@ type ProxyStore struct {
 	responseTimeout   time.Duration
 	metrics           *proxyStoreMetrics
 	retrievalStrategy RetrievalStrategy
+	debugLogging      bool
 }
 
 type proxyStoreMetrics struct {
@@ -101,6 +100,16 @@ func RegisterStoreServer(storeSrv storepb.StoreServer, logger log.Logger) func(*
 	}
 }
 
+// BucketStoreOption are functions that configure BucketStore.
+type ProxyStoreOption func(s *ProxyStore)
+
+// WithProxyStoreDebugLogging enables debug logging.
+func WithProxyStoreDebugLogging() ProxyStoreOption {
+	return func(s *ProxyStore) {
+		s.debugLogging = true
+	}
+}
+
 // NewProxyStore returns a new ProxyStore that uses the given clients that implements storeAPI to fan-in all series to the client.
 // Note that there is no deduplication support. Deduplication should be done on the highest level (just before PromQL).
 func NewProxyStore(
@@ -111,6 +120,7 @@ func NewProxyStore(
 	selectorLabels labels.Labels,
 	responseTimeout time.Duration,
 	retrievalStrategy RetrievalStrategy,
+	options ...ProxyStoreOption,
 ) *ProxyStore {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -130,6 +140,11 @@ func NewProxyStore(
 		metrics:           metrics,
 		retrievalStrategy: retrievalStrategy,
 	}
+
+	for _, option := range options {
+		option(s)
+	}
+
 	return s
 }
 
@@ -268,13 +283,16 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, srv storepb.
 		PartialResponseDisabled: originalRequest.PartialResponseDisabled,
 		PartialResponseStrategy: originalRequest.PartialResponseStrategy,
 		ShardInfo:               originalRequest.ShardInfo,
+		WithoutReplicaLabels:    originalRequest.WithoutReplicaLabels,
 	}
 
 	stores := []Client{}
 	for _, st := range s.stores() {
 		// We might be able to skip the store if its meta information indicates it cannot have series matching our query.
 		if ok, reason := storeMatches(srv.Context(), st, originalRequest.MinTime, originalRequest.MaxTime, matchers...); !ok {
-			storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s filtered out: %v", st, reason))
+			if s.debugLogging {
+				storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s filtered out: %v", st, reason))
+			}
 			continue
 		}
 
@@ -290,10 +308,11 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, srv storepb.
 
 	for _, st := range stores {
 		st := st
+		if s.debugLogging {
+			storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s queried", st))
+		}
 
-		storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s queried", st))
-
-		respSet, err := newAsyncRespSet(srv.Context(), st, r, s.responseTimeout, s.retrievalStrategy, st.SupportsSharding(), &s.buffers, r.ShardInfo, reqLogger, s.metrics.emptyStreamResponses)
+		respSet, err := newAsyncRespSet(srv.Context(), st, r, s.responseTimeout, s.retrievalStrategy, &s.buffers, r.ShardInfo, reqLogger, s.metrics.emptyStreamResponses)
 		if err != nil {
 			level.Error(reqLogger).Log("err", err)
 
@@ -384,7 +403,7 @@ func labelSetsMatch(matchers []*labels.Matcher, lset ...labels.Labels) bool {
 	for _, ls := range lset {
 		notMatched := false
 		for _, m := range matchers {
-			if lv := ls.Get(m.Name); lv != "" && !m.Matches(lv) {
+			if lv := ls.Get(m.Name); ls.Has(m.Name) && !m.Matches(lv) {
 				notMatched = true
 				break
 			}
@@ -413,10 +432,14 @@ func (s *ProxyStore) LabelNames(ctx context.Context, r *storepb.LabelNamesReques
 
 		// We might be able to skip the store if its meta information indicates it cannot have series matching our query.
 		if ok, reason := storeMatches(gctx, st, r.Start, r.End); !ok {
-			storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("Store %s filtered out due to %v", st, reason))
+			if s.debugLogging {
+				storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("Store %s filtered out due to %v", st, reason))
+			}
 			continue
 		}
-		storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("Store %s queried", st))
+		if s.debugLogging {
+			storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("Store %s queried", st))
+		}
 
 		g.Go(func() error {
 			resp, err := st.LabelNames(gctx, &storepb.LabelNamesRequest{
@@ -487,10 +510,14 @@ func (s *ProxyStore) LabelValues(ctx context.Context, r *storepb.LabelValuesRequ
 
 		// We might be able to skip the store if its meta information indicates it cannot have series matching our query.
 		if ok, reason := storeMatches(gctx, st, r.Start, r.End); !ok {
-			storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("Store %s filtered out due to %v", st, reason))
+			if s.debugLogging {
+				storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("Store %s filtered out due to %v", st, reason))
+			}
 			continue
 		}
-		storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("Store %s queried", st))
+		if s.debugLogging {
+			storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("Store %s queried", st))
+		}
 
 		g.Go(func() error {
 			resp, err := st.LabelValues(gctx, &storepb.LabelValuesRequest{

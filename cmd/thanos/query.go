@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	grpc_logging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
@@ -25,9 +27,8 @@ import (
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
-	"google.golang.org/grpc"
-
 	v1 "github.com/prometheus/prometheus/web/api/v1"
+
 	"github.com/thanos-community/promql-engine/engine"
 
 	apiv1 "github.com/thanos-io/thanos/pkg/api/query"
@@ -72,13 +73,22 @@ const (
 	promqlEngineThanos     promqlEngineType = "thanos"
 )
 
+type queryMode string
+
+const (
+	queryModeLocal       queryMode = "local"
+	queryModeDistributed queryMode = "distributed"
+)
+
 // registerQuery registers a query command.
 func registerQuery(app *extkingpin.App) {
 	comp := component.Query
 	cmd := app.Command(comp.String(), "Query node exposing PromQL enabled Query API with data retrieved from multiple store nodes.")
 
 	httpBindAddr, httpGracePeriod, httpTLSConfig := extkingpin.RegisterHTTPFlags(cmd)
-	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA, grpcMaxConnAge := extkingpin.RegisterGRPCFlags(cmd)
+
+	var grpcServerConfig grpcConfig
+	grpcServerConfig.registerFlag(cmd)
 
 	secure := cmd.Flag("grpc-client-tls-secure", "Use TLS when talking to the gRPC server").Default("false").Bool()
 	skipVerify := cmd.Flag("grpc-client-tls-skip-verify", "Disable TLS certificate verification i.e self signed, signed by fake CA").Default("false").Bool()
@@ -101,6 +111,11 @@ func registerQuery(app *extkingpin.App) {
 
 	promqlEngine := cmd.Flag("query.promql-engine", "PromQL engine to use.").Default(string(promqlEnginePrometheus)).
 		Enum(string(promqlEnginePrometheus), string(promqlEngineThanos))
+
+	promqlQueryMode := cmd.Flag("query.mode", "PromQL query mode. One of: local, distributed.").
+		Hidden().
+		Default(string(queryModeLocal)).
+		Enum(string(queryModeLocal), string(queryModeDistributed))
 
 	maxConcurrentQueries := cmd.Flag("query.max-concurrent", "Maximum number of queries processed concurrently by query node.").
 		Default("20").Int()
@@ -214,7 +229,7 @@ func registerQuery(app *extkingpin.App) {
 	var storeRateLimits store.SeriesSelectLimits
 	storeRateLimits.RegisterFlags(cmd)
 
-	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, debugLogging bool) error {
 		selectorLset, err := parseFlagLabels(*selectorLabels)
 		if err != nil {
 			return errors.Wrap(err, "parse federation labels")
@@ -263,17 +278,13 @@ func registerQuery(app *extkingpin.App) {
 		return runQuery(
 			g,
 			logger,
+			debugLogging,
 			reg,
 			tracer,
 			httpLogOpts,
 			grpcLogOpts,
 			tagOpts,
-			*grpcBindAddr,
-			time.Duration(*grpcGracePeriod),
-			*grpcCert,
-			*grpcKey,
-			*grpcClientCA,
-			*grpcMaxConnAge,
+			grpcServerConfig,
 			*grpcCompression,
 			*secure,
 			*skipVerify,
@@ -333,6 +344,7 @@ func registerQuery(app *extkingpin.App) {
 			*queryTelemetrySeriesQuantiles,
 			promqlEngineType(*promqlEngine),
 			storeRateLimits,
+			queryMode(*promqlQueryMode),
 		)
 	})
 }
@@ -342,17 +354,13 @@ func registerQuery(app *extkingpin.App) {
 func runQuery(
 	g *run.Group,
 	logger log.Logger,
+	debugLogging bool,
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
 	httpLogOpts []logging.Option,
 	grpcLogOpts []grpc_logging.Option,
 	tagOpts []tags.Option,
-	grpcBindAddr string,
-	grpcGracePeriod time.Duration,
-	grpcCert string,
-	grpcKey string,
-	grpcClientCA string,
-	grpcMaxConnAge time.Duration,
+	grpcServerConfig grpcConfig,
 	grpcCompression string,
 	secure bool,
 	skipVerify bool,
@@ -412,6 +420,7 @@ func runQuery(
 	queryTelemetrySeriesQuantiles []int64,
 	promqlEngine promqlEngineType,
 	storeRateLimits store.SeriesSelectLimits,
+	queryMode queryMode,
 ) error {
 	if alertQueryURL == "" {
 		lastColon := strings.LastIndex(httpBindAddr, ":")
@@ -483,6 +492,11 @@ func runQuery(
 		dns.ResolverType(dnsSDResolver),
 	)
 
+	options := []store.ProxyStoreOption{}
+	if debugLogging {
+		options = append(options, store.WithProxyStoreDebugLogging())
+	}
+
 	var (
 		endpoints = query.NewEndpointSet(
 			time.Now,
@@ -534,7 +548,7 @@ func runQuery(
 			endpointInfoTimeout,
 			queryConnMetricLabels...,
 		)
-		proxy            = store.NewProxyStore(logger, reg, endpoints.GetStoreClients, component.Query, selectorLset, storeResponseTimeout, store.RetrievalStrategy(grpcProxyStrategy))
+		proxy            = store.NewProxyStore(logger, reg, endpoints.GetStoreClients, component.Query, selectorLset, storeResponseTimeout, store.RetrievalStrategy(grpcProxyStrategy), options...)
 		rulesProxy       = rules.NewProxy(logger, endpoints.GetRulesClients)
 		targetsProxy     = targets.NewProxy(logger, endpoints.GetTargetsClients)
 		metadataProxy    = metadata.NewProxy(logger, endpoints.GetMetricMetadataClients)
@@ -667,7 +681,17 @@ func runQuery(
 	case promqlEnginePrometheus:
 		queryEngine = promql.NewEngine(engineOpts)
 	case promqlEngineThanos:
-		queryEngine = engine.New(engine.Opts{EngineOpts: engineOpts})
+		if queryMode == queryModeLocal {
+			queryEngine = engine.New(engine.Opts{EngineOpts: engineOpts})
+		} else {
+			remoteEngineEndpoints := query.NewRemoteEndpoints(logger, endpoints.GetQueryAPIClients, query.Opts{
+				AutoDownsample:        enableAutodownsampling,
+				ReplicaLabels:         queryReplicaLabels,
+				Timeout:               queryTimeout,
+				EnablePartialResponse: enableQueryPartialResponse,
+			})
+			queryEngine = engine.NewDistributedEngine(engine.Opts{EngineOpts: engineOpts}, remoteEngineEndpoints)
+		}
 	default:
 		return errors.Errorf("unknown query.promql-engine type %v", promqlEngine)
 	}
@@ -759,7 +783,7 @@ func runQuery(
 	}
 	// Start query (proxy) gRPC StoreAPI.
 	{
-		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcCert, grpcKey, grpcClientCA)
+		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcServerConfig.tlsSrvCert, grpcServerConfig.tlsSrvKey, grpcServerConfig.tlsSrvClientCA)
 		if err != nil {
 			return errors.Wrap(err, "setup gRPC server")
 		}
@@ -770,11 +794,12 @@ func runQuery(
 			info.WithStoreInfoFunc(func() *infopb.StoreInfo {
 				if httpProbe.IsReady() {
 					mint, maxt := proxy.TimeRange()
+
 					return &infopb.StoreInfo{
-						MinTime:           mint,
-						MaxTime:           maxt,
-						SupportsSharding:  true,
-						SendsSortedSeries: true,
+						MinTime:                      mint,
+						MaxTime:                      maxt,
+						SupportsSharding:             true,
+						SupportsWithoutReplicaLabels: true,
 					}
 				}
 				return nil
@@ -796,10 +821,10 @@ func runQuery(
 			grpcserver.WithServer(metadata.RegisterMetadataServer(metadataProxy)),
 			grpcserver.WithServer(exemplars.RegisterExemplarsServer(exemplarsProxy)),
 			grpcserver.WithServer(info.RegisterInfoServer(infoSrv)),
-			grpcserver.WithListen(grpcBindAddr),
-			grpcserver.WithGracePeriod(grpcGracePeriod),
+			grpcserver.WithListen(grpcServerConfig.bindAddress),
+			grpcserver.WithGracePeriod(grpcServerConfig.gracePeriod),
+			grpcserver.WithMaxConnAge(grpcServerConfig.maxConnectionAge),
 			grpcserver.WithTLSConfig(tlsCfg),
-			grpcserver.WithMaxConnAge(grpcMaxConnAge),
 		)
 
 		g.Add(func() error {
