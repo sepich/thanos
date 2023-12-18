@@ -8,6 +8,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 	"io"
 	stdlog "log"
 	"math"
@@ -60,8 +62,9 @@ const (
 	// LimitStatsQueryParam is the query parameter for limiting the amount of returned TSDB stats.
 	LimitStatsQueryParam = "limit"
 	// Labels for metrics.
-	labelSuccess = "success"
-	labelError   = "error"
+	labelSuccess      = "success"
+	labelError        = "error"
+	metaLabelTenantID = model.MetaLabelPrefix + "tenant_id"
 )
 
 var (
@@ -529,7 +532,7 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply relabeling configs.
-	h.relabel(&wreq)
+	h.relabel(&wreq, &tenant)
 	if len(wreq.Timeseries) == 0 {
 		level.Debug(tLogger).Log("msg", "remote write request dropped due to relabeling.")
 		return
@@ -614,6 +617,10 @@ func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *p
 
 // writeQuorum returns minimum number of replicas that has to confirm write success before claiming replication success.
 func (h *Handler) writeQuorum() int {
+	// special case for 2 replicas: to be available when one replica down (#3194)
+	if h.options.ReplicationFactor == 2 {
+		return 1
+	}
 	return int((h.options.ReplicationFactor / 2) + 1)
 }
 
@@ -839,21 +846,28 @@ func (h *Handler) RemoteWrite(ctx context.Context, r *storepb.WriteRequest) (*st
 }
 
 // relabel relabels the time series labels in the remote write request.
-func (h *Handler) relabel(wreq *prompb.WriteRequest) {
+func (h *Handler) relabel(wreq *prompb.WriteRequest, tenant *string) {
 	if len(h.options.RelabelConfigs) == 0 {
 		return
 	}
 	timeSeries := make([]prompb.TimeSeries, 0, len(wreq.Timeseries))
+	lb := labels.NewBuilder(labels.EmptyLabels())
+	newTenant := ""
 	for _, ts := range wreq.Timeseries {
-		var keep bool
-		lbls, keep := relabel.Process(labelpb.ZLabelsToPromLabels(ts.Labels), h.options.RelabelConfigs...)
-		if !keep {
+		lb.Reset(labelpb.ZLabelsToPromLabels(ts.Labels))
+		lb.Set(metaLabelTenantID, *tenant)
+		if keep := relabel.ProcessBuilder(lb, h.options.RelabelConfigs...); !keep {
 			continue
 		}
-		ts.Labels = labelpb.ZLabelsFromPromLabels(lbls)
+		newTenant = lb.Get(metaLabelTenantID)
+		lb.Del(metaLabelTenantID)
+		ts.Labels = labelpb.ZLabelsFromPromLabels(lb.Labels())
 		timeSeries = append(timeSeries, ts)
 	}
 	wreq.Timeseries = timeSeries
+	if newTenant != *tenant {
+		*tenant = newTenant
+	}
 }
 
 // isConflict returns whether or not the given error represents a conflict.
