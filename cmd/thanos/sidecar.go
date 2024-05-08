@@ -436,7 +436,7 @@ func (s *promMetadata) UpdateLabels(ctx context.Context) error {
 	var elset []labelpb.ZLabelSet
 	if s.mimir {
 		l, err := s.client.LabelValuesInGRPC(ctx, s.promURL, "prometheus",
-			[]*labels.Matcher{{Name: "__name__", Type: labels.MatchEqual, Value: "prometheus_build_info"}},
+			[]*labels.Matcher{},
 			s.limitMinTime.PrometheusTimestamp(),
 			timestamp.FromTime(time.Now()),
 		)
