@@ -21,8 +21,11 @@ import (
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/teststorage"
+
+	"github.com/thanos-io/thanos/pkg/extpromql"
 )
 
 var (
@@ -52,7 +55,7 @@ func timeMilliseconds(t time.Time) int64 {
 type test struct {
 	testing.TB
 
-	cmds       []interface{}
+	cmds       []any
 	rootEngine *promql.Engine
 	stores     []*testStore
 
@@ -88,7 +91,7 @@ func (s *testStore) close(t testing.TB) {
 }
 
 // NewTest returns an initialized empty Test.
-// It's compatible with promql.Test, allowing additionally multi StoreAPIs for query pushdown testing.
+// It's compatible with promql.Test, allowing additionally multi StoreAPIs.
 // TODO(bwplotka): Move to unittest and add add support for multi-store upstream. See: https://github.com/prometheus/prometheus/pull/8300
 func newTest(t testing.TB, input string) (*test, error) {
 	cmds, err := parse(input)
@@ -153,7 +156,7 @@ func getLines(input string) []string {
 }
 
 // parse parses the given input and returns command sequence.
-func parse(input string) (cmds []interface{}, err error) {
+func parse(input string) (cmds []any, err error) {
 	lines := getLines(input)
 
 	// Scan for steps line by line.
@@ -162,7 +165,7 @@ func parse(input string) (cmds []interface{}, err error) {
 		if l == "" {
 			continue
 		}
-		var cmd interface{}
+		var cmd any
 
 		switch c := strings.ToLower(patSpace.Split(l, 2)[0]); {
 		case c == "clear":
@@ -184,7 +187,7 @@ func parse(input string) (cmds []interface{}, err error) {
 	return cmds, nil
 }
 
-func raise(line int, format string, v ...interface{}) error {
+func raise(line int, format string, v ...any) error {
 	return &parser.ParseErr{
 		LineOffset: line,
 		Err:        errors.Errorf(format, v...),
@@ -203,7 +206,7 @@ func (t *test) run(createQueryableFn func([]*testStore) storage.Queryable) error
 }
 
 // exec processes a single step of the test.
-func (t *test) exec(tc interface{}, createQueryableFn func([]*testStore) storage.Queryable) error {
+func (t *test) exec(tc any, createQueryableFn func([]*testStore) storage.Queryable) error {
 	switch cmd := tc.(type) {
 	case *clearCmd:
 		t.reset()
@@ -260,7 +263,7 @@ func ParseStore(lines []string, i int) (int, *storeCmd, error) {
 	}
 	parts := patStore.FindStringSubmatch(lines[i])
 
-	m, err := parser.ParseMetricSelector(parts[1])
+	m, err := extpromql.ParseMetricSelector(parts[1])
 	if err != nil {
 		return i, nil, raise(i, "invalid matcher definition %q: %s", parts[1], err)
 	}
@@ -321,11 +324,11 @@ func ParseEval(lines []string, i int) (int, *evalCmd, error) {
 		at   = parts[2]
 		expr = parts[3]
 	)
-	_, err := parser.ParseExpr(expr)
+	_, err := extpromql.ParseExpr(expr)
 	if err != nil {
 		if perr, ok := err.(*parser.ParseErr); ok {
 			perr.LineOffset = i
-			posOffset := parser.Pos(strings.Index(lines[i], expr))
+			posOffset := posrange.Pos(strings.Index(lines[i], expr))
 			perr.PositionRange.Start += posOffset
 			perr.PositionRange.End += posOffset
 			perr.Query = lines[i]
@@ -355,7 +358,7 @@ func ParseEval(lines []string, i int) (int, *evalCmd, error) {
 			break
 		}
 		if f, err := parseNumber(defLine); err == nil {
-			cmd.expect(0, nil, parser.SequenceValue{Value: f})
+			cmd.expect(0, parser.SequenceValue{Value: f})
 			break
 		}
 		metric, vals, err := parser.ParseSeriesDesc(defLine)
@@ -370,7 +373,7 @@ func ParseEval(lines []string, i int) (int, *evalCmd, error) {
 		if len(vals) > 1 {
 			return i, nil, raise(i, "expecting multiple values in instant evaluation not allowed")
 		}
-		cmd.expect(j, metric, vals...)
+		cmd.expectMetric(j, metric, vals...)
 	}
 	return i, cmd, nil
 }
@@ -392,14 +395,14 @@ func parseNumber(s string) (float64, error) {
 type loadCmd struct {
 	gap     time.Duration
 	metrics map[uint64]labels.Labels
-	defs    map[uint64][]promql.Point
+	defs    map[uint64][]promql.FPoint
 }
 
 func newLoadCmd(gap time.Duration) *loadCmd {
 	return &loadCmd{
 		gap:     gap,
 		metrics: map[uint64]labels.Labels{},
-		defs:    map[uint64][]promql.Point{},
+		defs:    map[uint64][]promql.FPoint{},
 	}
 }
 
@@ -411,13 +414,13 @@ func (cmd loadCmd) String() string {
 func (cmd *loadCmd) set(m labels.Labels, vals ...parser.SequenceValue) {
 	h := m.Hash()
 
-	samples := make([]promql.Point, 0, len(vals))
+	samples := make([]promql.FPoint, 0, len(vals))
 	ts := testStartTime
 	for _, v := range vals {
 		if !v.Omitted {
-			samples = append(samples, promql.Point{
+			samples = append(samples, promql.FPoint{
 				T: ts.UnixNano() / int64(time.Millisecond/time.Nanosecond),
-				V: v.Value,
+				F: v.Value,
 			})
 		}
 		ts = ts.Add(cmd.gap)
@@ -432,7 +435,7 @@ func (cmd *loadCmd) Append(a storage.Appender) error {
 		m := cmd.metrics[h]
 
 		for _, s := range smpls {
-			if _, err := a.Append(0, m, s.T, s.V); err != nil {
+			if _, err := a.Append(0, m, s.T, s.F); err != nil {
 				return err
 			}
 		}
@@ -477,13 +480,15 @@ func (ev *evalCmd) String() string {
 	return "eval"
 }
 
-// expect adds a new metric with a sequence of values to the set of expected
+// expect adds a sequence of values to the set of expected
 // results for the query.
-func (ev *evalCmd) expect(pos int, m labels.Labels, vals ...parser.SequenceValue) {
-	if m == nil {
-		ev.expected[0] = entry{pos: pos, vals: vals}
-		return
-	}
+func (ev *evalCmd) expect(pos int, vals ...parser.SequenceValue) {
+	ev.expected[0] = entry{pos: pos, vals: vals}
+}
+
+// expectMetric adds a new metric with a sequence of values to the set of expected
+// results for the query.
+func (ev *evalCmd) expectMetric(pos int, m labels.Labels, vals ...parser.SequenceValue) {
 	h := m.Hash()
 	ev.metrics[h] = m
 	ev.expected[h] = entry{pos: pos, vals: vals}
@@ -528,8 +533,8 @@ func (ev *evalCmd) compareResult(result parser.Value) error {
 			if ev.ordered && exp.pos != pos+1 {
 				return errors.Errorf("expected metric %s with %v at position %d but was at %d", v.Metric, exp.vals, exp.pos, pos+1)
 			}
-			if !almostEqual(exp.vals[0].Value, v.V) {
-				return errors.Errorf("expected %v for %s but got %v", exp.vals[0].Value, v.Metric, v.V)
+			if !almostEqual(exp.vals[0].Value, v.F) {
+				return errors.Errorf("expected %v for %s but got %v", exp.vals[0].Value, v.Metric, v.F)
 			}
 
 			seen[fp] = true
@@ -538,7 +543,7 @@ func (ev *evalCmd) compareResult(result parser.Value) error {
 			if !seen[fp] {
 				details := fmt.Sprintln("vector result", len(val), ev.expr)
 				for _, ss := range val {
-					details += fmt.Sprintln("    ", ss.Metric, ss.Point)
+					details += fmt.Sprintln("    ", ss.Metric, ss.T, ss.F)
 				}
 				return errors.Errorf("expected metric %s with %v not found; details: %v", ev.metrics[fp], expVals, details)
 			}
@@ -556,7 +561,7 @@ func (ev *evalCmd) compareResult(result parser.Value) error {
 }
 
 func (ev *evalCmd) Eval(ctx context.Context, queryEngine *promql.Engine, queryable storage.Queryable) error {
-	q, err := queryEngine.NewInstantQuery(queryable, &promql.QueryOpts{}, ev.expr, ev.start)
+	q, err := queryEngine.NewInstantQuery(ctx, queryable, promql.NewPrometheusQueryOpts(false, 0), ev.expr, ev.start)
 	if err != nil {
 		return err
 	}
@@ -580,7 +585,7 @@ func (ev *evalCmd) Eval(ctx context.Context, queryEngine *promql.Engine, queryab
 
 	// Check query returns same result in range mode,
 	// by checking against the middle step.
-	q, err = queryEngine.NewRangeQuery(queryable, &promql.QueryOpts{}, ev.expr, ev.start.Add(-time.Minute), ev.start.Add(time.Minute), time.Minute)
+	q, err = queryEngine.NewRangeQuery(ctx, queryable, promql.NewPrometheusQueryOpts(false, 0), ev.expr, ev.start.Add(-time.Minute), ev.start.Add(time.Minute), time.Minute)
 	if err != nil {
 		return err
 	}
@@ -596,15 +601,15 @@ func (ev *evalCmd) Eval(ctx context.Context, queryEngine *promql.Engine, queryab
 	mat := rangeRes.Value.(promql.Matrix)
 	vec := make(promql.Vector, 0, len(mat))
 	for _, series := range mat {
-		for _, point := range series.Points {
+		for _, point := range series.Floats {
 			if point.T == timeMilliseconds(ev.start) {
-				vec = append(vec, promql.Sample{Metric: series.Metric, Point: point})
+				vec = append(vec, promql.Sample{Metric: series.Metric, T: point.T, F: point.F})
 				break
 			}
 		}
 	}
 	if _, ok := res.Value.(promql.Scalar); ok {
-		err = ev.compareResult(promql.Scalar{V: vec[0].Point.V})
+		err = ev.compareResult(promql.Scalar{V: vec[0].F})
 	} else {
 		err = ev.compareResult(vec)
 	}

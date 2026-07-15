@@ -8,18 +8,22 @@ import (
 	"os"
 	execlib "os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/efficientgo/e2e"
 	e2edb "github.com/efficientgo/e2e/db"
 	e2einteractive "github.com/efficientgo/e2e/interactive"
 	e2emon "github.com/efficientgo/e2e/monitoring"
+	e2eprof "github.com/efficientgo/e2e/profiling"
+
 	"github.com/efficientgo/e2e/monitoring/promconfig"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"gopkg.in/yaml.v2"
 
 	"github.com/efficientgo/core/testutil"
+	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
 	"github.com/thanos-io/objstore/providers/s3"
 	tracingclient "github.com/thanos-io/thanos/pkg/tracing/client"
@@ -121,6 +125,9 @@ func TestReadOnlyThanosSetup(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e.Close)
 
+	p, err := e2eprof.Start(e)
+	testutil.Ok(t, err)
+
 	m, err := e2emon.Start(e)
 	testutil.Ok(t, err)
 
@@ -170,7 +177,7 @@ func TestReadOnlyThanosSetup(t *testing.T) {
 	//	                    │           │
 	//	                    └───────────┘
 	bkt1Config, err := yaml.Marshal(client.BucketConfig{
-		Type: client.S3,
+		Type: objstore.S3,
 		Config: s3.Config{
 			Bucket:    "bkt1",
 			AccessKey: e2edb.MinioAccessKey,
@@ -192,7 +199,7 @@ func TestReadOnlyThanosSetup(t *testing.T) {
 	)
 
 	bkt2Config, err := yaml.Marshal(client.BucketConfig{
-		Type: client.S3,
+		Type: objstore.S3,
 		Config: s3.Config{
 			Bucket:    "bkt2",
 			AccessKey: e2edb.MinioAccessKey,
@@ -324,19 +331,25 @@ func TestReadOnlyThanosSetup(t *testing.T) {
 	//                                                                         │   Sidecar  │◄─────┘
 	//                                                                         └────────────┘
 	//
+
+	storeAPIEndpoints := []string{
+		store1.InternalEndpoint("grpc"),
+		store2.InternalEndpoint("grpc"),
+		sidecarHA0.InternalEndpoint("grpc"),
+		sidecarHA1.InternalEndpoint("grpc"),
+		sidecar2.InternalEndpoint("grpc"),
+		receive1.InternalEndpoint("grpc"),
+	}
+
 	query1 := e2edb.NewThanosQuerier(
 		e,
 		"query1",
-		[]string{
-			store1.InternalEndpoint("grpc"),
-			store2.InternalEndpoint("grpc"),
-			sidecarHA0.InternalEndpoint("grpc"),
-			sidecarHA1.InternalEndpoint("grpc"),
-			sidecar2.InternalEndpoint("grpc"),
-			receive1.InternalEndpoint("grpc"),
-		},
+		[]string{},
 		e2edb.WithImage("thanos:latest"),
-		e2edb.WithFlagOverride(map[string]string{"--tracing.config": string(jaegerConfig)}),
+		e2edb.WithFlagOverride(map[string]string{
+			"--tracing.config": string(jaegerConfig),
+			"--endpoint":       strings.Join(storeAPIEndpoints, ","),
+		}),
 	)
 	testutil.Ok(t, e2e.StartAndWaitReady(query1))
 
@@ -349,6 +362,8 @@ func TestReadOnlyThanosSetup(t *testing.T) {
 
 	// Tracing endpoint.
 	testutil.Ok(t, e2einteractive.OpenInBrowser("http://"+j.Endpoint("http-front")))
+	// Profiling Endpoint.
+	testutil.Ok(t, p.OpenUserInterfaceInBrowser())
 	// Monitoring Endpoint.
 	testutil.Ok(t, m.OpenUserInterfaceInBrowser())
 	testutil.Ok(t, e2einteractive.RunUntilEndpointHit())

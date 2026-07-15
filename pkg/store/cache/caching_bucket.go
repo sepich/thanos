@@ -132,7 +132,13 @@ func (cb *CachingBucket) Iter(ctx context.Context, dir string, f func(string) er
 	}
 
 	cb.operationRequests.WithLabelValues(objstore.OpIter, cfgName).Inc()
-	iterVerb := cachekey.BucketCacheKey{Verb: cachekey.IterVerb, Name: dir}
+
+	iterVerb := cachekey.BucketCacheKey{Verb: cachekey.IterVerb, Name: dir, ObjectStorageConfigHash: cfg.ConfigHash}
+	opts := objstore.ApplyIterOptions(options...)
+	if opts.Recursive {
+		iterVerb.Verb = cachekey.IterRecursiveVerb
+	}
+
 	key := iterVerb.String()
 	data := cfg.Cache.Fetch(ctx, []string{key})
 	if data[key] != nil {
@@ -358,10 +364,7 @@ func (cb *CachingBucket) cachedGetRange(ctx context.Context, name string, offset
 
 	totalRequestedBytes := int64(0)
 	for off := startRange; off < endRange; off += cfg.SubrangeSize {
-		end := off + cfg.SubrangeSize
-		if end > attrs.Size {
-			end = attrs.Size
-		}
+		end := min(off+cfg.SubrangeSize, attrs.Size)
 		totalRequestedBytes += (end - off)
 		objectSubrange := cachekey.BucketCacheKey{Verb: cachekey.SubrangeVerb, Name: name, Start: off, End: end}
 		k := objectSubrange.String()
@@ -419,7 +422,6 @@ func (cb *CachingBucket) fetchMissingSubranges(ctx context.Context, name string,
 	// Run parallel queries for each missing range. Fetched data is stored into 'hits' map, protected by hitsMutex.
 	g, gctx := errgroup.WithContext(ctx)
 	for _, m := range missing {
-		m := m
 		g.Go(func() error {
 			r, err := cb.Bucket.GetRange(gctx, name, m.start, m.end-m.start)
 			if err != nil {

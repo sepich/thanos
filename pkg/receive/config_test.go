@@ -14,9 +14,11 @@ import (
 )
 
 func TestValidateConfig(t *testing.T) {
+	t.Parallel()
+
 	for _, tc := range []struct {
 		name string
-		cfg  interface{}
+		cfg  any
 		err  error
 	}{
 		{
@@ -38,7 +40,7 @@ func TestValidateConfig(t *testing.T) {
 			name: "valid config",
 			cfg: []HashringConfig{
 				{
-					Endpoints: []string{"node1"},
+					Endpoints: []Endpoint{{Address: "node1"}},
 				},
 			},
 			err: nil, // means it's valid.
@@ -68,6 +70,56 @@ func TestValidateConfig(t *testing.T) {
 			if err := cw.ValidateConfig(); err != nil && !errors.Is(err, tc.err) {
 				t.Errorf("case %q: got unexpected error: %v", tc.name, err)
 			}
+		})
+	}
+}
+
+func TestUnmarshalEndpointSlice(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		json      string
+		endpoints []Endpoint
+		expectErr bool
+	}{
+		{
+			name:      "Endpoint with empty address",
+			json:      `[{"az": "az-1"}]`,
+			endpoints: []Endpoint{{Address: "node-1", CapNProtoAddress: "node-1:19391"}},
+			expectErr: true,
+		},
+		{
+			name:      "Endpoints as string slice",
+			json:      `["node-1"]`,
+			endpoints: []Endpoint{{Address: "node-1", CapNProtoAddress: "node-1:19391"}},
+		},
+		{
+			name:      "Endpoints as endpoints slice",
+			json:      `[{"address": "node-1", "az": "az-1"}]`,
+			endpoints: []Endpoint{{Address: "node-1", CapNProtoAddress: "node-1:19391", AZ: "az-1"}},
+		},
+		{
+			name:      "Endpoints as string slice with port",
+			json:      `["node-1:80"]`,
+			endpoints: []Endpoint{{Address: "node-1:80", CapNProtoAddress: "node-1:19391"}},
+		},
+		{
+			name:      "Endpoints as string slice with capnproto port",
+			json:      `[{"address": "node-1", "capnproto_address": "node-1:81"}]`,
+			endpoints: []Endpoint{{Address: "node-1", CapNProtoAddress: "node-1:81"}},
+		},
+	}
+	for _, tcase := range cases {
+		t.Run(tcase.name, func(t *testing.T) {
+			var endpoints []Endpoint
+			err := json.Unmarshal([]byte(tcase.json), &endpoints)
+			if tcase.expectErr {
+				testutil.NotOk(t, err)
+				return
+			}
+			testutil.Ok(t, err)
+			testutil.Equals(t, tcase.endpoints, endpoints)
 		})
 	}
 }

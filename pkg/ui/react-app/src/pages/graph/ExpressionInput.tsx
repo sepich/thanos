@@ -15,7 +15,7 @@ import {
   closeBracketsKeymap,
   closeBrackets,
 } from '@codemirror/autocomplete';
-import { baseTheme, lightTheme, darkTheme, promqlHighlighter } from './CMTheme';
+import { baseTheme, lightTheme, darkTheme, promqlHighlighter, darkPromqlHighlighter } from './CMTheme';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faSearch, faSpinner } from '@fortawesome/free-solid-svg-icons';
 import PathPrefixProps from '../../types/PathPrefixProps';
@@ -33,10 +33,16 @@ interface CMExpressionInputProps {
   enableAutocomplete: boolean;
   enableHighlighting: boolean;
   enableLinter: boolean;
+  executeExplain: () => void;
+  disableExplain: boolean;
 }
 
 const dynamicConfigCompartment = new Compartment();
 
+export interface ExplainTree {
+  name: string;
+  children?: ExplainTree[];
+}
 // Autocompletion strategy that wraps the main one and enriches
 // it with past query items.
 export class HistoryCompleteStrategy implements CompleteStrategy {
@@ -88,11 +94,12 @@ const ExpressionInput: FC<PathPrefixProps & CMExpressionInputProps> = ({
   enableAutocomplete,
   enableHighlighting,
   enableLinter,
+  executeExplain,
+  disableExplain,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const { theme } = useTheme();
-
   // (Re)initialize editor based on settings / setting changes.
   useEffect(() => {
     // Build the dynamic part of the config.
@@ -107,8 +114,10 @@ const ExpressionInput: FC<PathPrefixProps & CMExpressionInputProps> = ({
           queryHistory
         ),
       });
+
+    const highlighter = syntaxHighlighting(theme === 'dark' ? darkPromqlHighlighter : promqlHighlighter);
     const dynamicConfig = [
-      enableHighlighting ? syntaxHighlighting(promqlHighlighter) : [],
+      enableHighlighting ? highlighter : [],
       promqlExtension.asExtension(),
       theme === 'dark' ? darkTheme : lightTheme,
     ];
@@ -205,6 +214,9 @@ const ExpressionInput: FC<PathPrefixProps & CMExpressionInputProps> = ({
             Execute
           </Button>
         </InputGroupAddon>
+        <Button className="ml-2" color="info" onClick={executeExplain} disabled={disableExplain}>
+          Explain
+        </Button>
       </InputGroup>
     </>
   );

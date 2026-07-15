@@ -4,12 +4,18 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	crand "crypto/rand"
+	"io"
 	"math"
 	"math/rand"
+	"os"
+	"slices"
 	"strconv"
 	"testing"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
@@ -19,7 +25,65 @@ import (
 	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
 )
 
+func TestStreamedSnappyMaximumDecodedLen(t *testing.T) {
+	if testing.
+		Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+
+	t.Run("compressed", func(t *testing.T) {
+		b := make([]byte, 100)
+		for i := range 100 {
+			b[i] = 0x42
+		}
+
+		snappyEncoded := &bytes.Buffer{}
+
+		sw := s2.NewWriter(snappyEncoded, s2.WriterSnappyCompat(), s2.WriterBestCompression())
+
+		_, err := sw.Write(b)
+		testutil.Ok(t, err)
+
+		testutil.Ok(t, sw.Close())
+
+		maxLen, err := maximumDecodedLenSnappyStreamed(snappyEncoded.Bytes())
+		testutil.Ok(t, err)
+		t.Log(maxLen)
+		testutil.Assert(t, maxLen == 100)
+	})
+	t.Run("random", func(t *testing.T) {
+		for i := 10000; i < 30000; i++ {
+			b := make([]byte, i)
+			_, err := crand.Read(b)
+			testutil.Ok(t, err)
+
+			snappyEncoded := &bytes.Buffer{}
+
+			sw := s2.NewWriter(snappyEncoded, s2.WriterSnappyCompat())
+
+			_, err = sw.Write(b)
+			testutil.Ok(t, err)
+
+			testutil.Ok(t, sw.Close())
+
+			maxLen, err := maximumDecodedLenSnappyStreamed(snappyEncoded.Bytes())
+			testutil.Ok(t, err)
+			testutil.Assert(t, maxLen > 100)
+			testutil.Assert(t, maxLen < 30000)
+		}
+	})
+}
+
 func TestDiffVarintCodec(t *testing.T) {
+	if testing.
+		Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+
 	chunksDir := t.TempDir()
 
 	headOpts := tsdb.DefaultHeadOptions()
@@ -39,26 +103,30 @@ func TestDiffVarintCodec(t *testing.T) {
 		testutil.Ok(t, idx.Close())
 	}()
 
+	ctx := context.TODO()
 	postingsMap := map[string]index.Postings{
-		"all":      allPostings(t, idx),
-		`n="1"`:    matchPostings(t, idx, labels.MustNewMatcher(labels.MatchEqual, "n", "1"+storetestutil.LabelLongSuffix)),
-		`j="foo"`:  matchPostings(t, idx, labels.MustNewMatcher(labels.MatchEqual, "j", "foo")),
-		`j!="foo"`: matchPostings(t, idx, labels.MustNewMatcher(labels.MatchNotEqual, "j", "foo")),
-		`i=~".*"`:  matchPostings(t, idx, labels.MustNewMatcher(labels.MatchRegexp, "i", ".*")),
-		`i=~".+"`:  matchPostings(t, idx, labels.MustNewMatcher(labels.MatchRegexp, "i", ".+")),
-		`i=~"1.+"`: matchPostings(t, idx, labels.MustNewMatcher(labels.MatchRegexp, "i", "1.+")),
-		`i=~"^$"'`: matchPostings(t, idx, labels.MustNewMatcher(labels.MatchRegexp, "i", "^$")),
-		`i!~""`:    matchPostings(t, idx, labels.MustNewMatcher(labels.MatchNotEqual, "i", "")),
-		`n!="2"`:   matchPostings(t, idx, labels.MustNewMatcher(labels.MatchNotEqual, "n", "2"+storetestutil.LabelLongSuffix)),
-		`i!~"2.*"`: matchPostings(t, idx, labels.MustNewMatcher(labels.MatchNotRegexp, "i", "^2.*$")),
+		"all":      allPostings(ctx, t, idx),
+		`n="1"`:    matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchEqual, "n", "1"+storetestutil.LabelLongSuffix)),
+		`j="foo"`:  matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchEqual, "j", "foo")),
+		`j!="foo"`: matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchNotEqual, "j", "foo")),
+		`i=~".*"`:  matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchRegexp, "i", ".*")),
+		`i=~".+"`:  matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchRegexp, "i", ".+")),
+		`i=~"1.+"`: matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchRegexp, "i", "1.+")),
+		`i=~"^$"'`: matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchRegexp, "i", "^$")),
+		`i!~""`:    matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchNotEqual, "i", "")),
+		`n!="2"`:   matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchNotEqual, "n", "2"+storetestutil.LabelLongSuffix)),
+		`i!~"2.*"`: matchPostings(ctx, t, idx, labels.MustNewMatcher(labels.MatchNotRegexp, "i", "^2.*$")),
 	}
 
 	codecs := map[string]struct {
 		codingFunction   func(index.Postings, int) ([]byte, error)
-		decodingFunction func([]byte) (index.Postings, error)
+		decodingFunction func([]byte, bool) (closeablePostings, error)
 	}{
-		"raw":    {codingFunction: diffVarintEncodeNoHeader, decodingFunction: func(bytes []byte) (index.Postings, error) { return newDiffVarintPostings(bytes), nil }},
-		"snappy": {codingFunction: diffVarintSnappyEncode, decodingFunction: diffVarintSnappyDecode},
+		"raw": {codingFunction: diffVarintEncodeNoHeader, decodingFunction: func(bytes []byte, disablePooling bool) (closeablePostings, error) {
+			return newDiffVarintPostings(bytes, nil), nil
+		}},
+		"snappy":         {codingFunction: diffVarintSnappyEncode, decodingFunction: diffVarintSnappyDecode},
+		"snappyStreamed": {codingFunction: diffVarintSnappyStreamedEncode, decodingFunction: diffVarintSnappyStreamedDecode},
 	}
 
 	for postingName, postings := range postingsMap {
@@ -79,7 +147,7 @@ func TestDiffVarintCodec(t *testing.T) {
 				t.Log("encoded size", len(data), "bytes")
 				t.Logf("ratio: %0.3f", float64(len(data))/float64(4*p.len()))
 
-				decodedPostings, err := codec.decodingFunction(data)
+				decodedPostings, err := codec.decodingFunction(data, false)
 				testutil.Ok(t, err)
 
 				p.reset()
@@ -114,15 +182,15 @@ func comparePostings(t *testing.T, p1, p2 index.Postings) {
 	testutil.Ok(t, p2.Err())
 }
 
-func allPostings(t testing.TB, ix tsdb.IndexReader) index.Postings {
+func allPostings(ctx context.Context, t testing.TB, ix tsdb.IndexReader) index.Postings {
 	k, v := index.AllPostingsKey()
-	p, err := ix.Postings(k, v)
+	p, err := ix.Postings(ctx, k, v)
 	testutil.Ok(t, err)
 	return p
 }
 
-func matchPostings(t testing.TB, ix tsdb.IndexReader, m *labels.Matcher) index.Postings {
-	vals, err := ix.LabelValues(m.Name)
+func matchPostings(ctx context.Context, t testing.TB, ix tsdb.IndexReader, m *labels.Matcher) index.Postings {
+	vals, err := ix.LabelValues(ctx, m.Name, nil)
 	testutil.Ok(t, err)
 
 	matching := []string(nil)
@@ -132,7 +200,7 @@ func matchPostings(t testing.TB, ix tsdb.IndexReader, m *labels.Matcher) index.P
 		}
 	}
 
-	p, err := ix.Postings(m.Name, matching...)
+	p, err := ix.Postings(ctx, m.Name, matching...)
 	testutil.Ok(t, err)
 	return p
 }
@@ -194,7 +262,7 @@ func (p *uint64Postings) len() int {
 	return len(p.vals)
 }
 
-func BenchmarkEncodePostings(b *testing.B) {
+func BenchmarkPostingsEncodingDecoding(b *testing.B) {
 	const max = 1000000
 	r := rand.New(rand.NewSource(0))
 
@@ -208,16 +276,126 @@ func BenchmarkEncodePostings(b *testing.B) {
 		p[ix] = p[ix-1] + storage.SeriesRef(d)
 	}
 
+	codecs := map[string]struct {
+		codingFunction   func(index.Postings, int) ([]byte, error)
+		decodingFunction func([]byte, bool) (closeablePostings, error)
+	}{
+		"raw": {codingFunction: diffVarintEncodeNoHeader, decodingFunction: func(bytes []byte, disablePooling bool) (closeablePostings, error) {
+			return newDiffVarintPostings(bytes, nil), nil
+		}},
+		"snappy":         {codingFunction: diffVarintSnappyEncode, decodingFunction: diffVarintSnappyDecode},
+		"snappyStreamed": {codingFunction: diffVarintSnappyStreamedEncode, decodingFunction: diffVarintSnappyStreamedDecode},
+	}
+	b.ReportAllocs()
+
 	for _, count := range []int{10000, 100000, 1000000} {
 		b.Run(strconv.Itoa(count), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				ps := &uint64Postings{vals: p[:count]}
+			for codecName, codecFns := range codecs {
+				b.Run(codecName, func(b *testing.B) {
+					b.Run("encode", func(b *testing.B) {
+						for b.Loop() {
+							ps := &uint64Postings{vals: p[:count]}
 
-				_, err := diffVarintEncodeNoHeader(ps, ps.len())
-				if err != nil {
-					b.Fatal(err)
-				}
+							_, err := codecFns.codingFunction(ps, ps.len())
+							if err != nil {
+								b.Fatal(err)
+							}
+						}
+					})
+					b.Run("decode", func(b *testing.B) {
+						ps := &uint64Postings{vals: p[:count]}
+
+						encoded, err := codecFns.codingFunction(ps, ps.len())
+						if err != nil {
+							b.Fatal(err)
+						}
+						b.ResetTimer()
+
+						for b.Loop() {
+							decoded, err := codecFns.decodingFunction(encoded, true)
+							if err != nil {
+								b.Fatal(err)
+							}
+
+							for decoded.Next() {
+								var _ = decoded.At()
+							}
+							testutil.Ok(b, decoded.Err())
+						}
+					})
+				})
 			}
 		})
 	}
+}
+
+func FuzzSnappyStreamEncoding(f *testing.F) {
+	f.Add(10, 123)
+
+	f.Fuzz(func(t *testing.T, postingsCount, seedInit int) {
+		if postingsCount <= 0 {
+			return
+		}
+		r := rand.New(rand.NewSource(int64(seedInit)))
+		p := make([]storage.SeriesRef, postingsCount)
+
+		for ix := 1; ix < len(p); ix++ {
+			d := math.Abs(r.NormFloat64()*math.MaxUint64) + 1
+
+			p[ix] = p[ix-1] + storage.SeriesRef(d)
+		}
+
+		slices.Sort(p)
+
+		ps := &uint64Postings{vals: p}
+
+		_, err := diffVarintSnappyStreamedEncode(ps, ps.len())
+		testutil.Ok(t, err)
+	})
+}
+
+func TestRegressionIssue6545(t *testing.T) {
+	t.Parallel()
+
+	diffVarintPostings, err := os.ReadFile("6545postingsrepro")
+	testutil.Ok(t, err)
+
+	gotPostings := 0
+	dvp := newDiffVarintPostings(diffVarintPostings, nil)
+	decodedPostings := []storage.SeriesRef{}
+	for dvp.Next() {
+		decodedPostings = append(decodedPostings, dvp.At())
+		gotPostings++
+	}
+	testutil.Ok(t, dvp.Err())
+	testutil.Equals(t, 114024, gotPostings)
+
+	dataToCache, err := snappyStreamedEncode(114024, diffVarintPostings)
+	testutil.Ok(t, err)
+
+	// Check that the original decompressor works well.
+	sr := s2.NewReader(bytes.NewBuffer(dataToCache[3:]))
+	readBytes, err := io.ReadAll(sr)
+	testutil.Ok(t, err)
+	testutil.Equals(t, readBytes, diffVarintPostings)
+
+	dvp = newDiffVarintPostings(readBytes, nil)
+	gotPostings = 0
+	for dvp.Next() {
+		gotPostings++
+	}
+	testutil.Equals(t, 114024, gotPostings)
+
+	p, err := decodePostings(dataToCache)
+	testutil.Ok(t, err)
+
+	i := 0
+	for p.Next() {
+		post := p.At()
+		testutil.Equals(t, uint64(decodedPostings[i]), uint64(post))
+		i++
+	}
+
+	testutil.Ok(t, p.Err())
+	testutil.Equals(t, 114024, i)
 }

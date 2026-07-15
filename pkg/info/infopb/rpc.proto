@@ -49,6 +49,9 @@ message InfoResponse {
 
     // QueryAPIInfo holds the metadata related to Query API if exposed by the component, otherwise it will be null.
     QueryAPIInfo query                 = 8;
+
+    // StatusInfo holds the metadata related to Status API if exposed by the component, otherwise it will be null.
+    StatusInfo status                  = 9;
 }
 
 // StoreInfo holds the metadata related to Store API exposed by the component.
@@ -61,6 +64,9 @@ message StoreInfo {
 
     // replica_aware means this store supports without_replica_labels of StoreAPI.Series.
     bool supports_without_replica_labels = 5;
+
+    // TSDBInfos holds metadata for all TSDBs exposed by the store.
+    repeated TSDBInfo tsdb_infos = 6 [(gogoproto.nullable) = false];
 }
 
 // RulesInfo holds the metadata related to Rules API exposed by the component.
@@ -83,4 +89,15 @@ message ExemplarsInfo {
 
 // QueryInfo holds the metadata related to Query API exposed by the component.
 message QueryAPIInfo {
+}
+
+// StatusInfo holds the metadata related to Status API exposed by the component.
+message StatusInfo {
+}
+
+message TSDBInfo {
+    ZLabelSet labels = 1 [(gogoproto.nullable) = false];
+
+    int64 min_time = 2;
+    int64 max_time = 3;
 }

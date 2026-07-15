@@ -14,7 +14,8 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
@@ -30,9 +31,15 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/logutil"
 )
 
 func TestCompactor_WriteSeries_e2e(t *testing.T) {
+	if testing.
+		Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -57,20 +64,20 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 blocks no modify",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 				},
 			},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "2"}},
+				{lset: labels.FromStrings("a", "2"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 			},
 			expectedStats: tsdb.BlockStats{
@@ -83,32 +90,32 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "2 blocks compact no modify",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}}},
 				},
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{10, 10}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{10, 12}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "4"}},
+					{lset: labels.FromStrings("a", "4"),
 						chunks: [][]sample{{{10, 12}, {11, 11}, {20, 20}}}},
 				},
 			},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 10}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "2"}},
+				{lset: labels.FromStrings("a", "2"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 12}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "4"}},
+				{lset: labels.FromStrings("a", "4"),
 					chunks: [][]sample{{{10, 12}, {11, 11}, {20, 20}}}},
 			},
 			expectedStats: tsdb.BlockStats{
@@ -121,21 +128,21 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 blocks + delete modifier, empty deletion request",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 				},
 			},
 			modifiers: []Modifier{WithDeletionModifier()},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "2"}},
+				{lset: labels.FromStrings("a", "2"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 			},
 			expectedStats: tsdb.BlockStats{
@@ -148,11 +155,11 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 blocks + delete modifier, deletion request no deleting anything",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 				},
 			},
@@ -165,11 +172,11 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 					Intervals: tombstones.Intervals{{Mint: math.MinInt64, Maxt: -1}},
 				})},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "2"}},
+				{lset: labels.FromStrings("a", "2"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 			},
 			expectedStats: tsdb.BlockStats{
@@ -182,11 +189,11 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 blocks + delete modifier, deletion request no deleting anything - by specifying no intervals.",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 				},
 			},
@@ -198,11 +205,11 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 					Intervals: tombstones.Intervals{{Mint: math.MinInt64, Maxt: -1}},
 				})},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "2"}},
+				{lset: labels.FromStrings("a", "2"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 			},
 			expectedStats: tsdb.BlockStats{
@@ -215,11 +222,11 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 blocks + delete modifier, delete second series",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 				},
 			},
@@ -231,9 +238,9 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 					Intervals: tombstones.Intervals{{Mint: math.MinInt64, Maxt: -1}},
 				})},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 			},
 			expectedChanges: "Deleted {a=\"2\"} [{0 20}]\n",
@@ -247,11 +254,11 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 blocks + delete modifier, delete second series and part of first 3rd",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 				},
 			},
@@ -266,9 +273,9 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 					Intervals: tombstones.Intervals{{Mint: 10, Maxt: 11}},
 				})},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {20, 20}}}},
 			},
 			expectedChanges: "Deleted {a=\"2\"} [{0 20}]\nDeleted {a=\"3\"} [{10 11}]\n",
@@ -282,11 +289,11 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 blocks + delete modifier, deletion request contains multiple matchers, delete second series",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}, {Name: "b", Value: "1"}},
+					{lset: labels.FromStrings("a", "1", "b", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "1"}, {Name: "b", Value: "2"}},
+					{lset: labels.FromStrings("a", "1", "b", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 				},
 			},
@@ -298,9 +305,9 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 					},
 				})},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}, {Name: "b", Value: "1"}},
+				{lset: labels.FromStrings("a", "1", "b", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 			},
 			expectedChanges: "Deleted {a=\"1\", b=\"2\"} [{0 20}]\n",
@@ -314,15 +321,15 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 blocks + delete modifier. For deletion request, full match is required. Delete the first two series",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}, {Name: "b", Value: "2"}},
+					{lset: labels.FromStrings("a", "1", "b", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "1"}, {Name: "b", Value: "2"}, {Name: "foo", Value: "bar"}},
+					{lset: labels.FromStrings("a", "1", "b", "2", "foo", "bar"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "b", Value: "2"}},
+					{lset: labels.FromStrings("b", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "c", Value: "1"}},
+					{lset: labels.FromStrings("c", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 				},
 			},
@@ -334,11 +341,11 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 					},
 				})},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "b", Value: "2"}},
+				{lset: labels.FromStrings("b", "2"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "c", Value: "1"}},
+				{lset: labels.FromStrings("c", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 12}, {11, 11}, {20, 20}}}},
 			},
 			expectedChanges: "Deleted {a=\"1\", b=\"2\"} [{0 20}]\nDeleted {a=\"1\", b=\"2\", foo=\"bar\"} [{0 20}]\n",
@@ -352,24 +359,24 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 blocks + delete modifier. Deletion request contains non-equal matchers.",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}, {Name: "foo", Value: "1"}},
+					{lset: labels.FromStrings("a", "2", "foo", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}, {Name: "foo", Value: "bar"}},
+					{lset: labels.FromStrings("a", "2", "foo", "bar"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}, {Name: "foo", Value: "baz"}},
+					{lset: labels.FromStrings("a", "3", "foo", "baz"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "foo", Value: "bat"}},
+					{lset: labels.FromStrings("foo", "bat"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
 
 					// Label a is present but with an empty value.
-					{lset: labels.Labels{{Name: "a", Value: ""}, {Name: "foo", Value: "bat"}},
+					{lset: labels.FromMap(map[string]string{"a": "", "foo": "bat"}),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
 					// Series with unrelated labels.
-					{lset: labels.Labels{{Name: "c", Value: "1"}},
+					{lset: labels.FromStrings("c", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
 				},
 			},
@@ -381,17 +388,17 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 					},
 				})},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: ""}, {Name: "foo", Value: "bat"}},
+				{lset: labels.FromMap(map[string]string{"a": "", "foo": "bat"}),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "2"}},
+				{lset: labels.FromStrings("a", "2"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "a", Value: "2"}, {Name: "foo", Value: "1"}},
+				{lset: labels.FromStrings("a", "2", "foo", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "c", Value: "1"}},
+				{lset: labels.FromStrings("c", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
-				{lset: labels.Labels{{Name: "foo", Value: "bat"}},
+				{lset: labels.FromStrings("foo", "bat"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 11}, {11, 11}, {20, 20}}}},
 			},
 			expectedChanges: "Deleted {a=\"2\", foo=\"bar\"} [{0 20}]\nDeleted {a=\"3\", foo=\"baz\"} [{0 20}]\n",
@@ -405,20 +412,21 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 block + relabel modifier, two chunks from the same series are merged into one larger chunk",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 10}, {11, 11}, {20, 20}}}},
 				},
 			},
 			// Not used in this test case.
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action:       relabel.Drop,
-					Regex:        relabel.MustNewRegexp("no-match"),
-					SourceLabels: model.LabelNames{"a"},
+					Action:               relabel.Drop,
+					Regex:                relabel.MustNewRegexp("no-match"),
+					SourceLabels:         model.LabelNames{"a"},
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "1"}},
+				{lset: labels.FromStrings("a", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
 			},
 			expectedStats: tsdb.BlockStats{
@@ -431,25 +439,26 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 block + relabel modifier, delete first series",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
-					{lset: labels.Labels{{Name: "a", Value: "3"}},
+					{lset: labels.FromStrings("a", "3"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 13}, {11, 11}, {20, 20}}}},
 				},
 			},
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action:       relabel.Drop,
-					Regex:        relabel.MustNewRegexp("1"),
-					SourceLabels: model.LabelNames{"a"},
+					Action:               relabel.Drop,
+					Regex:                relabel.MustNewRegexp("1"),
+					SourceLabels:         model.LabelNames{"a"},
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "2"}},
+				{lset: labels.FromStrings("a", "2"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 13}, {11, 11}, {20, 20}}}},
 			},
 			expectedChanges: "Deleted {a=\"1\"} [{0 20}]\n",
@@ -463,33 +472,35 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 block + relabel modifier, series reordered",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, -1}, {2, -2}, {10, -10}, {11, -11}, {20, -20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
 				},
 			},
 			// {a="1"} will be relabeled to {a="3"} while {a="2"} will be relabeled to {a="0"}.
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action:       relabel.Replace,
-					Regex:        relabel.MustNewRegexp("1"),
-					SourceLabels: model.LabelNames{"a"},
-					TargetLabel:  "a",
-					Replacement:  "3",
+					Action:               relabel.Replace,
+					Regex:                relabel.MustNewRegexp("1"),
+					SourceLabels:         model.LabelNames{"a"},
+					TargetLabel:          "a",
+					Replacement:          "3",
+					NameValidationScheme: model.UTF8Validation,
 				},
 				&relabel.Config{
-					Action:       relabel.Replace,
-					Regex:        relabel.MustNewRegexp("2"),
-					SourceLabels: model.LabelNames{"a"},
-					TargetLabel:  "a",
-					Replacement:  "0",
+					Action:               relabel.Replace,
+					Regex:                relabel.MustNewRegexp("2"),
+					SourceLabels:         model.LabelNames{"a"},
+					TargetLabel:          "a",
+					Replacement:          "0",
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "0"}},
+				{lset: labels.FromStrings("a", "0"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
-				{lset: labels.Labels{{Name: "a", Value: "3"}},
+				{lset: labels.FromStrings("a", "3"),
 					chunks: [][]sample{{{0, 0}, {1, -1}, {2, -2}, {10, -10}, {11, -11}, {20, -20}}}},
 			},
 			expectedChanges: "Relabelled {a=\"1\"} {a=\"3\"}\nRelabelled {a=\"2\"} {a=\"0\"}\n",
@@ -503,19 +514,20 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 block + relabel modifier, series deleted because of no labels left after relabel",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
 				},
 				{
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
 				},
 			},
 			// Drop all label name "a".
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action: relabel.LabelDrop,
-					Regex:  relabel.MustNewRegexp("a"),
+					Action:               relabel.LabelDrop,
+					Regex:                relabel.MustNewRegexp("a"),
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected:        nil,
@@ -530,23 +542,24 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 block + relabel modifier, series 1 is deleted because of no labels left after relabel",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
 				},
 				{
-					{lset: labels.Labels{{Name: "a", Value: "2"}, {Name: "b", Value: "1"}},
+					{lset: labels.FromStrings("a", "2", "b", "1"),
 						chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}}, {{10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
 				},
 			},
 			// Drop all label name "a".
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action: relabel.LabelDrop,
-					Regex:  relabel.MustNewRegexp("a"),
+					Action:               relabel.LabelDrop,
+					Regex:                relabel.MustNewRegexp("a"),
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "b", Value: "1"}},
+				{lset: labels.FromStrings("b", "1"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
 			},
 			expectedChanges: "Deleted {a=\"1\"} [{0 25}]\nRelabelled {a=\"2\", b=\"1\"} {b=\"1\"}\n",
@@ -560,24 +573,25 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			name: "1 block + relabel modifier, series merged after relabeling",
 			input: [][]seriesSamples{
 				{
-					{lset: labels.Labels{{Name: "a", Value: "1"}},
+					{lset: labels.FromStrings("a", "1"),
 						chunks: [][]sample{{{1, 1}, {2, 2}, {10, 10}, {20, 20}}}},
-					{lset: labels.Labels{{Name: "a", Value: "2"}},
+					{lset: labels.FromStrings("a", "2"),
 						chunks: [][]sample{{{0, 0}, {2, 2}, {3, 3}}, {{4, 4}, {11, 11}, {20, 20}, {25, 25}}}},
 				},
 			},
 			// Replace values of label name "a" with "0".
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action:       relabel.Replace,
-					Regex:        relabel.MustNewRegexp("1|2"),
-					SourceLabels: model.LabelNames{"a"},
-					TargetLabel:  "a",
-					Replacement:  "0",
+					Action:               relabel.Replace,
+					Regex:                relabel.MustNewRegexp("1|2"),
+					SourceLabels:         model.LabelNames{"a"},
+					TargetLabel:          "a",
+					Replacement:          "0",
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{
-				{lset: labels.Labels{{Name: "a", Value: "0"}},
+				{lset: labels.FromStrings("a", "0"),
 					chunks: [][]sample{{{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {10, 10}, {11, 11}, {20, 20}, {25, 25}}}},
 			},
 			expectedChanges: "Relabelled {a=\"1\"} {a=\"0\"}\nRelabelled {a=\"2\"} {a=\"0\"}\n",
@@ -612,7 +626,7 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 				testutil.Ok(t, createBlockSeries(bdir, b))
 				// Meta does not matter, but let's create for OpenBlock to work.
 				testutil.Ok(t, metadata.Meta{BlockMeta: tsdb.BlockMeta{Version: 1, ULID: id}}.WriteToDir(logger, bdir))
-				block, err := tsdb.OpenBlock(logger, bdir, chunkPool)
+				block, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), bdir, chunkPool, nil)
 				testutil.Ok(t, err)
 				blocks = append(blocks, block)
 			}
@@ -651,7 +665,9 @@ type seriesSamples struct {
 }
 
 func readBlockSeries(t *testing.T, bDir string) []seriesSamples {
-	indexr, err := index.NewFileReader(filepath.Join(bDir, block.IndexFilename))
+	ctx := context.Background()
+
+	indexr, err := index.NewFileReader(filepath.Join(bDir, block.IndexFilename), index.DecodePostingsRaw)
 	testutil.Ok(t, err)
 	defer indexr.Close()
 
@@ -659,7 +675,8 @@ func readBlockSeries(t *testing.T, bDir string) []seriesSamples {
 	testutil.Ok(t, err)
 	defer chunkr.Close()
 
-	all, err := indexr.Postings(index.AllPostingsKey())
+	k, v := index.AllPostingsKey()
+	all, err := indexr.Postings(ctx, k, v)
 	testutil.Ok(t, err)
 	all = indexr.SortedPostings(all)
 
@@ -672,7 +689,8 @@ func readBlockSeries(t *testing.T, bDir string) []seriesSamples {
 		s.lset = builder.Labels()
 
 		for _, c := range chks {
-			c.Chunk, err = chunkr.Chunk(c)
+			// Ignore iterable as it should be nil.
+			c.Chunk, _, err = chunkr.ChunkOrIterable(c)
 			testutil.Ok(t, err)
 
 			var chk []sample
@@ -710,10 +728,10 @@ func createBlockSeries(bDir string, inputSeries []seriesSamples) (err error) {
 	// Gather symbols.
 	symbols := map[string]struct{}{}
 	for _, input := range inputSeries {
-		for _, l := range input.lset {
+		input.lset.Range(func(l labels.Label) {
 			symbols[l.Name] = struct{}{}
 			symbols[l.Value] = struct{}{}
-		}
+		})
 	}
 
 	symbolsSlice := make([]string, 0, len(symbols))

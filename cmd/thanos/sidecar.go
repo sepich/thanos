@@ -5,7 +5,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"sync"
 	"time"
@@ -14,7 +16,6 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	grpc_logging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
-	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/tags"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -22,14 +23,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
+
+	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
+	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/clientconfig"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/exemplars"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
-	"github.com/thanos-io/thanos/pkg/httpconfig"
 	"github.com/thanos-io/thanos/pkg/info"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/logging"
@@ -54,23 +59,51 @@ func registerSidecar(app *extkingpin.App) {
 	conf := &sidecarConfig{}
 	conf.registerFlag(cmd)
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
-		tagOpts, grpcLogOpts, err := logging.ParsegRPCOptions("", conf.reqLogConfig)
+
+		grpcLogOpts, logFilterMethods, err := logging.ParsegRPCOptions(conf.reqLogConfig)
+
 		if err != nil {
 			return errors.Wrap(err, "error while parsing config for request logging")
 		}
 
+		httpConfContentYaml, err := conf.prometheus.httpClient.Content()
+		if err != nil {
+			return errors.Wrap(err, "getting http client config")
+		}
+		httpClientConfig, err := clientconfig.NewHTTPClientConfigFromYAML(httpConfContentYaml)
+		if err != nil {
+			return errors.Wrap(err, "parsing http config YAML")
+		}
+
+		httpClient, err := clientconfig.NewHTTPClient(*httpClientConfig, "thanos-sidecar")
+		if err != nil {
+			return errors.Wrap(err, "Improper http client config")
+		}
+
+		opts := reloader.Options{
+			HTTPClient:    *httpClient,
+			CfgFile:       conf.reloader.confFile,
+			CfgOutputFile: conf.reloader.envVarConfFile,
+			WatchedDirs:   conf.reloader.ruleDirectories,
+			WatchInterval: conf.reloader.watchInterval,
+			RetryInterval: conf.reloader.retryInterval,
+		}
+
+		switch conf.reloader.method {
+		case HTTPReloadMethod:
+			opts.ReloadURL = reloader.ReloadURLFromBase(conf.prometheus.url)
+		case SignalReloadMethod:
+			opts.ProcessName = conf.reloader.processName
+			opts.RuntimeInfoURL = reloader.RuntimeInfoURLFromBase(conf.prometheus.url)
+		default:
+			return fmt.Errorf("invalid reload method: %s", conf.reloader.method)
+		}
+
 		rl := reloader.New(log.With(logger, "component", "reloader"),
 			extprom.WrapRegistererWithPrefix("thanos_sidecar_", reg),
-			&reloader.Options{
-				ReloadURL:     reloader.ReloadURLFromBase(conf.prometheus.url),
-				CfgFile:       conf.reloader.confFile,
-				CfgOutputFile: conf.reloader.envVarConfFile,
-				WatchedDirs:   conf.reloader.ruleDirectories,
-				WatchInterval: conf.reloader.watchInterval,
-				RetryInterval: conf.reloader.retryInterval,
-			})
+			&opts)
 
-		return runSidecar(g, logger, reg, tracer, rl, component.Sidecar, *conf, grpcLogOpts, tagOpts)
+		return runSidecar(g, logger, reg, tracer, rl, component.Sidecar, *conf, httpClient, grpcLogOpts, logFilterMethods)
 	})
 }
 
@@ -82,28 +115,13 @@ func runSidecar(
 	reloader *reloader.Reloader,
 	comp component.Component,
 	conf sidecarConfig,
+	httpClient *http.Client,
 	grpcLogOpts []grpc_logging.Option,
-	tagOpts []tags.Option,
+	logFilterMethods []string,
 ) error {
-	httpConfContentYaml, err := conf.prometheus.httpClient.Content()
-	if err != nil {
-		return errors.Wrap(err, "getting http client config")
-	}
-	httpClientConfig, err := httpconfig.NewClientConfigFromYAML(httpConfContentYaml)
-	if err != nil {
-		return errors.Wrap(err, "parsing http config YAML")
-	}
-
-	httpClient, err := httpconfig.NewHTTPClient(*httpClientConfig, "thanos-sidecar")
-	if err != nil {
-		return errors.Wrap(err, "Improper http client config")
-	}
-
-	reloader.SetHttpClient(*httpClient)
 
 	var m = &promMetadata{
 		promURL: conf.prometheus.url,
-
 		// Start out with the full time range. The shipper will constrain it later.
 		// TODO(fabxc): minimum timestamp is never adjusted if shipping is disabled.
 		mint: conf.limitMinTime.PrometheusTimestamp(),
@@ -111,6 +129,11 @@ func runSidecar(
 
 		limitMinTime: conf.limitMinTime,
 		client:       promclient.NewWithTracingClient(logger, httpClient, "thanos-sidecar"),
+		mimir:        conf.mimirOrg != "",
+	}
+	if conf.mimirOrg != "" {
+		level.Info(logger).Log("msg", "Mimir org header is set. Sidecar will use Mimir-compatible metadata discovery.", "header", "X-Scope-OrgID")
+		m.client.Headers = map[string]string{"X-Scope-OrgID": conf.mimirOrg}
 	}
 
 	confContentYaml, err := conf.objStore.Content()
@@ -118,10 +141,9 @@ func runSidecar(
 		return errors.Wrap(err, "getting object store config")
 	}
 
-	var uploads = true
-	if len(confContentYaml) == 0 {
+	var uploads = len(confContentYaml) != 0 && conf.mimirOrg == ""
+	if !uploads {
 		level.Info(logger).Log("msg", "no supported bucket was configured, uploads will be disabled")
-		uploads = false
 	}
 
 	grpcProbe := prober.NewGRPC()
@@ -132,24 +154,31 @@ func runSidecar(
 		prober.NewInstrumentation(comp, logger, extprom.WrapRegistererWithPrefix("thanos_", reg)),
 	)
 
-	srv := httpserver.New(logger, reg, comp, httpProbe,
-		httpserver.WithListen(conf.http.bindAddress),
-		httpserver.WithGracePeriod(time.Duration(conf.http.gracePeriod)),
-		httpserver.WithTLSConfig(conf.http.tlsConfig),
-	)
+	// Setup the HTTP server.
+	{
+		srv := httpserver.New(logger, reg, comp, httpProbe,
+			httpserver.WithListen(conf.http.bindAddress),
+			httpserver.WithGracePeriod(time.Duration(conf.http.gracePeriod)),
+			httpserver.WithTLSConfig(conf.http.tlsConfig),
+		)
 
-	g.Add(func() error {
-		statusProber.Healthy()
+		g.Add(func() error {
+			statusProber.Healthy()
+			return srv.ListenAndServe()
+		}, func(err error) {
 
-		return srv.ListenAndServe()
-	}, func(err error) {
-		statusProber.NotReady(err)
-		defer statusProber.NotHealthy(err)
+			statusProber.NotReady(err)
+			defer statusProber.NotHealthy(err)
 
-		srv.Shutdown(err)
-	})
+			srv.Shutdown(err)
+		})
+	}
 
-	// Setup all the concurrent groups.
+	// Once we have loaded external labels from prometheus we can use this to signal the servers
+	// that they can start now.
+	readyToStartGRPC := make(chan struct{})
+
+	// Setup Prometheus Heartbeats.
 	{
 		promUp := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "thanos_sidecar_prometheus_up",
@@ -161,14 +190,35 @@ func runSidecar(
 			// Only check Prometheus's flags when upload is enabled.
 			if uploads {
 				// Check prometheus's flags to ensure same sidecar flags.
-				if err := validatePrometheus(ctx, m.client, logger, conf.shipper.ignoreBlockSize, m); err != nil {
-					return errors.Wrap(err, "validate Prometheus flags")
+				// We retry infinitely until we validated prometheus flags
+				err := runutil.Retry(conf.prometheus.getConfigInterval, ctx.Done(), func() error {
+					iterCtx, iterCancel := context.WithTimeout(context.Background(), conf.prometheus.getConfigTimeout)
+					defer iterCancel()
+
+					if err := validatePrometheus(iterCtx, m.client, logger, conf.shipper.ignoreBlockSize, conf.shipper.metaFileName, m); err != nil {
+						level.Warn(logger).Log(
+							"msg", "failed to validate prometheus flags. Is Prometheus running? Retrying",
+							"err", err,
+						)
+						return err
+					}
+
+					level.Info(logger).Log(
+						"msg", "successfully validated prometheus flags",
+					)
+					return nil
+				})
+				if err != nil {
+					return errors.Wrap(err, "failed to validate prometheus flags")
 				}
 			}
 
 			// We retry infinitely until we reach and fetch BuildVersion from our Prometheus.
-			err := runutil.Retry(2*time.Second, ctx.Done(), func() error {
-				if err := m.BuildVersion(ctx); err != nil {
+			err := runutil.Retry(conf.prometheus.getConfigInterval, ctx.Done(), func() error {
+				iterCtx, iterCancel := context.WithTimeout(context.Background(), conf.prometheus.getConfigTimeout)
+				defer iterCancel()
+
+				if err := m.BuildVersion(iterCtx); err != nil {
 					level.Warn(logger).Log(
 						"msg", "failed to fetch prometheus version. Is Prometheus running? Retrying",
 						"err", err,
@@ -187,54 +237,72 @@ func runSidecar(
 
 			// Blocking query of external labels before joining as a Source Peer into gossip.
 			// We retry infinitely until we reach and fetch labels from our Prometheus.
-			err = runutil.Retry(2*time.Second, ctx.Done(), func() error {
-				if err := m.UpdateLabels(ctx); err != nil {
+			err = runutil.Retry(conf.prometheus.getConfigInterval, ctx.Done(), func() error {
+				iterCtx, iterCancel := context.WithTimeout(context.Background(), conf.prometheus.getConfigTimeout)
+				defer iterCancel()
+
+				if err := m.UpdateTimestamps(iterCtx); err != nil {
+					level.Warn(logger).Log(
+						"msg", "failed to fetch timestamps. Is Prometheus running? Retrying",
+						"err", err,
+					)
+					return err
+				}
+
+				if err := m.UpdateLabels(iterCtx); err != nil {
 					level.Warn(logger).Log(
 						"msg", "failed to fetch initial external labels. Is Prometheus running? Retrying",
 						"err", err,
 					)
-					promUp.Set(0)
-					statusProber.NotReady(err)
 					return err
 				}
 
 				level.Info(logger).Log(
-					"msg", "successfully loaded prometheus external labels",
-					"external_labels", m.Labels().String(),
+					"msg", "successfully loaded external labels",
+					"external_labels", m.LabelsLogValue(),
 				)
-				promUp.Set(1)
-				statusProber.Ready()
 				return nil
 			})
 			if err != nil {
 				return errors.Wrap(err, "initial external labels query")
 			}
 
-			if len(m.Labels()) == 0 {
+			if m.Labels().Len() == 0 {
 				return errors.New("no external labels configured on Prometheus server, uniquely identifying external labels must be configured; see https://thanos.io/tip/thanos/storage.md#external-labels for details.")
 			}
+			promUp.Set(1)
+			statusProber.Ready()
+
+			close(readyToStartGRPC)
 
 			// Periodically query the Prometheus config. We use this as a heartbeat as well as for updating
 			// the external labels we apply.
 			return runutil.Repeat(conf.prometheus.getConfigInterval, ctx.Done(), func() error {
 				iterCtx, iterCancel := context.WithTimeout(context.Background(), conf.prometheus.getConfigTimeout)
 				defer iterCancel()
-
-				if err := m.UpdateLabels(iterCtx); err != nil {
-					level.Warn(logger).Log("msg", "heartbeat failed", "err", err)
+				if err := m.UpdateTimestamps(iterCtx); err != nil {
+					level.Warn(logger).Log("msg", "updating timestamps failed", "err", err)
 					promUp.Set(0)
 					statusProber.NotReady(err)
-				} else {
-					promUp.Set(1)
-					statusProber.Ready()
+					return nil
 				}
 
+				if err := m.UpdateLabels(iterCtx); err != nil {
+					level.Warn(logger).Log("msg", "updating labels failed", "err", err)
+					promUp.Set(0)
+					statusProber.NotReady(err)
+					return nil
+				}
+				promUp.Set(1)
+				statusProber.Ready()
 				return nil
 			})
 		}, func(error) {
 			cancel()
 		})
 	}
+
+	// Setup the Reloader.
 	{
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
@@ -243,8 +311,13 @@ func runSidecar(
 			cancel()
 		})
 	}
+
+	// Setup the gRPC server.
 	{
-		c := promclient.NewWithTracingClient(logger, httpClient, httpconfig.ThanosUserAgent)
+		c := promclient.NewWithTracingClient(logger, httpClient, clientconfig.ThanosUserAgent)
+		if conf.mimirOrg != "" {
+			c.Headers = map[string]string{"X-Scope-OrgID": conf.mimirOrg}
+		}
 
 		promStore, err := store.NewPrometheusStore(logger, reg, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps, m.Version)
 		if err != nil {
@@ -252,7 +325,7 @@ func runSidecar(
 		}
 
 		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"),
-			conf.grpc.tlsSrvCert, conf.grpc.tlsSrvKey, conf.grpc.tlsSrvClientCA)
+			conf.grpc.tlsSrvCert, conf.grpc.tlsSrvKey, conf.grpc.tlsSrvClientCA, conf.grpc.tlsMinVersion)
 		if err != nil {
 			return errors.Wrap(err, "setup gRPC server")
 		}
@@ -262,19 +335,27 @@ func runSidecar(
 		infoSrv := info.NewInfoServer(
 			component.Sidecar.String(),
 			info.WithLabelSetFunc(func() []labelpb.ZLabelSet {
+				if conf.mimirOrg != "" {
+					return m.LabelSets()
+				}
 				return promStore.LabelSet()
 			}),
-			info.WithStoreInfoFunc(func() *infopb.StoreInfo {
+			info.WithStoreInfoFunc(func() (*infopb.StoreInfo, error) {
 				if httpProbe.IsReady() {
-					mint, maxt := promStore.Timestamps()
+					mint, maxt := m.Timestamps()
+					tsdbInfos := promStore.TSDBInfos()
+					if conf.mimirOrg != "" {
+						tsdbInfos = m.TSDBInfos(mint, maxt)
+					}
 					return &infopb.StoreInfo{
 						MinTime:                      mint,
 						MaxTime:                      maxt,
 						SupportsSharding:             true,
 						SupportsWithoutReplicaLabels: true,
-					}
+						TsdbInfos:                    tsdbInfos,
+					}, nil
 				}
-				return nil
+				return nil, errors.New("Not ready")
 			}),
 			info.WithExemplarsInfoFunc(),
 			info.WithRulesInfoFunc(),
@@ -283,7 +364,7 @@ func runSidecar(
 		)
 
 		storeServer := store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, promStore), reg, conf.storeRateLimits)
-		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, tagOpts, comp, grpcProbe,
+		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, logFilterMethods, comp, grpcProbe,
 			grpcserver.WithServer(store.RegisterStoreServer(storeServer, logger)),
 			grpcserver.WithServer(rules.RegisterRulesServer(rules.NewPrometheus(conf.prometheus.url, c, m.Labels))),
 			grpcserver.WithServer(targets.RegisterTargetsServer(targets.NewPrometheus(conf.prometheus.url, c, m.Labels))),
@@ -295,22 +376,31 @@ func runSidecar(
 			grpcserver.WithMaxConnAge(conf.grpc.maxConnectionAge),
 			grpcserver.WithTLSConfig(tlsCfg),
 		)
+
+		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-readyToStartGRPC:
+			}
+
 			statusProber.Ready()
 			return s.ListenAndServe()
 		}, func(err error) {
+			cancel()
 			statusProber.NotReady(err)
 			s.Shutdown(err)
 		})
 	}
-
 	if uploads {
 		// The background shipper continuously scans the data directory and uploads
 		// new blocks to Google Cloud Storage or an S3-compatible storage service.
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Sidecar.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Sidecar.String(), nil)
 		if err != nil {
 			return err
 		}
+		bkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 		// Ensure we close up everything properly.
 		defer func() {
@@ -332,7 +422,7 @@ func runSidecar(
 			defer cancel()
 
 			if err := runutil.Retry(2*time.Second, extLabelsCtx.Done(), func() error {
-				if len(m.Labels()) == 0 {
+				if m.Labels().Len() == 0 {
 					return errors.New("not uploading as no external labels are configured yet - is Prometheus healthy/reachable?")
 				}
 				return nil
@@ -340,20 +430,25 @@ func runSidecar(
 				return errors.Wrapf(err, "aborting as no external labels found after waiting %s", promReadyTimeout)
 			}
 
-			s := shipper.New(logger, reg, conf.tsdb.path, bkt, m.Labels, metadata.SidecarSource,
-				conf.shipper.uploadCompacted, conf.shipper.allowOutOfOrderUpload, metadata.HashFunc(conf.shipper.hashFunc))
+			s := shipper.New(
+				bkt,
+				conf.tsdb.path,
+				shipper.WithLogger(logger),
+				shipper.WithRegisterer(reg),
+				shipper.WithSource(metadata.SidecarSource),
+				shipper.WithHashFunc(metadata.HashFunc(conf.shipper.hashFunc)),
+				shipper.WithMetaFileName(conf.shipper.metaFileName),
+				shipper.WithLabels(m.Labels),
+				shipper.WithUploadCompacted(conf.shipper.uploadCompacted),
+				shipper.WithAllowOutOfOrderUploads(conf.shipper.allowOutOfOrderUpload),
+				shipper.WithSkipCorruptedBlocks(conf.shipper.skipCorruptedBlocks),
+				shipper.WithUploadConcurrency(conf.shipper.uploadConcurrency),
+			)
 
 			return runutil.Repeat(30*time.Second, ctx.Done(), func() error {
 				if uploaded, err := s.Sync(ctx); err != nil {
 					level.Warn(logger).Log("err", err, "uploaded", uploaded)
 				}
-
-				minTime, _, err := s.Timestamps()
-				if err != nil {
-					level.Warn(logger).Log("msg", "reading timestamps failed", "err", err)
-					return nil
-				}
-				m.UpdateTimestamps(minTime, math.MaxInt64)
 				return nil
 			})
 		}, func(error) {
@@ -365,7 +460,7 @@ func runSidecar(
 	return nil
 }
 
-func validatePrometheus(ctx context.Context, client *promclient.Client, logger log.Logger, ignoreBlockSize bool, m *promMetadata) error {
+func validatePrometheus(ctx context.Context, client *promclient.Client, logger log.Logger, ignoreBlockSize bool, metaFileName string, m *promMetadata) error {
 	var (
 		flagErr error
 		flags   promclient.Flags
@@ -386,8 +481,16 @@ func validatePrometheus(ctx context.Context, client *promclient.Client, logger l
 		return nil
 	}
 
+	if flags.TSDBDelayCompact != "" && flags.TSDBDelayCompact != metaFileName {
+		return errors.Errorf(
+			"found that Prometheus and Thanos use different paths for tracking block uploads. "+
+				"Prometheus uses --storage.tsdb.delay-compact-file.path=%s while Thanos uses --shipper.meta-file-name=%s, they must both use the same path.",
+			flags.TSDBDelayCompact, metaFileName,
+		)
+	}
+
 	// Check if compaction is disabled.
-	if flags.TSDBMinTime != flags.TSDBMaxTime {
+	if flags.TSDBMinTime != flags.TSDBMaxTime && flags.TSDBDelayCompact == "" {
 		if !ignoreBlockSize {
 			return errors.Errorf("found that TSDB Max time is %s and Min time is %s. "+
 				"Compaction needs to be disabled (storage.tsdb.min-block-duration = storage.tsdb.max-block-duration)", flags.TSDBMaxTime, flags.TSDBMinTime)
@@ -405,40 +508,79 @@ func validatePrometheus(ctx context.Context, client *promclient.Client, logger l
 type promMetadata struct {
 	promURL *url.URL
 
-	mtx         sync.Mutex
-	mint        int64
-	maxt        int64
-	labels      labels.Labels
-	promVersion string
-
+	mtx          sync.Mutex
+	mint         int64
+	maxt         int64
+	labels       labels.Labels
+	labelSets    []labelpb.ZLabelSet
+	promVersion  string
 	limitMinTime thanosmodel.TimeOrDurationValue
 
 	client *promclient.Client
+	mimir  bool
 }
 
 func (s *promMetadata) UpdateLabels(ctx context.Context) error {
+	if s.mimir {
+		values, err := s.client.LabelValuesInGRPC(
+			ctx,
+			s.promURL,
+			"prometheus",
+			[]*labels.Matcher{{Name: "__name__", Type: labels.MatchEqual, Value: "prometheus_build_info"}},
+			s.limitMinTime.PrometheusTimestamp(),
+			timestamp.FromTime(time.Now()),
+			0,
+		)
+		if err != nil {
+			return err
+		}
+
+		labelSets := make([]labelpb.ZLabelSet, 0, len(values))
+		for _, value := range values {
+			labelSets = append(labelSets, labelpb.ZLabelSet{
+				Labels: labelpb.ZLabelsFromPromLabels(labels.FromStrings("prometheus", value)),
+			})
+		}
+
+		s.mtx.Lock()
+		defer s.mtx.Unlock()
+
+		s.labels = labels.FromStrings("replica", "mimir")
+		s.labelSets = labelSets
+		return nil
+	}
+
 	elset, err := s.client.ExternalLabels(ctx, s.promURL)
 	if err != nil {
 		return err
 	}
-
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
 	s.labels = elset
+	s.labelSets = nil
 	return nil
 }
 
-func (s *promMetadata) UpdateTimestamps(mint, maxt int64) {
+func (s *promMetadata) UpdateTimestamps(ctx context.Context) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	if mint < s.limitMinTime.PrometheusTimestamp() {
-		mint = s.limitMinTime.PrometheusTimestamp()
+	if s.mimir {
+		s.mint = s.limitMinTime.PrometheusTimestamp()
+		s.maxt = math.MaxInt64
+		return nil
 	}
 
-	s.mint = mint
-	s.maxt = maxt
+	mint, err := s.client.LowestTimestamp(ctx, s.promURL)
+	if err != nil {
+		return err
+	}
+
+	s.mint = max(s.limitMinTime.PrometheusTimestamp(), mint)
+	s.maxt = math.MaxInt64
+
+	return nil
 }
 
 func (s *promMetadata) Labels() labels.Labels {
@@ -446,6 +588,39 @@ func (s *promMetadata) Labels() labels.Labels {
 	defer s.mtx.Unlock()
 
 	return s.labels
+}
+
+func (s *promMetadata) LabelSets() []labelpb.ZLabelSet {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	labelSets := make([]labelpb.ZLabelSet, len(s.labelSets))
+	copy(labelSets, s.labelSets)
+	return labelSets
+}
+
+func (s *promMetadata) LabelsLogValue() string {
+	if s.mimir {
+		return fmt.Sprintf("%v", s.LabelSets())
+	}
+	return s.Labels().String()
+}
+
+func (s *promMetadata) TSDBInfos(mint, maxt int64) []infopb.TSDBInfo {
+	labelSets := s.LabelSets()
+	if len(labelSets) == 0 {
+		return []infopb.TSDBInfo{}
+	}
+
+	infos := make([]infopb.TSDBInfo, 0, len(labelSets))
+	for _, labelSet := range labelSets {
+		infos = append(infos, infopb.TSDBInfo{
+			Labels:  labelSet,
+			MinTime: mint,
+			MaxTime: maxt,
+		})
+	}
+	return infos
 }
 
 func (s *promMetadata) Timestamps() (mint, maxt int64) {
@@ -456,6 +631,14 @@ func (s *promMetadata) Timestamps() (mint, maxt int64) {
 }
 
 func (s *promMetadata) BuildVersion(ctx context.Context) error {
+	if s.mimir {
+		s.mtx.Lock()
+		defer s.mtx.Unlock()
+
+		s.promVersion = "2.43.0"
+		return nil
+	}
+
 	ver, err := s.client.BuildVersion(ctx, s.promURL)
 	if err != nil {
 		return err
@@ -486,6 +669,7 @@ type sidecarConfig struct {
 	shipper         shipperConfig
 	limitMinTime    thanosmodel.TimeOrDurationValue
 	storeRateLimits store.SeriesSelectLimits
+	mimirOrg        string
 }
 
 func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
@@ -500,4 +684,6 @@ func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.storeRateLimits.RegisterFlags(cmd)
 	cmd.Flag("min-time", "Start of time range limit to serve. Thanos sidecar will serve only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("0000-01-01T00:00:00Z").SetValue(&sc.limitMinTime)
+	cmd.Flag("mimir-org", "Header X-Scope-OrgID value to pass to Mimir. When set, sidecar uses Mimir-compatible metadata discovery and disables block uploads.").
+		Default("").StringVar(&sc.mimirOrg)
 }

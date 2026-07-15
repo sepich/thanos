@@ -7,7 +7,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/thanos-io/thanos/pkg/extpromql"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -31,8 +33,6 @@ import (
 	"github.com/thanos-io/thanos/internal/cortex/cortexpb"
 	"github.com/thanos-io/thanos/internal/cortex/querier"
 	"github.com/thanos-io/thanos/internal/cortex/tenant"
-	"github.com/thanos-io/thanos/internal/cortex/util/flagext"
-	util_log "github.com/thanos-io/thanos/internal/cortex/util/log"
 	"github.com/thanos-io/thanos/internal/cortex/util/spanlogger"
 	"github.com/thanos-io/thanos/internal/cortex/util/validation"
 )
@@ -62,8 +62,6 @@ func (cfg *ResultsCacheConfig) RegisterFlags(f *flag.FlagSet) {
 
 	f.StringVar(&cfg.Compression, "frontend.compression", "", "Use compression in results cache. Supported values are: 'snappy' and '' (disable compression).")
 	f.BoolVar(&cfg.CacheQueryableSamplesStats, "frontend.cache-queryable-samples-stats", false, "Cache Statistics queryable samples on results cache.")
-	//lint:ignore faillint Need to pass the global logger like this for warning on deprecated methods
-	flagext.DeprecatedFlag(f, "frontend.cache-split-interval", "Deprecated: The maximum interval expected for each request, results will be cached per single interval. This behavior is now determined by querier.split-queries-by-interval.", util_log.Logger)
 }
 
 func (cfg *ResultsCacheConfig) Validate(qCfg querier.Config) error {
@@ -101,8 +99,10 @@ func (PrometheusResponseExtractor) Extract(start, end int64, from Response) Resp
 			ResultType: promRes.Data.ResultType,
 			Result:     extractMatrix(start, end, promRes.Data.Result),
 			Stats:      extractStats(start, end, promRes.Data.Stats),
+			Analysis:   promRes.Data.Analysis,
 		},
-		Headers: promRes.Headers,
+		Headers:  promRes.Headers,
+		Warnings: promRes.Warnings,
 	}
 }
 
@@ -116,7 +116,9 @@ func (PrometheusResponseExtractor) ResponseWithoutHeaders(resp Response) Respons
 			ResultType: promRes.Data.ResultType,
 			Result:     promRes.Data.Result,
 			Stats:      promRes.Data.Stats,
+			Analysis:   promRes.Data.Analysis,
 		},
+		Warnings: promRes.Warnings,
 	}
 }
 
@@ -128,8 +130,10 @@ func (PrometheusResponseExtractor) ResponseWithoutStats(resp Response) Response 
 		Data: PrometheusData{
 			ResultType: promRes.Data.ResultType,
 			Result:     promRes.Data.Result,
+			Analysis:   promRes.Data.Analysis,
 		},
-		Headers: promRes.Headers,
+		Headers:  promRes.Headers,
+		Warnings: promRes.Warnings,
 	}
 }
 
@@ -219,7 +223,7 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 	tenantIDs, err := tenant.TenantIDs(ctx)
 	respWithStats := r.GetStats() != "" && s.cacheQueryableSamplesStats
 	if err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
 	// If cache_queryable_samples_stats is enabled we always need request the status upstream
@@ -273,14 +277,15 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 // shouldCacheResponse says whether the response should be cached or not.
 func (s resultsCache) shouldCacheResponse(ctx context.Context, req Request, r Response, maxCacheTime int64) bool {
 	headerValues := getHeaderValuesWithName(r, cacheControlHeader)
-	for _, v := range headerValues {
-		if v == noStoreValue {
-			level.Debug(s.logger).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cacheControlHeader, noStoreValue))
-			return false
-		}
+	if slices.Contains(headerValues, noStoreValue) {
+		level.Debug(s.logger).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cacheControlHeader, noStoreValue))
+		return false
 	}
 
 	if !s.isAtModifierCachable(req, maxCacheTime) {
+		return false
+	}
+	if !s.isOffsetCachable(req) {
 		return false
 	}
 
@@ -306,11 +311,10 @@ func (s resultsCache) shouldCacheResponse(ctx context.Context, req Request, r Re
 	return true
 }
 
-var errAtModifierAfterEnd = errors.New("at modifier after end")
-
 // isAtModifierCachable returns true if the @ modifier result
 // is safe to cache.
 func (s resultsCache) isAtModifierCachable(r Request, maxCacheTime int64) bool {
+	var errAtModifierAfterEnd = errors.New("at modifier after end")
 	// There are 2 cases when @ modifier is not safe to cache:
 	//   1. When @ modifier points to time beyond the maxCacheTime.
 	//   2. If the @ modifier time is > the query range end while being
@@ -321,7 +325,7 @@ func (s resultsCache) isAtModifierCachable(r Request, maxCacheTime int64) bool {
 	if !strings.Contains(query, "@") {
 		return true
 	}
-	expr, err := parser.ParseExpr(query)
+	expr, err := extpromql.ParseExpr(query)
 	if err != nil {
 		// We are being pessimistic in such cases.
 		level.Warn(s.logger).Log("msg", "failed to parse query, considering @ modifier as not cachable", "query", query, "err", err)
@@ -329,7 +333,12 @@ func (s resultsCache) isAtModifierCachable(r Request, maxCacheTime int64) bool {
 	}
 
 	// This resolves the start() and end() used with the @ modifier.
-	expr = promql.PreprocessExpr(expr, timestamp.Time(r.GetStart()), timestamp.Time(r.GetEnd()))
+	expr, err = promql.PreprocessExpr(expr, timestamp.Time(r.GetStart()), timestamp.Time(r.GetEnd()), time.Duration(r.GetStep())*time.Millisecond)
+	if err != nil {
+		// We are being pessimistic in such cases.
+		level.Warn(s.logger).Log("msg", "failed to preprocess expr", "query", query, "err", err)
+		return false
+	}
 
 	end := r.GetEnd()
 	atModCachable := true
@@ -356,6 +365,46 @@ func (s resultsCache) isAtModifierCachable(r Request, maxCacheTime int64) bool {
 	})
 
 	return atModCachable
+}
+
+// isOffsetCachable returns true if the offset is positive, result is safe to cache.
+// and false when offset is negative, result is not cached.
+func (s resultsCache) isOffsetCachable(r Request) bool {
+	var errNegativeOffset = errors.New("negative offset")
+	query := r.GetQuery()
+	if !strings.Contains(query, "offset") {
+		return true
+	}
+	expr, err := extpromql.ParseExpr(query)
+	if err != nil {
+		level.Warn(s.logger).Log("msg", "failed to parse query, considering offset as not cachable", "query", query, "err", err)
+		return false
+	}
+
+	offsetCachable := true
+	parser.Inspect(expr, func(n parser.Node, _ []parser.Node) error {
+		switch e := n.(type) {
+		case *parser.VectorSelector:
+			if e.OriginalOffset < 0 {
+				offsetCachable = false
+				return errNegativeOffset
+			}
+		case *parser.MatrixSelector:
+			offset := e.VectorSelector.(*parser.VectorSelector).OriginalOffset
+			if offset < 0 {
+				offsetCachable = false
+				return errNegativeOffset
+			}
+		case *parser.SubqueryExpr:
+			if e.OriginalOffset < 0 {
+				offsetCachable = false
+				return errNegativeOffset
+			}
+		}
+		return nil
+	})
+
+	return offsetCachable
 }
 
 func getHeaderValuesWithName(r Response, headerName string) (headerValues []string) {
@@ -686,15 +735,28 @@ func extractMatrix(start, end int64, matrix []SampleStream) []SampleStream {
 
 func extractSampleStream(start, end int64, stream SampleStream) (SampleStream, bool) {
 	result := SampleStream{
-		Labels:  stream.Labels,
-		Samples: make([]cortexpb.Sample, 0, len(stream.Samples)),
+		Labels: stream.Labels,
 	}
+
+	if len(stream.Samples) > 0 {
+		result.Samples = make([]cortexpb.Sample, 0, len(stream.Samples))
+	}
+
+	if len(stream.Histograms) > 0 {
+		result.Histograms = make([]SampleHistogramPair, 0, len(stream.Histograms))
+	}
+
 	for _, sample := range stream.Samples {
 		if start <= sample.TimestampMs && sample.TimestampMs <= end {
 			result.Samples = append(result.Samples, sample)
 		}
 	}
-	if len(result.Samples) == 0 {
+	for _, histogram := range stream.Histograms {
+		if start <= int64(histogram.GetTimestamp()) && int64(histogram.GetTimestamp()) <= end {
+			result.Histograms = append(result.Histograms, histogram)
+		}
+	}
+	if len(result.Samples) == 0 && len(result.Histograms) == 0 {
 		return SampleStream{}, false
 	}
 	return result, true

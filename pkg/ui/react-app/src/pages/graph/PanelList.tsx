@@ -30,6 +30,9 @@ interface PanelListProps extends PathPrefixProps, RouteComponentProps {
   enableHighlighting: boolean;
   enableLinter: boolean;
   defaultStep: string;
+  defaultEngine: string;
+  queryMode: string;
+  usePartialResponse: boolean;
 }
 
 export const PanelListContent: FC<PanelListProps> = ({
@@ -42,6 +45,9 @@ export const PanelListContent: FC<PanelListProps> = ({
   enableHighlighting,
   enableLinter,
   defaultStep,
+  defaultEngine,
+  queryMode,
+  usePartialResponse,
   ...rest
 }) => {
   const [panels, setPanels] = useState(rest.panels);
@@ -93,6 +99,9 @@ export const PanelListContent: FC<PanelListProps> = ({
       },
     ]);
   };
+  const handleUsePartialResponseChange = (value: boolean): void => {
+    localStorage.setItem('usePartialResponse', JSON.stringify(value));
+  };
 
   return (
     <>
@@ -123,8 +132,12 @@ export const PanelListContent: FC<PanelListProps> = ({
           stores={storeData}
           enableAutocomplete={enableAutocomplete}
           enableHighlighting={enableHighlighting}
+          defaultEngine={defaultEngine}
+          queryMode={queryMode}
           enableLinter={enableLinter}
           defaultStep={defaultStep}
+          usePartialResponse={usePartialResponse}
+          onUsePartialResponseChange={handleUsePartialResponseChange}
         />
       ))}
       <Button className="d-block mb-3" color="primary" onClick={addPanel}>
@@ -157,6 +170,9 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
     isLoading: flagsLoading,
   } = useFetch<FlagMap>(`${pathPrefix}/api/v1/status/flags`);
   const defaultStep = flagsRes?.data?.['query.default-step'] || '1s';
+  const queryMode = flagsRes?.data?.['query.mode'];
+  const defaultEngine = queryMode === 'distributed' ? 'thanos' : flagsRes?.data?.['query.promql-engine'];
+  const usePartialResponse = flagsRes?.data?.['query.partial-response'] || true;
 
   const browserTime = new Date().getTime() / 1000;
   const { response: timeRes, error: timeErr } = useFetch<{ result: number[] }>(`${pathPrefix}/api/v1/query?query=time()`);
@@ -266,7 +282,10 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
         enableHighlighting={enableHighlighting}
         enableLinter={enableLinter}
         defaultStep={defaultStep}
+        defaultEngine={defaultEngine}
+        queryMode={queryMode}
         queryHistoryEnabled={enableQueryHistory}
+        usePartialResponse={!!usePartialResponse}
         isLoading={storesLoading || flagsLoading}
       />
     </>

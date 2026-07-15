@@ -8,13 +8,25 @@ package main
 
 import (
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/KimMachineGun/automemlimit/memlimit"
 	extflag "github.com/efficientgo/tools/extkingpin"
+	"github.com/go-kit/log"
+	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
+	"google.golang.org/grpc"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 
+	"github.com/thanos-io/thanos/pkg/extgrpc"
+	"github.com/thanos-io/thanos/pkg/extgrpc/snappy"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
+	"github.com/thanos-io/thanos/pkg/shipper"
 )
 
 type grpcConfig struct {
@@ -22,6 +34,7 @@ type grpcConfig struct {
 	tlsSrvCert       string
 	tlsSrvKey        string
 	tlsSrvClientCA   string
+	tlsMinVersion    string
 	gracePeriod      time.Duration
 	maxConnectionAge time.Duration
 }
@@ -39,6 +52,9 @@ func (gc *grpcConfig) registerFlag(cmd extkingpin.FlagClause) *grpcConfig {
 	cmd.Flag("grpc-server-tls-client-ca",
 		"TLS CA to verify clients against. If no client CA is specified, there is no client verification on server side. (tls.NoClientCert)").
 		Default("").StringVar(&gc.tlsSrvClientCA)
+	cmd.Flag("grpc-server-tls-min-version",
+		"TLS supported minimum version for gRPC server. If no version is specified, it'll default to 1.3. Allowed values: [\"1.0\", \"1.1\", \"1.2\", \"1.3\"]").
+		Default("1.3").StringVar(&gc.tlsMinVersion)
 	cmd.Flag("grpc-server-max-connection-age", "The grpc server max connection age. This controls how often to re-establish connections and redo TLS handshakes.").
 		Default("60m").DurationVar(&gc.maxConnectionAge)
 	cmd.Flag("grpc-grace-period",
@@ -46,6 +62,38 @@ func (gc *grpcConfig) registerFlag(cmd extkingpin.FlagClause) *grpcConfig {
 		Default("2m").DurationVar(&gc.gracePeriod)
 
 	return gc
+}
+
+type grpcClientConfig struct {
+	secure            bool
+	skipVerify        bool
+	cert, key, caCert string
+	serverName        string
+	compression       string
+}
+
+func (gc *grpcClientConfig) registerFlag(cmd extkingpin.FlagClause) *grpcClientConfig {
+	cmd.Flag("grpc-client-tls-secure", "Use TLS when talking to the gRPC server").Default("false").BoolVar(&gc.secure)
+	cmd.Flag("grpc-client-tls-skip-verify", "Disable TLS certificate verification i.e self signed, signed by fake CA").Default("false").BoolVar(&gc.skipVerify)
+	cmd.Flag("grpc-client-tls-cert", "TLS Certificates to use to identify this client to the server").Default("").StringVar(&gc.cert)
+	cmd.Flag("grpc-client-tls-key", "TLS Key for the client's certificate").Default("").StringVar(&gc.key)
+	cmd.Flag("grpc-client-tls-ca", "TLS CA Certificates to use to verify gRPC servers").Default("").StringVar(&gc.caCert)
+	cmd.Flag("grpc-client-server-name", "Server name to verify the hostname on the returned gRPC certificates. See https://tools.ietf.org/html/rfc4366#section-3.1").Default("").StringVar(&gc.serverName)
+	compressionOptions := strings.Join([]string{snappy.Name, compressionNone}, ", ")
+	cmd.Flag("grpc-compression", "Compression algorithm to use for gRPC requests to other clients. Must be one of: "+compressionOptions).Default(compressionNone).EnumVar(&gc.compression, snappy.Name, compressionNone)
+
+	return gc
+}
+
+func (gc *grpcClientConfig) dialOptions(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer) ([]grpc.DialOption, error) {
+	dialOpts, err := extgrpc.StoreClientGRPCOpts(logger, reg, tracer, gc.secure, gc.skipVerify, gc.cert, gc.key, gc.caCert, gc.serverName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "building gRPC client")
+	}
+	if gc.compression != compressionNone {
+		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.UseCompressor(gc.compression)))
+	}
+	return dialOpts, nil
 }
 
 type httpConfig struct {
@@ -88,7 +136,7 @@ func (pc *prometheusConfig) registerFlag(cmd extkingpin.FlagClause) *prometheusC
 		Default("30s").DurationVar(&pc.getConfigInterval)
 	cmd.Flag("prometheus.get_config_timeout",
 		"Timeout for getting Prometheus config").
-		Default("5s").DurationVar(&pc.getConfigTimeout)
+		Default("30s").DurationVar(&pc.getConfigTimeout)
 	pc.httpClient = extflag.RegisterPathOrContent(
 		cmd,
 		"prometheus.http-client",
@@ -113,7 +161,17 @@ type reloaderConfig struct {
 	ruleDirectories []string
 	watchInterval   time.Duration
 	retryInterval   time.Duration
+	method          string
+	processName     string
 }
+
+const (
+	// HTTPReloadMethod reloads the configuration using the HTTP reload endpoint.
+	HTTPReloadMethod = "http"
+
+	// SignalReloadMethod reloads the configuration sending a SIGHUP signal to the process.
+	SignalReloadMethod = "signal"
+)
 
 func (rc *reloaderConfig) registerFlag(cmd extkingpin.FlagClause) *reloaderConfig {
 	cmd.Flag("reloader.config-file",
@@ -131,6 +189,12 @@ func (rc *reloaderConfig) registerFlag(cmd extkingpin.FlagClause) *reloaderConfi
 	cmd.Flag("reloader.retry-interval",
 		"Controls how often reloader retries config reload in case of error.").
 		Default("5s").DurationVar(&rc.retryInterval)
+	cmd.Flag("reloader.method",
+		"Method used to reload the configuration.").
+		Default(HTTPReloadMethod).EnumVar(&rc.method, HTTPReloadMethod, SignalReloadMethod)
+	cmd.Flag("reloader.process-name",
+		"Executable name used to match the process being reloaded when using the signal method.").
+		Default("prometheus").StringVar(&rc.processName)
 
 	return rc
 }
@@ -139,7 +203,10 @@ type shipperConfig struct {
 	uploadCompacted       bool
 	ignoreBlockSize       bool
 	allowOutOfOrderUpload bool
+	skipCorruptedBlocks   bool
 	hashFunc              string
+	metaFileName          string
+	uploadConcurrency     int
 }
 
 func (sc *shipperConfig) registerFlag(cmd extkingpin.FlagClause) *shipperConfig {
@@ -154,8 +221,15 @@ func (sc *shipperConfig) registerFlag(cmd extkingpin.FlagClause) *shipperConfig 
 			"This can trigger compaction without those blocks and as a result will create an overlap situation. Set it to true if you have vertical compaction enabled and wish to upload blocks as soon as possible without caring"+
 			"about order.").
 		Default("false").Hidden().BoolVar(&sc.allowOutOfOrderUpload)
+	cmd.Flag("shipper.skip-corrupted-blocks",
+		"If true, shipper will skip corrupted blocks in the given iteration and retry later. This means that some newer blocks might be uploaded sooner than older blocks."+
+			"This can trigger compaction without those blocks and as a result will create an overlap situation. Set it to true if you have vertical compaction enabled and wish to upload blocks as soon as possible without caring"+
+			"about order.").
+		Default("false").Hidden().BoolVar(&sc.skipCorruptedBlocks)
 	cmd.Flag("hash-func", "Specify which hash function to use when calculating the hashes of produced files. If no function has been specified, it does not happen. This permits avoiding downloading some files twice albeit at some performance cost. Possible values are: \"\", \"SHA256\".").
 		Default("").EnumVar(&sc.hashFunc, "SHA256", "")
+	cmd.Flag("shipper.meta-file-name", "the file to store shipper metadata in").Default(shipper.DefaultMetaFilename).StringVar(&sc.metaFileName)
+	cmd.Flag("shipper.upload-concurrency", "Number of goroutines to use when uploading block files to object storage.").Default("0").IntVar(&sc.uploadConcurrency)
 	return sc
 }
 
@@ -180,14 +254,15 @@ func (wc *webConfig) registerFlag(cmd extkingpin.FlagClause) *webConfig {
 }
 
 type queryConfig struct {
-	addrs         []string
-	sdFiles       []string
-	sdInterval    time.Duration
-	configPath    *extflag.PathOrContent
-	dnsSDInterval time.Duration
-	httpMethod    string
-	dnsSDResolver string
-	step          time.Duration
+	addrs                []string
+	sdFiles              []string
+	sdInterval           time.Duration
+	configPath           *extflag.PathOrContent
+	dnsSDInterval        time.Duration
+	httpMethod           string
+	dnsSDResolver        string
+	step                 time.Duration
+	doNotAddThanosParams bool
 }
 
 func (qc *queryConfig) registerFlag(cmd extkingpin.FlagClause) *queryConfig {
@@ -206,6 +281,8 @@ func (qc *queryConfig) registerFlag(cmd extkingpin.FlagClause) *queryConfig {
 		Default("miekgdns").Hidden().StringVar(&qc.dnsSDResolver)
 	cmd.Flag("query.default-step", "Default range query step to use. This is only used in stateless Ruler and alert state restoration.").
 		Default("1s").DurationVar(&qc.step)
+	cmd.Flag("query.only-prometheus-params", "Disable adding Thanos parameters (e.g dedup, partial_response) when querying metrics. Some non-Thanos systems have strict API validation.").Hidden().
+		Default("false").BoolVar(&qc.doNotAddThanosParams)
 	return qc
 }
 
@@ -217,6 +294,7 @@ type alertMgrConfig struct {
 	alertExcludeLabels     []string
 	alertQueryURL          *string
 	alertRelabelConfigPath *extflag.PathOrContent
+	alertSourceTemplate    *string
 }
 
 func (ac *alertMgrConfig) registerFlag(cmd extflag.FlagClause) *alertMgrConfig {
@@ -231,5 +309,72 @@ func (ac *alertMgrConfig) registerFlag(cmd extflag.FlagClause) *alertMgrConfig {
 	cmd.Flag("alert.label-drop", "Labels by name to drop before sending to alertmanager. This allows alert to be deduplicated on replica label (repeated). Similar Prometheus alert relabelling").
 		StringsVar(&ac.alertExcludeLabels)
 	ac.alertRelabelConfigPath = extflag.RegisterPathOrContent(cmd, "alert.relabel-config", "YAML file that contains alert relabelling configuration.", extflag.WithEnvSubstitution())
+	ac.alertSourceTemplate = cmd.Flag("alert.query-template", "Template to use in alerts source field. Need only include {{.Expr}} parameter").Default("/graph?g0.expr={{.Expr}}&g0.tab=1").String()
+
 	return ac
+}
+
+func parseFlagLabels(s []string) (labels.Labels, error) {
+	var lset labels.ScratchBuilder
+	for _, l := range s {
+		parts := strings.SplitN(l, "=", 2)
+		if len(parts) != 2 {
+			return labels.EmptyLabels(), errors.Errorf("unrecognized label %q", l)
+		}
+		if !model.UTF8Validation.IsValidLabelName(parts[0]) {
+			return labels.EmptyLabels(), errors.Errorf("unsupported format for label %s", l)
+		}
+		val, err := strconv.Unquote(parts[1])
+		if err != nil {
+			return labels.EmptyLabels(), errors.Wrap(err, "unquote label value")
+		}
+		lset.Add(parts[0], val)
+	}
+	lset.Sort()
+	return lset.Labels(), nil
+}
+
+type goMemLimitConfig struct {
+	enableAutoGoMemlimit bool
+	memlimitRatio        float64
+}
+
+func (gml *goMemLimitConfig) registerFlag(cmd extkingpin.FlagClause) *goMemLimitConfig {
+	cmd.Flag("enable-auto-gomemlimit",
+		"Enable go runtime to automatically limit memory consumption.").
+		Default("false").BoolVar(&gml.enableAutoGoMemlimit)
+
+	cmd.Flag("auto-gomemlimit.ratio",
+		"The ratio of reserved GOMEMLIMIT memory to the detected maximum container or system memory.").
+		Default("0.9").FloatVar(&gml.memlimitRatio)
+
+	return gml
+}
+
+func configureGoAutoMemLimit(common goMemLimitConfig) (int64, error) {
+	var (
+		err    error
+		limits int64 = -1
+	)
+
+	if common.memlimitRatio <= 0.0 || common.memlimitRatio > 1.0 {
+		return limits, errors.New("--auto-gomemlimit.ratio must be greater than 0 and less than or equal to 1.")
+	}
+
+	if common.enableAutoGoMemlimit {
+		limits, err = memlimit.SetGoMemLimitWithOpts(
+			memlimit.WithRatio(common.memlimitRatio),
+			memlimit.WithProvider(
+				memlimit.ApplyFallback(
+					memlimit.FromCgroup,
+					memlimit.FromSystem,
+				),
+			),
+		)
+		if err != nil {
+			return -1, errors.Wrap(err, "Failed to set GOMEMLIMIT automatically")
+		}
+	}
+
+	return limits, nil
 }

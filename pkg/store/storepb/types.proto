@@ -24,6 +24,7 @@ message Chunk {
   enum Encoding {
     XOR = 0;
     HISTOGRAM = 1;
+    FLOAT_HISTOGRAM = 2;
   }
   Encoding type  = 1;
   bytes data     = 2;
@@ -33,6 +34,10 @@ message Chunk {
 message Series {
   repeated Label labels      = 1 [(gogoproto.nullable) = false, (gogoproto.customtype) = "github.com/thanos-io/thanos/pkg/store/labelpb.ZLabel"];
   repeated AggrChunk chunks  = 2 [(gogoproto.nullable) = false];
+}
+
+message SeriesBatch {
+  repeated Series series = 1;
 }
 
 message AggrChunk {

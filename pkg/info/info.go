@@ -6,9 +6,10 @@ package info
 import (
 	"context"
 
+	"google.golang.org/grpc"
+
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
-	"google.golang.org/grpc"
 )
 
 // InfoServer implements the corresponding protobuf interface
@@ -20,12 +21,13 @@ type InfoServer struct {
 	component string
 
 	getLabelSet           func() []labelpb.ZLabelSet
-	getStoreInfo          func() *infopb.StoreInfo
+	getStoreInfo          func() (*infopb.StoreInfo, error)
 	getExemplarsInfo      func() *infopb.ExemplarsInfo
 	getRulesInfo          func() *infopb.RulesInfo
 	getTargetsInfo        func() *infopb.TargetsInfo
 	getMetricMetadataInfo func() *infopb.MetricMetadataInfo
 	getQueryAPIInfo       func() *infopb.QueryAPIInfo
+	getStatusInfo         func() *infopb.StatusInfo
 }
 
 // NewInfoServer creates a new server instance for given component
@@ -38,12 +40,13 @@ func NewInfoServer(
 		component: component,
 		// By default, do not return info for any API.
 		getLabelSet:           func() []labelpb.ZLabelSet { return nil },
-		getStoreInfo:          func() *infopb.StoreInfo { return nil },
+		getStoreInfo:          func() (*infopb.StoreInfo, error) { return nil, nil },
 		getExemplarsInfo:      func() *infopb.ExemplarsInfo { return nil },
 		getRulesInfo:          func() *infopb.RulesInfo { return nil },
 		getTargetsInfo:        func() *infopb.TargetsInfo { return nil },
 		getMetricMetadataInfo: func() *infopb.MetricMetadataInfo { return nil },
 		getQueryAPIInfo:       func() *infopb.QueryAPIInfo { return nil },
+		getStatusInfo:         func() *infopb.StatusInfo { return nil },
 	}
 
 	for _, o := range options {
@@ -74,10 +77,10 @@ func WithLabelSetFunc(getLabelSet ...func() []labelpb.ZLabelSet) ServerOptionFun
 // WithStoreInfoFunc determines the function that should be executed to obtain
 // the store information. If no function is provided, the default empty
 // store info is returned. Only the first function from the list is considered.
-func WithStoreInfoFunc(getStoreInfo ...func() *infopb.StoreInfo) ServerOptionFunc {
+func WithStoreInfoFunc(getStoreInfo ...func() (*infopb.StoreInfo, error)) ServerOptionFunc {
 	if len(getStoreInfo) == 0 {
 		return func(s *InfoServer) {
-			s.getStoreInfo = func() *infopb.StoreInfo { return &infopb.StoreInfo{} }
+			s.getStoreInfo = func() (*infopb.StoreInfo, error) { return &infopb.StoreInfo{}, nil }
 		}
 	}
 
@@ -131,9 +134,9 @@ func WithTargetsInfoFunc(getTargetsInfo ...func() *infopb.TargetsInfo) ServerOpt
 	}
 }
 
-// WithTargetsInfoFunc determines the function that should be executed to obtain
-// the targets information. If no function is provided, the default empty
-// targets info is returned. Only the first function from the list is considered.
+// WithMetricMetadataInfoFunc determines the function that should be executed to obtain
+// the metric metadata information. If no function is provided, the default empty
+// metric metadata info is returned. Only the first function from the list is considered.
 func WithMetricMetadataInfoFunc(getMetricMetadataInfo ...func() *infopb.MetricMetadataInfo) ServerOptionFunc {
 	if len(getMetricMetadataInfo) == 0 {
 		return func(s *InfoServer) {
@@ -161,6 +164,21 @@ func WithQueryAPIInfoFunc(queryInfo ...func() *infopb.QueryAPIInfo) ServerOption
 	}
 }
 
+// WithStatusInfoFunc determines the function that should be executed to obtain
+// the status information. If no function is provided, the default empty
+// status info is returned. Only the first function from the list is considered.
+func WithStatusInfoFunc(statusInfo ...func() *infopb.StatusInfo) ServerOptionFunc {
+	if len(statusInfo) == 0 {
+		return func(s *InfoServer) {
+			s.getStatusInfo = func() *infopb.StatusInfo { return &infopb.StatusInfo{} }
+		}
+	}
+
+	return func(s *InfoServer) {
+		s.getStatusInfo = statusInfo[0]
+	}
+}
+
 // RegisterInfoServer registers the info server.
 func RegisterInfoServer(infoSrv infopb.InfoServer) func(*grpc.Server) {
 	return func(s *grpc.Server) {
@@ -170,14 +188,19 @@ func RegisterInfoServer(infoSrv infopb.InfoServer) func(*grpc.Server) {
 
 // Info returns the information about label set and available APIs exposed by the component.
 func (srv *InfoServer) Info(ctx context.Context, req *infopb.InfoRequest) (*infopb.InfoResponse, error) {
+	storeInfo, err := srv.getStoreInfo()
+	if err != nil {
+		return nil, err
+	}
 	return &infopb.InfoResponse{
 		LabelSets:      srv.getLabelSet(),
 		ComponentType:  srv.component,
-		Store:          srv.getStoreInfo(),
+		Store:          storeInfo,
 		Exemplars:      srv.getExemplarsInfo(),
 		Rules:          srv.getRulesInfo(),
 		Targets:        srv.getTargetsInfo(),
 		MetricMetadata: srv.getMetricMetadataInfo(),
 		Query:          srv.getQueryAPIInfo(),
+		Status:         srv.getStatusInfo(),
 	}, nil
 }

@@ -5,21 +5,24 @@ package receive
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
-	"gopkg.in/fsnotify.v1"
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 var (
@@ -35,15 +38,123 @@ const (
 	RouterOnly     ReceiverMode = "RouterOnly"
 	IngestorOnly   ReceiverMode = "IngestorOnly"
 	RouterIngestor ReceiverMode = "RouterIngestor"
+
+	DefaultCapNProtoPort string = "19391"
 )
+
+type endpoints []Endpoint
+
+func (e endpoints) Len() int {
+	return len(e)
+}
+
+func (e endpoints) Less(i, j int) bool {
+	// Sort by address first, then by CapNProtoAddress.
+	// First sort by address, then by CapNProtoAddress, then by AZ.
+	if e[i].Address == e[j].Address {
+		if e[i].CapNProtoAddress == e[j].CapNProtoAddress {
+			return e[i].AZ < e[j].AZ
+		}
+		return e[i].CapNProtoAddress < e[j].CapNProtoAddress
+	}
+	return e[i].Address < e[j].Address
+}
+func (e endpoints) Swap(i, j int) {
+	e[i], e[j] = e[j], e[i]
+}
+
+type Endpoint struct {
+	Address          string `json:"address"`
+	CapNProtoAddress string `json:"capnproto_address"`
+	AZ               string `json:"az"`
+}
+
+func (e *Endpoint) String() string {
+	return fmt.Sprintf("addr: %s, capnp_addr: %s, az: %s", e.Address, e.CapNProtoAddress, e.AZ)
+}
+
+func (e *Endpoint) HasAddress(addr string) bool {
+	return e.Address == addr || e.CapNProtoAddress == addr
+}
+
+func (e *Endpoint) UnmarshalJSON(data []byte) error {
+	if err := e.unmarshal(data); err != nil {
+		return err
+	}
+	if e.Address == "" {
+		return errors.New("endpoint address must be set")
+	}
+
+	// If the Cap'n proto address is not set, initialize it
+	// to the existing address using the default cap'n proto server port.
+	if e.CapNProtoAddress != "" {
+		return nil
+	}
+	if parts := strings.SplitN(e.Address, ":", 2); len(parts) <= 2 {
+		e.CapNProtoAddress = parts[0] + ":" + DefaultCapNProtoPort
+	}
+	return nil
+}
+
+func (e *Endpoint) unmarshal(data []byte) error {
+	// First try to unmarshal as a string.
+	err := json.Unmarshal(data, &e.Address)
+	if err == nil {
+		return nil
+	}
+
+	// If that fails, try to unmarshal as an endpoint object.
+	type endpointAlias Endpoint
+	var configEndpoint endpointAlias
+	if err := json.Unmarshal(data, &configEndpoint); err != nil {
+		return err
+	}
+
+	e.Address = configEndpoint.Address
+	e.AZ = configEndpoint.AZ
+	e.CapNProtoAddress = configEndpoint.CapNProtoAddress
+	return nil
+}
 
 // HashringConfig represents the configuration for a hashring
 // a receive node knows about.
 type HashringConfig struct {
-	Hashring  string            `json:"hashring,omitempty"`
-	Tenants   []string          `json:"tenants,omitempty"`
-	Endpoints []string          `json:"endpoints"`
-	Algorithm HashringAlgorithm `json:"algorithm,omitempty"`
+	Hashring          string            `json:"hashring,omitempty"`
+	Tenants           []string          `json:"tenants,omitempty"`
+	TenantMatcherType tenantMatcher     `json:"tenant_matcher_type,omitempty"`
+	Endpoints         []Endpoint        `json:"endpoints"`
+	Algorithm         HashringAlgorithm `json:"algorithm,omitempty"`
+	ExternalLabels    labels.Labels     `json:"external_labels,omitempty"`
+	// If non-zero then enable shuffle sharding.
+	ShuffleShardingConfig ShuffleShardingConfig `json:"shuffle_sharding_config,omitempty"`
+}
+
+type ShuffleShardingOverrideConfig struct {
+	ShardSize         int           `json:"shard_size"`
+	Tenants           []string      `json:"tenants,omitempty"`
+	TenantMatcherType tenantMatcher `json:"tenant_matcher_type,omitempty"`
+}
+
+type ShuffleShardingConfig struct {
+	ShardSize int `json:"shard_size"`
+	CacheSize int `json:"cache_size"`
+	// ZoneAwarenessDisabled disables zone awareness. We still try to spread the load
+	// across the available zones, but we don't try to balance the shards across zones.
+	ZoneAwarenessDisabled bool                            `json:"zone_awareness_disabled"`
+	Overrides             []ShuffleShardingOverrideConfig `json:"overrides,omitempty"`
+}
+
+type tenantMatcher string
+
+const (
+	// TenantMatcherTypeExact matches tenants exactly. This is also the default one.
+	TenantMatcherTypeExact tenantMatcher = "exact"
+	// TenantMatcherGlob matches tenants using glob patterns.
+	TenantMatcherGlob tenantMatcher = "glob"
+)
+
+func isExactMatcher(m tenantMatcher) bool {
+	return m == TenantMatcherTypeExact || m == ""
 }
 
 // ConfigWatcher is able to watch a file containing a hashring configuration
@@ -255,6 +366,30 @@ func (cw *ConfigWatcher) refresh(ctx context.Context) {
 	}
 }
 
+func ConfigFromWatcher(ctx context.Context, updates chan<- []HashringConfig, cw *ConfigWatcher) error {
+	defer close(updates)
+	go cw.Run(ctx)
+
+	for {
+		select {
+		case cfg, ok := <-cw.C():
+			if !ok {
+				return errors.New("hashring config watcher stopped unexpectedly")
+			}
+			updates <- cfg
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// ParseConfig parses the raw configuration content and returns a HashringConfig.
+func ParseConfig(content []byte) ([]HashringConfig, error) {
+	var config []HashringConfig
+	err := json.Unmarshal(content, &config)
+	return config, err
+}
+
 // loadConfig loads raw configuration content and returns a configuration.
 func loadConfig(logger log.Logger, path string) ([]HashringConfig, float64, error) {
 	cfgContent, err := readFile(logger, path)
@@ -262,7 +397,7 @@ func loadConfig(logger log.Logger, path string) ([]HashringConfig, float64, erro
 		return nil, 0, errors.Wrap(err, "failed to read configuration file")
 	}
 
-	config, err := parseConfig(cfgContent)
+	config, err := ParseConfig(cfgContent)
 	if err != nil {
 		return nil, 0, errors.Wrapf(errParseConfigurationFile, "failed to parse configuration file: %v", err)
 	}
@@ -290,19 +425,15 @@ func readFile(logger log.Logger, path string) ([]byte, error) {
 	return io.ReadAll(fd)
 }
 
-// parseConfig parses the raw configuration content and returns a HashringConfig.
-func parseConfig(content []byte) ([]HashringConfig, error) {
-	var config []HashringConfig
-	err := json.Unmarshal(content, &config)
-	return config, err
-}
-
 // hashAsMetricValue generates metric value from hash of data.
 func hashAsMetricValue(data []byte) float64 {
-	sum := md5.Sum(data)
-	// We only want 48 bits as a float64 only has a 53 bit mantissa.
-	smallSum := sum[0:6]
-	var bytes = make([]byte, 8)
-	copy(bytes, smallSum)
+	sum := sha256.Sum256(data)
+	bytes := make([]byte, 8)
+	// Keep only the first 48 bits since a float64 has a 53 bit mantissa.
+	// Little-endian representation:
+	// | mantissa| exponent| sign|
+	// +---------+---------+-----+
+	// | 53 bits | 11 bits |1 bit|
+	copy(bytes, sum[:6])
 	return float64(binary.LittleEndian.Uint64(bytes))
 }

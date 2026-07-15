@@ -21,7 +21,6 @@ package queryrange
 import (
 	"context"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"time"
@@ -260,7 +259,7 @@ func (q roundTripper) Do(ctx context.Context, r Request) (Response, error) {
 	}
 
 	if err := user.InjectOrgIDIntoHTTPRequest(ctx, request); err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
 	response, err := q.next.RoundTrip(request)
@@ -268,7 +267,7 @@ func (q roundTripper) Do(ctx context.Context, r Request) (Response, error) {
 		return nil, err
 	}
 	defer func() {
-		io.Copy(ioutil.Discard, io.LimitReader(response.Body, 1024))
+		io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
 		_ = response.Body.Close()
 	}()
 

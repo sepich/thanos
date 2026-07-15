@@ -9,12 +9,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/fatih/structtag"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
+	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
 	"github.com/thanos-io/objstore/providers/azure"
 	"github.com/thanos-io/objstore/providers/bos"
@@ -24,13 +27,11 @@ import (
 	"github.com/thanos-io/objstore/providers/oss"
 	"github.com/thanos-io/objstore/providers/s3"
 	"github.com/thanos-io/objstore/providers/swift"
-	"gopkg.in/alecthomas/kingpin.v2"
 	"gopkg.in/yaml.v2"
-
-	"github.com/thanos-io/thanos/pkg/httpconfig"
 
 	"github.com/thanos-io/thanos/pkg/alert"
 	"github.com/thanos-io/thanos/pkg/cacheutil"
+	"github.com/thanos-io/thanos/pkg/clientconfig"
 	"github.com/thanos-io/thanos/pkg/logging"
 	"github.com/thanos-io/thanos/pkg/queryfrontend"
 	storecache "github.com/thanos-io/thanos/pkg/store/cache"
@@ -43,34 +44,34 @@ import (
 )
 
 var (
-	configs        map[string]interface{}
+	configs        map[string]any
 	possibleValues []string
 
-	bucketConfigs = map[client.ObjProvider]interface{}{
-		client.AZURE:      azure.Config{},
-		client.GCS:        gcs.Config{},
-		client.S3:         s3.DefaultConfig,
-		client.SWIFT:      swift.DefaultConfig,
-		client.COS:        cos.DefaultConfig,
-		client.ALIYUNOSS:  oss.Config{},
-		client.FILESYSTEM: filesystem.Config{},
-		client.BOS:        bos.Config{},
+	bucketConfigs = map[objstore.ObjProvider]any{
+		objstore.AZURE:      azure.DefaultConfig,
+		objstore.GCS:        gcs.DefaultConfig,
+		objstore.S3:         s3.DefaultConfig,
+		objstore.SWIFT:      swift.DefaultConfig,
+		objstore.COS:        cos.DefaultConfig,
+		objstore.ALIYUNOSS:  oss.Config{},
+		objstore.FILESYSTEM: filesystem.Config{},
+		objstore.BOS:        bos.Config{},
 	}
 
-	tracingConfigs = map[trclient.TracingProvider]interface{}{
+	tracingConfigs = map[trclient.TracingProvider]any{
 		trclient.OpenTelemetryProtocol: otlp.Config{},
 		trclient.Jaeger:                jaeger.Config{},
 		trclient.GoogleCloud:           google_cloud.Config{},
 		trclient.ElasticAPM:            elasticapm.Config{},
 		trclient.Lightstep:             lightstep.Config{},
 	}
-	indexCacheConfigs = map[storecache.IndexCacheProvider]interface{}{
+	indexCacheConfigs = map[storecache.IndexCacheProvider]any{
 		storecache.INMEMORY:  storecache.InMemoryIndexCacheConfig{},
 		storecache.MEMCACHED: cacheutil.MemcachedClientConfig{},
 		storecache.REDIS:     cacheutil.DefaultRedisClientConfig,
 	}
 
-	queryfrontendCacheConfigs = map[queryfrontend.ResponseCacheProvider]interface{}{
+	queryfrontendCacheConfigs = map[queryfrontend.ResponseCacheProvider]any{
 		queryfrontend.INMEMORY:  queryfrontend.InMemoryResponseCacheConfig{},
 		queryfrontend.MEMCACHED: queryfrontend.MemcachedResponseCacheConfig{},
 		queryfrontend.REDIS:     queryfrontend.DefaultRedisConfig,
@@ -78,16 +79,16 @@ var (
 )
 
 func init() {
-	configs = map[string]interface{}{}
+	configs = map[string]any{}
 	configs[name(logging.RequestConfig{})] = logging.RequestConfig{}
 
 	alertmgrCfg := alert.DefaultAlertmanagerConfig()
-	alertmgrCfg.EndpointsConfig.FileSDConfigs = []httpconfig.FileSDConfig{{}}
+	alertmgrCfg.EndpointsConfig.FileSDConfigs = []clientconfig.HTTPFileSDConfig{{}}
 	configs[name(alert.AlertingConfig{})] = alert.AlertingConfig{Alertmanagers: []alert.AlertmanagerConfig{alertmgrCfg}}
 
-	queryCfg := httpconfig.DefaultConfig()
-	queryCfg.EndpointsConfig.FileSDConfigs = []httpconfig.FileSDConfig{{}}
-	configs[name(httpconfig.Config{})] = []httpconfig.Config{queryCfg}
+	queryCfg := clientconfig.DefaultConfig()
+	queryCfg.HTTPConfig.EndpointsConfig.FileSDConfigs = []clientconfig.HTTPFileSDConfig{{}}
+	configs[name(clientconfig.Config{})] = []clientconfig.Config{queryCfg}
 
 	for typ, config := range bucketConfigs {
 		configs[name(config)] = client.BucketConfig{Type: typ, Config: config}
@@ -107,7 +108,7 @@ func init() {
 	}
 }
 
-func name(typ interface{}) string {
+func name(typ any) string {
 	return fmt.Sprintf("%T", typ)
 }
 
@@ -134,7 +135,7 @@ func main() {
 	os.Exit(1)
 }
 
-func generate(obj interface{}, w io.Writer) error {
+func generate(obj any, w io.Writer) error {
 	// We forbid omitempty option. This is for simplification for doc generation.
 	if err := checkForOmitEmptyTagOption(obj); err != nil {
 		return errors.Wrap(err, "invalid type")
@@ -142,7 +143,7 @@ func generate(obj interface{}, w io.Writer) error {
 	return yaml.NewEncoder(w).Encode(obj)
 }
 
-func checkForOmitEmptyTagOption(obj interface{}) error {
+func checkForOmitEmptyTagOption(obj any) error {
 	return checkForOmitEmptyTagOptionRec(reflect.ValueOf(obj))
 }
 
@@ -160,10 +161,8 @@ func checkForOmitEmptyTagOptionRec(v reflect.Value) error {
 				return errors.Wrapf(err, "%s: failed to get tag %q", v.Type().Field(i).Name, v.Type().Field(i).Tag)
 			}
 
-			for _, opts := range tag.Options {
-				if opts == "omitempty" {
-					return errors.Errorf("omitempty is forbidden for config, but spotted on field '%s'", v.Type().Field(i).Name)
-				}
+			if slices.Contains(tag.Options, "omitempty") {
+				return errors.Errorf("omitempty is forbidden for config, but spotted on field '%s'", v.Type().Field(i).Name)
 			}
 
 			if err := checkForOmitEmptyTagOptionRec(v.Field(i)); err != nil {

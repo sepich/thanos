@@ -12,10 +12,11 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
 	"github.com/efficientgo/core/testutil"
+
+	"github.com/thanos-io/thanos/pkg/extpromql"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 )
 
@@ -72,7 +73,7 @@ func (s *listSeriesSet) Next() bool {
 
 func (s *listSeriesSet) At() (labels.Labels, []AggrChunk) {
 	if s.idx < 0 || s.idx >= len(s.series) {
-		return nil, nil
+		return labels.EmptyLabels(), nil
 	}
 
 	return s.series[s.idx].PromLabels(), s.series[s.idx].Chunks
@@ -84,7 +85,7 @@ type errSeriesSet struct{ err error }
 
 func (errSeriesSet) Next() bool { return false }
 
-func (errSeriesSet) At() (labels.Labels, []AggrChunk) { return nil, nil }
+func (errSeriesSet) At() (labels.Labels, []AggrChunk) { return labels.EmptyLabels(), nil }
 
 func (e errSeriesSet) Err() error { return e.err }
 
@@ -256,10 +257,10 @@ func TestMergeSeriesSets(t *testing.T) {
 
 			expected: []rawSeries{
 				{
-					lset:   labels.Labels{labels.Label{Name: "a", Value: "a"}},
+					lset:   labels.FromStrings("a", "a"),
 					chunks: [][]sample{{{t: 1, v: 1}, {t: 2, v: 2}}, {{t: 3, v: 3}, {t: 4, v: 4}}},
 				}, {
-					lset: labels.Labels{labels.Label{Name: "a", Value: "c"}},
+					lset: labels.FromStrings("a", "c"),
 					chunks: [][]sample{
 						{{t: 1, v: 1}, {t: 2, v: 2}, {t: 3, v: 3}, {t: 4, v: 4}},
 						{{t: 11, v: 11}, {t: 12, v: 12}, {t: 13, v: 13}, {t: 14, v: 14}},
@@ -269,7 +270,7 @@ func TestMergeSeriesSets(t *testing.T) {
 						{{t: 20, v: 20}, {t: 21, v: 21}, {t: 22, v: 23}, {t: 24, v: 24}},
 					},
 				}, {
-					lset:   labels.Labels{labels.Label{Name: "a", Value: "d"}},
+					lset:   labels.FromStrings("a", "d"),
 					chunks: [][]sample{{{t: 11, v: 1}, {t: 12, v: 2}}, {{t: 13, v: 3}, {t: 14, v: 4}}},
 				},
 			},
@@ -314,7 +315,7 @@ func TestMergeSeriesSets(t *testing.T) {
 
 			expected: []rawSeries{
 				{
-					lset: labels.Labels{labels.Label{Name: "a", Value: "c"}},
+					lset: labels.FromStrings("a", "c"),
 					chunks: [][]sample{
 						{{t: 11, v: 11}, {t: 12, v: 12}, {t: 13, v: 13}, {t: 14, v: 14}},
 						{{t: 1, v: 1}, {t: 2, v: 2}, {t: 3, v: 3}, {t: 4, v: 4}},
@@ -392,6 +393,11 @@ func BenchmarkMergedSeriesSet(b *testing.B) {
 }
 
 func TestMergedSeriesSet_Labels(t *testing.T) {
+	if testing.
+		Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
 	t.Run("overlapping chunks", func(t *testing.T) {
 		benchmarkMergedSeriesSet(testutil.NewTB(t), true)
 	})
@@ -520,9 +526,12 @@ func TestMatchersToString_Translate(t *testing.T) {
 			testutil.Equals(t, c.expected, MatchersToString(ms...))
 
 			// Is this parsable?
-			promMsParsed, err := parser.ParseMetricSelector(c.expected)
-			testutil.Ok(t, err)
-			testutil.Equals(t, promMs, promMsParsed)
+			promMsParsed, err := extpromql.ParseMetricSelector(c.expected)
+			testutil.Ok(t, err, "unexpected error parsing %q", c.expected)
+			testutil.Assert(t, len(promMs) == len(promMsParsed))
+			for i := range promMs {
+				testutil.Equals(t, promMs[i].String(), promMsParsed[i].String())
+			}
 		})
 
 	}
@@ -656,6 +665,77 @@ func TestSeriesRequestToPromQL(t *testing.T) {
 				},
 			},
 			expected: `max without (container,pod) ({__name__="kube_pod_info", namespace=~"kube-.+"}[600000ms])`,
+		},
+		{
+			name: "Query with projection hints (include)",
+			r: &SeriesRequest{
+				Matchers: []LabelMatcher{
+					{
+						Type:  LabelMatcher_EQ,
+						Name:  "__name__",
+						Value: "http_requests_total",
+					},
+				},
+				QueryHints: &QueryHints{
+					Func: &Func{
+						Name: "sum",
+					},
+					Grouping: &Grouping{
+						By:     true,
+						Labels: []string{"job"},
+					},
+					ProjectionLabels:  []string{"job", "__name__"},
+					ProjectionInclude: true,
+				},
+			},
+			expected: `sum by (job) projection (job,__name__) ({__name__="http_requests_total"})`,
+		},
+		{
+			name: "Query with projection hints (exclude)",
+			r: &SeriesRequest{
+				Matchers: []LabelMatcher{
+					{
+						Type:  LabelMatcher_EQ,
+						Name:  "__name__",
+						Value: "http_requests_total",
+					},
+				},
+				QueryHints: &QueryHints{
+					Func: &Func{
+						Name: "sum",
+					},
+					Grouping: &Grouping{
+						By:     true,
+						Labels: []string{"job"},
+					},
+					ProjectionLabels:  []string{"instance", "pod"},
+					ProjectionInclude: false,
+				},
+			},
+			expected: `sum by (job) projection without (instance,pod) ({__name__="http_requests_total"})`,
+		},
+		{
+			name: "Query with projection hints and range",
+			r: &SeriesRequest{
+				Matchers: []LabelMatcher{
+					{
+						Type:  LabelMatcher_EQ,
+						Name:  "__name__",
+						Value: "node_cpu_seconds_total",
+					},
+				},
+				QueryHints: &QueryHints{
+					Func: &Func{
+						Name: "rate",
+					},
+					Range: &Range{
+						Millis: 5 * time.Minute.Milliseconds(),
+					},
+					ProjectionLabels:  []string{"cpu", "mode"},
+					ProjectionInclude: true,
+				},
+			},
+			expected: `rate projection (cpu,mode) ({__name__="node_cpu_seconds_total"}[300000ms])`,
 		},
 	}
 

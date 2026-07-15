@@ -166,7 +166,7 @@ func compactSeries(ctx context.Context, sReaders ...seriesReader) (symbols index
 		}
 
 		k, v := index.AllPostingsKey()
-		all, err := r.ir.Postings(k, v)
+		all, err := r.ir.Postings(ctx, k, v)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -185,5 +185,5 @@ func compactSeries(ctx context.Context, sReaders ...seriesReader) (symbols index
 		return symbols, set, nil
 	}
 	// Merge series using compacting chunk series merger.
-	return symbols, storage.NewMergeChunkSeriesSet(sets, storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge)), nil
+	return symbols, storage.NewMergeChunkSeriesSet(sets, 0, storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge)), nil
 }

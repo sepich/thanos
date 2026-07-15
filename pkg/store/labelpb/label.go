@@ -12,8 +12,10 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"unsafe"
 
+	"github.com/VictoriaMetrics/easyproto"
 	"github.com/cespare/xxhash/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
@@ -97,14 +99,14 @@ func ZLabelSetsFromPromLabels(lss ...labels.Labels) []ZLabelSet {
 	sets := make([]ZLabelSet, 0, len(lss))
 	for _, ls := range lss {
 		set := ZLabelSet{
-			Labels: make([]ZLabel, 0, len(ls)),
+			Labels: make([]ZLabel, 0, ls.Len()),
 		}
-		for _, lbl := range ls {
+		ls.Range(func(lbl labels.Label) {
 			set.Labels = append(set.Labels, ZLabel{
 				Name:  lbl.Name,
 				Value: lbl.Value,
 			})
-		}
+		})
 		sets = append(sets, set)
 	}
 
@@ -291,31 +293,15 @@ func (m *ZLabel) Compare(other ZLabel) int {
 // The type conversion is done safely, which means we don't modify extend labels underlying array.
 //
 // In case of existing labels already present in given label set, it will be overwritten by external one.
-// NOTE: Labels and extend has to be sorted.
 func ExtendSortedLabels(lset, extend labels.Labels) labels.Labels {
-	ret := make(labels.Labels, 0, len(lset)+len(extend))
-
-	// Inject external labels in place.
-	for len(lset) > 0 && len(extend) > 0 {
-		d := strings.Compare(lset[0].Name, extend[0].Name)
-		if d == 0 {
-			// Duplicate, prefer external labels.
-			// NOTE(fabxc): Maybe move it to a prefixed version to still ensure uniqueness of series?
-			ret = append(ret, extend[0])
-			lset, extend = lset[1:], extend[1:]
-		} else if d < 0 {
-			ret = append(ret, lset[0])
-			lset = lset[1:]
-		} else if d > 0 {
-			ret = append(ret, extend[0])
-			extend = extend[1:]
-		}
+	if extend.IsEmpty() {
+		return lset.Copy()
 	}
-
-	// Append all remaining elements.
-	ret = append(ret, lset...)
-	ret = append(ret, extend...)
-	return ret
+	b := labels.NewBuilder(lset)
+	extend.Range(func(l labels.Label) {
+		b.Set(l.Name, l.Value)
+	})
+	return b.Labels()
 }
 
 func PromLabelSetsToString(lsets []labels.Labels) string {
@@ -332,7 +318,6 @@ func (m *ZLabelSet) UnmarshalJSON(entry []byte) error {
 	if err := lbls.UnmarshalJSON(entry); err != nil {
 		return errors.Wrapf(err, "labels: labels field unmarshal: %v", string(entry))
 	}
-	sort.Sort(lbls)
 	m.Labels = ZLabelsFromPromLabels(lbls)
 	return nil
 }
@@ -441,4 +426,68 @@ func (z ZLabelSets) Less(i, j int) bool {
 	}
 
 	return l == lenI
+}
+
+type CustomLabelset labels.Labels
+
+var builderPool = &sync.Pool{
+	New: func() any {
+		b := labels.NewScratchBuilder(8)
+		return &b
+	},
+}
+
+func (l *CustomLabelset) UnmarshalProtobuf(src []byte) (err error) {
+	b := builderPool.Get().(*labels.ScratchBuilder)
+	b.Reset()
+
+	defer builderPool.Put(b)
+
+	var fc easyproto.FieldContext
+
+	for len(src) > 0 {
+		src, err = fc.NextField(src)
+		if err != nil {
+			return errors.Wrap(err, "unmarshal next field")
+		}
+
+		if fc.FieldNum != 1 {
+			return fmt.Errorf("expected field 1, got %d", fc.FieldNum)
+		}
+
+		dat, ok := fc.MessageData()
+		if !ok {
+			return fmt.Errorf("expected message data for field %d", fc.FieldNum)
+		}
+
+		var n, v string
+		var msgFc easyproto.FieldContext
+		for len(dat) > 0 {
+			dat, err = msgFc.NextField(dat)
+			if err != nil {
+				return errors.Wrap(err, "unmarshal next field in message")
+			}
+
+			switch msgFc.FieldNum {
+			case 1:
+				n, ok = msgFc.String()
+				if !ok {
+					return fmt.Errorf("expected string data for field %d", msgFc.FieldNum)
+				}
+			case 2:
+				v, ok = msgFc.String()
+				if !ok {
+					return fmt.Errorf("expected string data for field %d", msgFc.FieldNum)
+				}
+			default:
+				return fmt.Errorf("unexpected field %d in label message", msgFc.FieldNum)
+			}
+		}
+
+		b.Add(n, v)
+
+	}
+
+	*l = CustomLabelset(b.Labels())
+	return nil
 }

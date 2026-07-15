@@ -14,13 +14,15 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 
 	"github.com/efficientgo/core/testutil"
+
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
@@ -29,6 +31,11 @@ import (
 
 type erroringBucket struct {
 	bkt objstore.InstrumentedBucket
+}
+
+// Provider returns the provider of the bucket.
+func (b *erroringBucket) Provider() objstore.ObjProvider {
+	return b.bkt.Provider()
 }
 
 func (b *erroringBucket) Close() error {
@@ -77,6 +84,11 @@ func (b *erroringBucket) IsObjNotFoundErr(err error) bool {
 	return b.bkt.IsObjNotFoundErr(err)
 }
 
+// IsAccessDeniedErr returns true if error means that access to the object was denied.
+func (b *erroringBucket) IsAccessDeniedErr(err error) bool {
+	return b.bkt.IsAccessDeniedErr(err)
+}
+
 // Attributes returns information about the specified object.
 func (b *erroringBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
 	return b.bkt.Attributes(ctx, name)
@@ -84,8 +96,8 @@ func (b *erroringBucket) Attributes(ctx context.Context, name string) (objstore.
 
 // Upload the contents of the reader as an object into the bucket.
 // Upload should be idempotent.
-func (b *erroringBucket) Upload(ctx context.Context, name string, r io.Reader) error {
-	return b.bkt.Upload(ctx, name, r)
+func (b *erroringBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
+	return b.bkt.Upload(ctx, name, r, opts...)
 }
 
 // Delete removes the object with the given name.
@@ -97,6 +109,16 @@ func (b *erroringBucket) Delete(ctx context.Context, name string) error {
 // Name returns the bucket name for the provider.
 func (b *erroringBucket) Name() string {
 	return b.bkt.Name()
+}
+
+// IterWithAttributes allows to iterate over objects in the bucket with their attributes.
+func (b *erroringBucket) IterWithAttributes(ctx context.Context, dir string, f func(objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	return b.bkt.IterWithAttributes(ctx, dir, f, options...)
+}
+
+// SupportedIterOptions returns the supported iteration options.
+func (b *erroringBucket) SupportedIterOptions() []objstore.IterOptionType {
+	return b.bkt.SupportedIterOptions()
 }
 
 // Ensures that downsampleBucket() stops its work properly
@@ -117,10 +139,10 @@ func TestRegression4960_Deadlock(t *testing.T) {
 		id, err = e2eutil.CreateBlock(
 			ctx,
 			dir,
-			[]labels.Labels{{{Name: "a", Value: "1"}}},
+			[]labels.Labels{labels.FromStrings("a", "1")},
 			1, 0, downsample.ResLevel1DownsampleRange+1, // Pass the minimum ResLevel1DownsampleRange check.
-			labels.Labels{{Name: "e1", Value: "1"}},
-			downsample.ResLevel0, metadata.NoneFunc)
+			labels.FromStrings("e1", "1"),
+			downsample.ResLevel0, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, block.Upload(ctx, logger, bkt, path.Join(dir, id.String()), metadata.NoneFunc))
 	}
@@ -128,10 +150,10 @@ func TestRegression4960_Deadlock(t *testing.T) {
 		id2, err = e2eutil.CreateBlock(
 			ctx,
 			dir,
-			[]labels.Labels{{{Name: "a", Value: "2"}}},
+			[]labels.Labels{labels.FromStrings("a", "2")},
 			1, 0, downsample.ResLevel1DownsampleRange+1, // Pass the minimum ResLevel1DownsampleRange check.
-			labels.Labels{{Name: "e1", Value: "2"}},
-			downsample.ResLevel0, metadata.NoneFunc)
+			labels.FromStrings("e1", "2"),
+			downsample.ResLevel0, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, block.Upload(ctx, logger, bkt, path.Join(dir, id2.String()), metadata.NoneFunc))
 	}
@@ -139,10 +161,10 @@ func TestRegression4960_Deadlock(t *testing.T) {
 		id3, err = e2eutil.CreateBlock(
 			ctx,
 			dir,
-			[]labels.Labels{{{Name: "a", Value: "2"}}},
+			[]labels.Labels{labels.FromStrings("a", "2")},
 			1, 0, downsample.ResLevel1DownsampleRange+1, // Pass the minimum ResLevel1DownsampleRange check.
-			labels.Labels{{Name: "e1", Value: "2"}},
-			downsample.ResLevel0, metadata.NoneFunc)
+			labels.FromStrings("e1", "2"),
+			downsample.ResLevel0, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, block.Upload(ctx, logger, bkt, path.Join(dir, id3.String()), metadata.NoneFunc))
 	}
@@ -151,13 +173,14 @@ func TestRegression4960_Deadlock(t *testing.T) {
 	testutil.Ok(t, err)
 
 	metrics := newDownsampleMetrics(prometheus.NewRegistry())
-	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.GroupKey())))
-	metaFetcher, err := block.NewMetaFetcher(nil, block.FetcherConcurrency, bkt, "", nil, nil)
+	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.ResolutionString())))
+	baseBlockIDsFetcher := block.NewConcurrentLister(logger, bkt)
+	metaFetcher, err := block.NewMetaFetcher(nil, block.FetcherConcurrency, bkt, baseBlockIDsFetcher, "", nil, nil)
 	testutil.Ok(t, err)
 
 	metas, _, err := metaFetcher.Fetch(ctx)
 	testutil.Ok(t, err)
-	err = downsampleBucket(ctx, logger, metrics, bkt, metas, dir, 1, metadata.NoneFunc, false)
+	err = downsampleBucket(ctx, logger, metrics, bkt, metas, dir, 1, 1, metadata.NoneFunc, false)
 	testutil.NotOk(t, err)
 
 	testutil.Assert(t, strings.Contains(err.Error(), "some random error has occurred"))
@@ -178,10 +201,10 @@ func TestCleanupDownsampleCacheFolder(t *testing.T) {
 		id, err = e2eutil.CreateBlock(
 			ctx,
 			dir,
-			[]labels.Labels{{{Name: "a", Value: "1"}}},
+			[]labels.Labels{labels.FromStrings("a", "1")},
 			1, 0, downsample.ResLevel1DownsampleRange+1, // Pass the minimum ResLevel1DownsampleRange check.
-			labels.Labels{{Name: "e1", Value: "1"}},
-			downsample.ResLevel0, metadata.NoneFunc)
+			labels.FromStrings("e1", "1"),
+			downsample.ResLevel0, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, block.Upload(ctx, logger, bkt, path.Join(dir, id.String()), metadata.NoneFunc))
 	}
@@ -190,14 +213,15 @@ func TestCleanupDownsampleCacheFolder(t *testing.T) {
 	testutil.Ok(t, err)
 
 	metrics := newDownsampleMetrics(prometheus.NewRegistry())
-	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.GroupKey())))
-	metaFetcher, err := block.NewMetaFetcher(nil, block.FetcherConcurrency, bkt, "", nil, nil)
+	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.ResolutionString())))
+	baseBlockIDsFetcher := block.NewConcurrentLister(logger, bkt)
+	metaFetcher, err := block.NewMetaFetcher(nil, block.FetcherConcurrency, bkt, baseBlockIDsFetcher, "", nil, nil)
 	testutil.Ok(t, err)
 
 	metas, _, err := metaFetcher.Fetch(ctx)
 	testutil.Ok(t, err)
-	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, metas, dir, 1, metadata.NoneFunc, false))
-	testutil.Equals(t, 1.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.GroupKey())))
+	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, metas, dir, 1, 1, metadata.NoneFunc, false))
+	testutil.Equals(t, 1.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.ResolutionString())))
 
 	_, err = os.Stat(dir)
 	testutil.Assert(t, os.IsNotExist(err), "index cache dir should not exist at the end of execution")

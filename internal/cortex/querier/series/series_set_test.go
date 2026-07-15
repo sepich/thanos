@@ -49,19 +49,19 @@ func TestMatrixToSeriesSetSortsMetricLabels(t *testing.T) {
 	require.NoError(t, ss.Err())
 
 	l := ss.At().Labels()
-	require.Equal(t, labels.Labels{
-		{Name: string(model.MetricNameLabel), Value: "testmetric"},
-		{Name: "a", Value: "b"},
-		{Name: "c", Value: "d"},
-		{Name: "e", Value: "f"},
-		{Name: "g", Value: "h"},
-	}, l)
+	require.Equal(t, labels.New(
+		labels.Label{Name: string(model.MetricNameLabel), Value: "testmetric"},
+		labels.Label{Name: "a", Value: "b"},
+		labels.Label{Name: "c", Value: "d"},
+		labels.Label{Name: "e", Value: "f"},
+		labels.Label{Name: "g", Value: "h"},
+	), l)
 }
 
 func TestDeletedSeriesIterator(t *testing.T) {
 	cs := ConcreteSeries{labels: labels.FromStrings("foo", "bar")}
 	// Insert random stuff from (0, 1000).
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		cs.samples = append(cs.samples, model.SamplePair{Timestamp: model.Time(i), Value: model.SampleValue(rand.Float64())})
 	}
 
@@ -118,7 +118,7 @@ func TestDeletedSeriesIterator(t *testing.T) {
 func TestDeletedIterator_WithSeek(t *testing.T) {
 	cs := ConcreteSeries{labels: labels.FromStrings("foo", "bar")}
 	// Insert random stuff from (0, 1000).
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		cs.samples = append(cs.samples, model.SamplePair{Timestamp: model.Time(i), Value: model.SampleValue(rand.Float64())})
 	}
 

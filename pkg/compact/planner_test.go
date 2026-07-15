@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -30,7 +30,7 @@ type tsdbPlannerAdapter struct {
 	comp tsdb.Compactor
 }
 
-func (p *tsdbPlannerAdapter) Plan(_ context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
+func (p *tsdbPlannerAdapter) Plan(_ context.Context, metasByMinTime []*metadata.Meta, errChan chan error, _ any) ([]*metadata.Meta, error) {
 	// TSDB planning works based on the meta.json files in the given dir. Mock it up.
 	for _, meta := range metasByMinTime {
 		bdir := filepath.Join(p.dir, meta.ULID.String())
@@ -59,6 +59,8 @@ func (p *tsdbPlannerAdapter) Plan(_ context.Context, metasByMinTime []*metadata.
 
 // Adapted from https://github.com/prometheus/prometheus/blob/6c56a1faaaad07317ff585bda75b99bdba0517ad/tsdb/compact_test.go#L167
 func TestPlanners_Plan_Compatibility(t *testing.T) {
+	t.Parallel()
+
 	ranges := []int64{
 		20,
 		60,
@@ -364,7 +366,7 @@ func TestPlanners_Plan_Compatibility(t *testing.T) {
 				})
 
 				tsdbPlanner.dir = dir
-				plan, err := tsdbPlanner.Plan(context.Background(), metasByMinTime)
+				plan, err := tsdbPlanner.Plan(context.Background(), metasByMinTime, nil, nil)
 				testutil.Ok(t, err)
 				testutil.Equals(t, c.expected, plan)
 			})
@@ -377,7 +379,7 @@ func TestPlanners_Plan_Compatibility(t *testing.T) {
 					return metasByMinTime[i].MinTime < metasByMinTime[j].MinTime
 				})
 
-				plan, err := tsdbBasedPlanner.Plan(context.Background(), metasByMinTime)
+				plan, err := tsdbBasedPlanner.Plan(context.Background(), metasByMinTime, nil, nil)
 				testutil.Ok(t, err)
 				testutil.Equals(t, c.expected, plan)
 			})
@@ -387,6 +389,8 @@ func TestPlanners_Plan_Compatibility(t *testing.T) {
 
 // Adapted form: https://github.com/prometheus/prometheus/blob/6c56a1faaaad07317ff585bda75b99bdba0517ad/tsdb/compact_test.go#L377
 func TestRangeWithFailedCompactionWontGetSelected(t *testing.T) {
+	t.Parallel()
+
 	ranges := []int64{
 		20,
 		60,
@@ -440,12 +444,12 @@ func TestRangeWithFailedCompactionWontGetSelected(t *testing.T) {
 				defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
 
 				tsdbPlanner.dir = dir
-				plan, err := tsdbPlanner.Plan(context.Background(), c.metas)
+				plan, err := tsdbPlanner.Plan(context.Background(), c.metas, nil, nil)
 				testutil.Ok(t, err)
 				testutil.Equals(t, []*metadata.Meta(nil), plan)
 			})
 			t.Run("tsdbBasedPlanner", func(t *testing.T) {
-				plan, err := tsdbBasedPlanner.Plan(context.Background(), c.metas)
+				plan, err := tsdbBasedPlanner.Plan(context.Background(), c.metas, nil, nil)
 				testutil.Ok(t, err)
 				testutil.Equals(t, []*metadata.Meta(nil), plan)
 			})
@@ -454,6 +458,8 @@ func TestRangeWithFailedCompactionWontGetSelected(t *testing.T) {
 }
 
 func TestTSDBBasedPlanner_PlanWithNoCompactMarks(t *testing.T) {
+	t.Parallel()
+
 	ranges := []int64{
 		20,
 		60,
@@ -638,7 +644,7 @@ func TestTSDBBasedPlanner_PlanWithNoCompactMarks(t *testing.T) {
 				return metasByMinTime[i].MinTime < metasByMinTime[j].MinTime
 			})
 			g.noCompactMarkedMap = c.noCompactMarks
-			plan, err := tsdbBasedPlanner.Plan(context.Background(), metasByMinTime)
+			plan, err := tsdbBasedPlanner.Plan(context.Background(), metasByMinTime, nil, nil)
 			testutil.Ok(t, err)
 			testutil.Equals(t, c.expected, plan)
 		})
@@ -646,6 +652,8 @@ func TestTSDBBasedPlanner_PlanWithNoCompactMarks(t *testing.T) {
 }
 
 func TestLargeTotalIndexSizeFilter_Plan(t *testing.T) {
+	t.Parallel()
+
 	ranges := []int64{
 		20,
 		60,
@@ -814,7 +822,7 @@ func TestLargeTotalIndexSizeFilter_Plan(t *testing.T) {
 					return metasByMinTime[i].MinTime < metasByMinTime[j].MinTime
 				})
 
-				plan, err := planner.Plan(context.Background(), metasByMinTime)
+				plan, err := planner.Plan(context.Background(), metasByMinTime, nil, nil)
 				testutil.Ok(t, err)
 
 				for _, m := range plan {
@@ -847,7 +855,7 @@ func TestLargeTotalIndexSizeFilter_Plan(t *testing.T) {
 					m.Thanos = metadata.Thanos{}
 				}
 
-				plan, err := planner.Plan(context.Background(), metasByMinTime)
+				plan, err := planner.Plan(context.Background(), metasByMinTime, nil, nil)
 				testutil.Ok(t, err)
 				testutil.Equals(t, c.expected, plan)
 				testutil.Equals(t, c.expectedMarks, promtest.ToFloat64(marked)-lastMarkValue)

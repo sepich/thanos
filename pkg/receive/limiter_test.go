@@ -4,7 +4,6 @@
 package receive
 
 import (
-	"context"
 	"os"
 	"path"
 	"testing"
@@ -17,6 +16,8 @@ import (
 )
 
 func TestLimiter_StartConfigReloader(t *testing.T) {
+	t.Parallel()
+
 	origLimitsFile, err := os.ReadFile(path.Join("testdata", "limits_config", "good_limits.yaml"))
 	testutil.Ok(t, err)
 	copyLimitsFile := path.Join(t.TempDir(), "limits.yaml")
@@ -32,11 +33,10 @@ func TestLimiter_StartConfigReloader(t *testing.T) {
 		t.Fatalf("could not load test content at %s: %s", invalidLimitsPath, err)
 	}
 
-	limiter, err := NewLimiter(goodLimits, nil, RouterIngestor, log.NewLogfmtLogger(os.Stdout))
+	limiter, err := NewLimiter(goodLimits, nil, RouterIngestor, log.NewLogfmtLogger(os.Stdout), 1*time.Second)
 	testutil.Ok(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	err = limiter.StartConfigReloader(ctx)
 	testutil.Ok(t, err)
 
@@ -55,6 +55,8 @@ func (e emptyPathFile) Path() string {
 }
 
 func TestLimiter_CanReload(t *testing.T) {
+	t.Parallel()
+
 	validLimitsPath, err := extkingpin.NewStaticPathContent(
 		path.Join("testdata", "limits_config", "good_limits.yaml"),
 	)
@@ -88,7 +90,7 @@ func TestLimiter_CanReload(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			configFile := tt.args.configFilePath
-			limiter, err := NewLimiter(configFile, nil, RouterIngestor, log.NewLogfmtLogger(os.Stdout))
+			limiter, err := NewLimiter(configFile, nil, RouterIngestor, log.NewLogfmtLogger(os.Stdout), 1*time.Second)
 			testutil.Ok(t, err)
 			if tt.wantReload {
 				testutil.Assert(t, limiter.CanReload())

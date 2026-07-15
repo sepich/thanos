@@ -15,6 +15,11 @@ const (
 	LogFormatJSON   = "json"
 )
 
+type LevelLogger struct {
+	log.Logger
+	LogLevel string
+}
+
 // NewLogger returns a log.Logger that prints in the provided format at the
 // provided level with a UTC timestamp and the caller of the log entry. If non
 // empty, the debug name is also appended as a field to all log lines. Panics
@@ -46,11 +51,17 @@ func NewLogger(logLevel, logFormat, debugName string) log.Logger {
 		logger = log.NewJSONLogger(log.NewSyncWriter(os.Stderr))
 	}
 
+	// Sort the logger chain to avoid expensive log.Valuer evaluation for disallowed level.
+	// Ref: https://github.com/go-kit/log/issues/14#issuecomment-945038252
+	logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", log.Caller(5))
 	logger = level.NewFilter(logger, lvl)
 
 	if debugName != "" {
 		logger = log.With(logger, "name", debugName)
 	}
 
-	return log.With(logger, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
+	return LevelLogger{
+		Logger:   logger,
+		LogLevel: logLevel,
+	}
 }

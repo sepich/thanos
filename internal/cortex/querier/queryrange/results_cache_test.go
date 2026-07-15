@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	query        = "/api/v1/query_range?end=1536716898&query=sum%28container_memory_rss%29+by+%28namespace%29&start=1536673680&stats=all&step=120"
-	responseBody = `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"foo":"bar"},"values":[[1536673680,"137"],[1536673780,"137"]]}]}}`
+	query                 = "/api/v1/query_range?end=1536716898&query=sum%28container_memory_rss%29+by+%28namespace%29&start=1536673680&stats=all&step=120"
+	responseBody          = `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"foo":"bar"},"values":[[1536673680,"137"],[1536673780,"137"]]}],"analysis":null},"warnings":["test-warn"]}`
+	histogramResponseBody = `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"fake":"histogram"},"histograms":[[1536673680,{"count":"5","sum":"18.4","buckets":[[3,"-0.001","0.001","2"],[0,"0.7071067811865475","1","1"],[0,"1","1.414213562373095","2"],[0,"2","2.82842712474619","1"],[0,"2.82842712474619","4","1"]]}]]}],"analysis":null}}`
 )
 
 var (
@@ -34,6 +35,14 @@ var (
 		End:   1536716898 * 1e3,
 		Step:  120 * 1e3,
 		Query: "sum(container_memory_rss) by (namespace)",
+		Stats: "all",
+	}
+	parsedHistogramRequest = &PrometheusRequest{
+		Path:  "/api/v1/query_range",
+		Start: 1536673680 * 1e3,
+		End:   1536716898 * 1e3,
+		Step:  120 * 1e3,
+		Query: "{fake=\"histogram\"}",
 		Stats: "all",
 	}
 	reqHeaders = []*PrometheusRequestHeader{
@@ -69,6 +78,7 @@ var (
 		Status: "success",
 		Data: PrometheusData{
 			ResultType: model.ValMatrix.String(),
+			Analysis:   (*Analysis)(nil),
 			Result: []SampleStream{
 				{
 					Labels: []cortexpb.LabelAdapter{
@@ -77,6 +87,27 @@ var (
 					Samples: []cortexpb.Sample{
 						{Value: 137, TimestampMs: 1536673680000},
 						{Value: 137, TimestampMs: 1536673780000},
+					},
+				},
+			},
+		},
+		Warnings: []string{"test-warn"},
+	}
+	parsedHistogramResponse = &PrometheusResponse{
+		Status: "success",
+		Data: PrometheusData{
+			ResultType: model.ValMatrix.String(),
+			Analysis:   (*Analysis)(nil),
+			Result: []SampleStream{
+				{
+					Labels: []cortexpb.LabelAdapter{
+						{Name: "fake", Value: "histogram"},
+					},
+					Histograms: []SampleHistogramPair{
+						{
+							Timestamp: 1536673680000,
+							Histogram: genSampleHistogram(),
+						},
 					},
 				},
 			},
@@ -115,6 +146,7 @@ func mkAPIResponseWithStats(start, end, step int64, withStats bool) *PrometheusR
 		Data: PrometheusData{
 			ResultType: matrix,
 			Stats:      stats,
+			Analysis:   &Analysis{},
 			Result: []SampleStream{
 				{
 					Labels: []cortexpb.LabelAdapter{
@@ -501,6 +533,45 @@ func TestShouldCache(t *testing.T) {
 		{
 			name:     "@ modifier on subqueries with end() after maxCacheTime",
 			request:  &PrometheusRequest{Query: "sum_over_time(rate(metric[1m])[10m:1m] @ end())", Start: 100000, End: 200000},
+			input:    Response(&PrometheusResponse{}),
+			expected: false,
+		},
+		// offset on vector selectors.
+		{
+			name:     "positive offset on vector selector",
+			request:  &PrometheusRequest{Query: "metric offset 10ms", End: 125000},
+			input:    Response(&PrometheusResponse{}),
+			expected: true,
+		},
+		{
+			name:     "negative offset on vector selector",
+			request:  &PrometheusRequest{Query: "metric offset -10ms", End: 125000},
+			input:    Response(&PrometheusResponse{}),
+			expected: false,
+		},
+		// offset on matrix selectors.
+		{
+			name:     "positive offset on matrix selector",
+			request:  &PrometheusRequest{Query: "rate(metric[5m] offset 10ms)", End: 125000},
+			input:    Response(&PrometheusResponse{}),
+			expected: true,
+		},
+		{
+			name:     "negative offset on matrix selector",
+			request:  &PrometheusRequest{Query: "rate(metric[5m] offset -10ms)", End: 125000},
+			input:    Response(&PrometheusResponse{}),
+			expected: false,
+		},
+		// offset on subqueries.
+		{
+			name:     "positive offset on subqueries",
+			request:  &PrometheusRequest{Query: "sum_over_time(rate(metric[1m])[10m:1m] offset 10ms)", End: 125000},
+			input:    Response(&PrometheusResponse{}),
+			expected: true,
+		},
+		{
+			name:     "negative offset on subqueries",
+			request:  &PrometheusRequest{Query: "sum_over_time(rate(metric[1m])[10m:1m] offset -10ms)", End: 125000},
 			input:    Response(&PrometheusResponse{}),
 			expected: false,
 		},
@@ -1003,21 +1074,24 @@ func TestResultsCache(t *testing.T) {
 	)
 	require.NoError(t, err)
 
+	useResp := *parsedResponse
+	useResp.Data.Analysis = &Analysis{}
+
 	rc := rcm.Wrap(HandlerFunc(func(_ context.Context, req Request) (Response, error) {
 		calls++
-		return parsedResponse, nil
+		return &useResp, nil
 	}))
 	ctx := user.InjectOrgID(context.Background(), "1")
 	resp, err := rc.Do(ctx, parsedRequest)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls)
-	require.Equal(t, parsedResponse, resp)
+	require.Equal(t, &useResp, resp)
 
 	// Doing same request again shouldn't change anything.
 	resp, err = rc.Do(ctx, parsedRequest)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls)
-	require.Equal(t, parsedResponse, resp)
+	require.Equal(t, &useResp, resp)
 
 	// Doing request with new end time should do one more query.
 	req := parsedRequest.WithStartEnd(parsedRequest.GetStart(), parsedRequest.GetEnd()+100)
@@ -1264,6 +1338,52 @@ func TestResultsCacheShouldCacheFunc(t *testing.T) {
 	}
 }
 
+func TestNativeHistograms(t *testing.T) {
+	calls := 0
+	cfg := ResultsCacheConfig{
+		CacheConfig: cache.Config{
+			Cache: cache.NewMockCache(),
+		},
+	}
+	rcm, _, err := NewResultsCacheMiddleware(
+		log.NewNopLogger(),
+		cfg,
+		constSplitter(day),
+		mockLimits{},
+		PrometheusCodec,
+		PrometheusResponseExtractor{},
+		nil,
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+
+	useResp := *parsedHistogramResponse
+	useResp.Data.Analysis = &Analysis{}
+
+	rc := rcm.Wrap(HandlerFunc(func(_ context.Context, req Request) (Response, error) {
+		calls++
+		return &useResp, nil
+	}))
+	ctx := user.InjectOrgID(context.Background(), "1")
+	resp, err := rc.Do(ctx, parsedHistogramRequest)
+	require.NoError(t, err)
+	require.Equal(t, 1, calls)
+	require.Equal(t, &useResp, resp)
+
+	// Doing same request again shouldn't change anything.
+	resp, err = rc.Do(ctx, parsedHistogramRequest)
+	require.NoError(t, err)
+	require.Equal(t, 1, calls)
+	require.Equal(t, &useResp, resp)
+
+	// Doing request with new end time should do one more query.
+	req := parsedHistogramRequest.WithStartEnd(parsedHistogramRequest.GetStart(), parsedHistogramRequest.GetEnd()+100)
+	_, err = rc.Do(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, 2, calls)
+}
+
 func toMs(t time.Duration) int64 {
 	return int64(t / time.Millisecond)
 }
@@ -1277,4 +1397,43 @@ func newMockCacheGenNumberLoader() CacheGenNumberLoader {
 
 func (mockCacheGenNumberLoader) GetResultsCacheGenNumber(tenantIDs []string) string {
 	return ""
+}
+
+func genSampleHistogram() SampleHistogram {
+	return SampleHistogram{
+		Count: 5,
+		Sum:   18.4,
+		Buckets: []*HistogramBucket{
+			{
+				Boundaries: 3,
+				Lower:      -0.001,
+				Upper:      0.001,
+				Count:      2,
+			},
+			{
+				Boundaries: 0,
+				Lower:      0.7071067811865475,
+				Upper:      1,
+				Count:      1,
+			},
+			{
+				Boundaries: 0,
+				Lower:      1,
+				Upper:      1.414213562373095,
+				Count:      2,
+			},
+			{
+				Boundaries: 0,
+				Lower:      2,
+				Upper:      2.82842712474619,
+				Count:      1,
+			},
+			{
+				Boundaries: 0,
+				Lower:      2.82842712474619,
+				Upper:      4,
+				Count:      1,
+			},
+		},
+	}
 }

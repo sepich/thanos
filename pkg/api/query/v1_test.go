@@ -30,10 +30,13 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/atomic"
+
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
@@ -44,12 +47,15 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	"github.com/prometheus/prometheus/tsdb/tsdbutil"
+	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/util/annotations"
 	promgate "github.com/prometheus/prometheus/util/gate"
 	"github.com/prometheus/prometheus/util/stats"
+	"github.com/thanos-io/promql-engine/engine"
 	baseAPI "github.com/thanos-io/thanos/pkg/api"
 	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/dedup"
 	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/query"
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
@@ -71,17 +77,42 @@ type endpointTestCase struct {
 	params   map[string]string
 	query    url.Values
 	method   string
-	response interface{}
+	response any
 	errType  baseAPI.ErrorType
 }
-type responeCompareFunction func(interface{}, interface{}) bool
+type responeCompareFunction func(any, any) bool
 
 // Checks if both responses have Stats present or not.
-func lookupStats(a, b interface{}) bool {
+func lookupStats(a, b any) bool {
 	ra := a.(*queryData)
 	rb := b.(*queryData)
 	return (ra.Stats == nil && rb.Stats == nil) || (ra.Stats != nil && rb.Stats != nil)
 }
+
+var (
+	timeout = 100 * time.Second
+
+	queryFactory = NewQueryFactory(
+		prometheus.NewRegistry(),
+		log.NewNopLogger(),
+		timeout,
+		5*time.Minute,
+		30*time.Second,
+		true,
+		nil,
+		PromqlQueryModeLocal,
+		false,
+	)
+
+	emptyRemoteEndpointsCreate = query.NewRemoteEndpointsCreator(
+		log.NewNopLogger(),
+		func() []query.Client { return nil },
+		nil,
+		timeout,
+		true,
+		true,
+	)
+)
 
 func testEndpoint(t *testing.T, test endpointTestCase, name string, responseCompareFunc responeCompareFunction) bool {
 	return t.Run(name, func(t *testing.T) {
@@ -95,9 +126,11 @@ func testEndpoint(t *testing.T, test endpointTestCase, name string, responseComp
 		params := test.query.Encode()
 
 		var body io.Reader
-		if test.method == http.MethodPost {
+
+		switch test.method {
+		case http.MethodPost:
 			body = strings.NewReader(params)
-		} else if test.method == "" {
+		case "":
 			test.method = "ANY"
 			reqURL += "?" + params
 		}
@@ -134,38 +167,13 @@ func testEndpoint(t *testing.T, test endpointTestCase, name string, responseComp
 
 func TestQueryEndpoints(t *testing.T) {
 	lbls := []labels.Labels{
-		{
-			labels.Label{Name: "__name__", Value: "test_metric1"},
-			labels.Label{Name: "foo", Value: "bar"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric1"},
-			labels.Label{Name: "foo", Value: "boo"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric2"},
-			labels.Label{Name: "foo", Value: "boo"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			labels.Label{Name: "foo", Value: "bar"},
-			labels.Label{Name: "replica", Value: "a"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			labels.Label{Name: "foo", Value: "boo"},
-			labels.Label{Name: "replica", Value: "a"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			labels.Label{Name: "foo", Value: "boo"},
-			labels.Label{Name: "replica", Value: "b"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			labels.Label{Name: "foo", Value: "boo"},
-			labels.Label{Name: "replica1", Value: "a"},
-		},
+		labels.FromStrings("__name__", "test_metric1", "foo", "bar"),
+		labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+		labels.FromStrings("__name__", "test_metric2", "foo", "boo"),
+		labels.FromStrings("__name__", "test_metric_replica1", "foo", "bar", "replica", "a"),
+		labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo", "replica", "a"),
+		labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo", "replica", "b"),
+		labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo", "replica1", "a"),
 	}
 
 	db, err := e2eutil.NewTSDB()
@@ -174,7 +182,7 @@ func TestQueryEndpoints(t *testing.T) {
 
 	app := db.Appender(context.Background())
 	for _, lbl := range lbls {
-		for i := int64(0); i < 10; i++ {
+		for i := range int64(10) {
 			_, err := app.Append(0, lbl, i*60000, float64(i))
 			testutil.Ok(t, err)
 		}
@@ -182,26 +190,23 @@ func TestQueryEndpoints(t *testing.T) {
 	testutil.Ok(t, app.Commit())
 
 	now := time.Now()
-	timeout := 100 * time.Second
-	qe := promql.NewEngine(promql.EngineOpts{
-		Logger:     nil,
-		Reg:        nil,
-		MaxSamples: 10000,
-		Timeout:    timeout,
-	})
 	api := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
 		},
-		queryableCreate:       query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout),
-		queryEngine:           qe,
+		queryableCreate:       query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout, dedup.AlgorithmPenalty, 1),
+		remoteEndpointsCreate: emptyRemoteEndpointsCreate,
+		queryCreate:           queryFactory,
 		lookbackDeltaCreate:   func(m int64) time.Duration { return time.Duration(0) },
+		defaultEngine:         PromqlEnginePrometheus,
 		gate:                  gate.New(nil, 4, gate.Queries),
 		defaultRangeQueryStep: time.Second,
 		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
 			Name: "query_range_hist",
 		}),
-		seriesStatsAggregator: &store.NoopSeriesStatsAggregator{},
+		seriesStatsAggregatorFactory: &store.NoopSeriesStatsAggregatorFactory{},
+		tenantHeader:                 "thanos-tenant",
+		defaultTenant:                "default-tenant",
 	}
 
 	start := time.Unix(0, 0)
@@ -260,88 +265,29 @@ func TestQueryEndpoints(t *testing.T) {
 				ResultType: parser.ValueTypeVector,
 				Result: promql.Vector{
 					{
-						Metric: labels.Labels{
-							{
-								Name:  "__name__",
-								Value: "test_metric_replica1",
-							},
-							{
-								Name:  "foo",
-								Value: "bar",
-							},
-							{
-								Name:  "replica",
-								Value: "a",
-							},
-						},
-						Point: promql.Point{
-							T: 123000,
-							V: 2,
-						},
+						Metric: labels.FromStrings("__name__", "test_metric_replica1", "foo", "bar", "replica", "a"),
+						T:      123000,
+						F:      2,
 					},
 					{
-						Metric: labels.Labels{
-							{
-								Name:  "__name__",
-								Value: "test_metric_replica1",
-							},
-							{
-								Name:  "foo",
-								Value: "boo",
-							},
-							{
-								Name:  "replica",
-								Value: "a",
-							},
-						},
-						Point: promql.Point{
-							T: 123000,
-							V: 2,
-						},
+						Metric: labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo", "replica", "a"),
+						T:      123000,
+						F:      2,
 					},
 					{
-						Metric: labels.Labels{
-							{
-								Name:  "__name__",
-								Value: "test_metric_replica1",
-							},
-							{
-								Name:  "foo",
-								Value: "boo",
-							},
-							{
-								Name:  "replica",
-								Value: "b",
-							},
-						},
-						Point: promql.Point{
-							T: 123000,
-							V: 2,
-						},
+						Metric: labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo", "replica", "b"),
+						T:      123000,
+						F:      2,
 					},
 					{
-						Metric: labels.Labels{
-							{
-								Name:  "__name__",
-								Value: "test_metric_replica1",
-							},
-							{
-								Name:  "foo",
-								Value: "boo",
-							},
-							{
-								Name:  "replica1",
-								Value: "a",
-							},
-						},
-						Point: promql.Point{
-							T: 123000,
-							V: 2,
-						},
+						Metric: labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo", "replica1", "a"),
+						T:      123000,
+						F:      2,
 					},
 				},
 			},
 		},
+
 		// Query endpoint with single deduplication label.
 		{
 			endpoint: api.query,
@@ -354,56 +300,19 @@ func TestQueryEndpoints(t *testing.T) {
 				ResultType: parser.ValueTypeVector,
 				Result: promql.Vector{
 					{
-						Metric: labels.Labels{
-							{
-								Name:  "__name__",
-								Value: "test_metric_replica1",
-							},
-							{
-								Name:  "foo",
-								Value: "bar",
-							},
-						},
-						Point: promql.Point{
-							T: 123000,
-							V: 2,
-						},
+						Metric: labels.FromStrings("__name__", "test_metric_replica1", "foo", "bar"),
+						T:      123000,
+						F:      2,
 					},
 					{
-						Metric: labels.Labels{
-							{
-								Name:  "__name__",
-								Value: "test_metric_replica1",
-							},
-							{
-								Name:  "foo",
-								Value: "boo",
-							},
-						},
-						Point: promql.Point{
-							T: 123000,
-							V: 2,
-						},
+						Metric: labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo"),
+						T:      123000,
+						F:      2,
 					},
 					{
-						Metric: labels.Labels{
-							{
-								Name:  "__name__",
-								Value: "test_metric_replica1",
-							},
-							{
-								Name:  "foo",
-								Value: "boo",
-							},
-							{
-								Name:  "replica1",
-								Value: "a",
-							},
-						},
-						Point: promql.Point{
-							T: 123000,
-							V: 2,
-						},
+						Metric: labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo", "replica1", "a"),
+						T:      123000,
+						F:      2,
 					},
 				},
 			},
@@ -420,36 +329,14 @@ func TestQueryEndpoints(t *testing.T) {
 				ResultType: parser.ValueTypeVector,
 				Result: promql.Vector{
 					{
-						Metric: labels.Labels{
-							{
-								Name:  "__name__",
-								Value: "test_metric_replica1",
-							},
-							{
-								Name:  "foo",
-								Value: "bar",
-							},
-						},
-						Point: promql.Point{
-							T: 123000,
-							V: 2,
-						},
+						Metric: labels.FromStrings("__name__", "test_metric_replica1", "foo", "bar"),
+						T:      123000,
+						F:      2,
 					},
 					{
-						Metric: labels.Labels{
-							{
-								Name:  "__name__",
-								Value: "test_metric_replica1",
-							},
-							{
-								Name:  "foo",
-								Value: "boo",
-							},
-						},
-						Point: promql.Point{
-							T: 123000,
-							V: 2,
-						},
+						Metric: labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo"),
+						T:      123000,
+						F:      2,
 					},
 				},
 			},
@@ -488,14 +375,13 @@ func TestQueryEndpoints(t *testing.T) {
 				ResultType: parser.ValueTypeMatrix,
 				Result: promql.Matrix{
 					promql.Series{
-						Points: func(end, step float64) []promql.Point {
-							var res []promql.Point
+						Floats: func(end, step float64) []promql.FPoint {
+							var res []promql.FPoint
 							for v := float64(0); v <= end; v += step {
-								res = append(res, promql.Point{V: v, T: timestamp.FromTime(start.Add(time.Duration(v) * time.Second))})
+								res = append(res, promql.FPoint{F: v, T: timestamp.FromTime(start.Add(time.Duration(v) * time.Second))})
 							}
 							return res
 						}(500, 1),
-						Metric: nil,
 					},
 				},
 			},
@@ -512,12 +398,11 @@ func TestQueryEndpoints(t *testing.T) {
 				ResultType: parser.ValueTypeMatrix,
 				Result: promql.Matrix{
 					promql.Series{
-						Points: []promql.Point{
-							{V: 0, T: timestamp.FromTime(start)},
-							{V: 1, T: timestamp.FromTime(start.Add(1 * time.Second))},
-							{V: 2, T: timestamp.FromTime(start.Add(2 * time.Second))},
+						Floats: []promql.FPoint{
+							{F: 0, T: timestamp.FromTime(start)},
+							{F: 1, T: timestamp.FromTime(start.Add(1 * time.Second))},
+							{F: 2, T: timestamp.FromTime(start.Add(2 * time.Second))},
 						},
-						Metric: nil,
 					},
 				},
 			},
@@ -643,10 +528,150 @@ func TestQueryEndpoints(t *testing.T) {
 	}
 }
 
+func TestQueryExplainEndpoints(t *testing.T) {
+	db, err := e2eutil.NewTSDB()
+	defer func() { testutil.Ok(t, db.Close()) }()
+	testutil.Ok(t, err)
+
+	now := time.Now()
+	timeout := 100 * time.Second
+	api := &QueryAPI{
+		baseAPI: &baseAPI.BaseAPI{
+			Now: func() time.Time { return now },
+		},
+		queryableCreate:       query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout, dedup.AlgorithmPenalty, 1),
+		remoteEndpointsCreate: emptyRemoteEndpointsCreate,
+		queryCreate:           queryFactory,
+		defaultEngine:         PromqlEnginePrometheus,
+		lookbackDeltaCreate:   func(m int64) time.Duration { return time.Duration(0) },
+		gate:                  gate.New(nil, 4, gate.Queries),
+		defaultRangeQueryStep: time.Second,
+		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
+			Name: "query_range_hist",
+		}),
+		seriesStatsAggregatorFactory: &store.NoopSeriesStatsAggregatorFactory{},
+		tenantHeader:                 "thanos-tenant",
+		defaultTenant:                "default-tenant",
+	}
+
+	var tests = []endpointTestCase{
+		{
+			endpoint: api.queryExplain,
+			query: url.Values{
+				"query":  []string{"2"},
+				"time":   []string{"123.4"},
+				"engine": []string{"thanos"},
+			},
+			response: &engine.ExplainOutputNode{
+				OperatorName: "[numberLiteral] 2",
+			},
+		},
+		{
+			endpoint: api.queryRangeExplain,
+			query: url.Values{
+				"query":  []string{"time()"},
+				"start":  []string{"0"},
+				"end":    []string{"500"},
+				"step":   []string{"1"},
+				"engine": []string{"thanos"},
+			},
+			response: &engine.ExplainOutputNode{
+				OperatorName: "[duplicateLabelCheck]",
+				Children: []engine.ExplainOutputNode{
+					{
+						OperatorName: "[noArgFunction]",
+					},
+				},
+			},
+		},
+	}
+	for i, test := range tests {
+		if ok := testEndpoint(t, test, fmt.Sprintf("#%d %s", i, test.query.Encode()), reflect.DeepEqual); !ok {
+			return
+		}
+	}
+}
+
+func TestQueryAnalyzeEndpoints(t *testing.T) {
+	db, err := e2eutil.NewTSDB()
+	defer func() { testutil.Ok(t, db.Close()) }()
+	testutil.Ok(t, err)
+
+	now := time.Now()
+	timeout := 100 * time.Second
+	api := &QueryAPI{
+		baseAPI: &baseAPI.BaseAPI{
+			Now: func() time.Time { return now },
+		},
+		queryableCreate:       query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout, dedup.AlgorithmPenalty, 1),
+		remoteEndpointsCreate: emptyRemoteEndpointsCreate,
+		queryCreate:           queryFactory,
+		defaultEngine:         PromqlEnginePrometheus,
+		lookbackDeltaCreate:   func(m int64) time.Duration { return time.Duration(0) },
+		gate:                  gate.New(nil, 4, gate.Queries),
+		defaultRangeQueryStep: time.Second,
+		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
+			Name: "query_range_hist",
+		}),
+		seriesStatsAggregatorFactory: &store.NoopSeriesStatsAggregatorFactory{},
+		tenantHeader:                 "thanos-tenant",
+		defaultTenant:                "default-tenant",
+	}
+	start := time.Unix(0, 0)
+
+	var tests = []endpointTestCase{
+		{
+			endpoint: api.query,
+			query: url.Values{
+				"query":  []string{"2"},
+				"time":   []string{"123.4"},
+				"engine": []string{"thanos"},
+			},
+			response: &queryData{
+				ResultType: parser.ValueTypeScalar,
+				Result: promql.Scalar{
+					V: 2,
+					T: timestamp.FromTime(start.Add(123*time.Second + 400*time.Millisecond)),
+				},
+				QueryAnalysis: queryTelemetry{},
+			},
+		},
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"time()"},
+				"start": []string{"0"},
+				"end":   []string{"500"},
+				"step":  []string{"1"},
+			},
+			response: &queryData{
+				ResultType: parser.ValueTypeMatrix,
+				Result: promql.Matrix{
+					promql.Series{
+						Floats: func(end, step float64) []promql.FPoint {
+							var res []promql.FPoint
+							for v := float64(0); v <= end; v += step {
+								res = append(res, promql.FPoint{F: v, T: timestamp.FromTime(start.Add(time.Duration(v) * time.Second))})
+							}
+							return res
+						}(500, 1),
+					},
+				},
+				QueryAnalysis: queryTelemetry{},
+			},
+		},
+	}
+	for i, test := range tests {
+		if ok := testEndpoint(t, test, fmt.Sprintf("#%d %s", i, test.query.Encode()), reflect.DeepEqual); !ok {
+			return
+		}
+	}
+}
+
 func newProxyStoreWithTSDBStore(db store.TSDBReader) *store.ProxyStore {
 	c := &storetestutil.TestClient{
 		Name:        "1",
-		StoreClient: storepb.ServerAsClient(store.NewTSDBStore(nil, db, component.Query, nil), 0),
+		StoreClient: storepb.ServerAsClient(store.NewTSDBStore(nil, db, component.Query, labels.EmptyLabels()), atomic.Bool{}),
 		MinTime:     math.MinInt64, MaxTime: math.MaxInt64,
 	}
 
@@ -655,7 +680,7 @@ func newProxyStoreWithTSDBStore(db store.TSDBReader) *store.ProxyStore {
 		nil,
 		func() []store.Client { return []store.Client{c} },
 		component.Query,
-		nil,
+		labels.EmptyLabels(),
 		0,
 		store.EagerRetrieval,
 	)
@@ -663,41 +688,16 @@ func newProxyStoreWithTSDBStore(db store.TSDBReader) *store.ProxyStore {
 
 func TestMetadataEndpoints(t *testing.T) {
 	var old = []labels.Labels{
-		{
-			labels.Label{Name: "__name__", Value: "test_metric1"},
-			labels.Label{Name: "foo", Value: "bar"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric1"},
-			labels.Label{Name: "foo", Value: "boo"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric2"},
-			labels.Label{Name: "foo", Value: "boo"},
-		},
+		labels.FromStrings("__name__", "test_metric1", "foo", "bar"),
+		labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+		labels.FromStrings("__name__", "test_metric2", "foo", "boo"),
 	}
 
 	var recent = []labels.Labels{
-		{
-			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			labels.Label{Name: "foo", Value: "bar"},
-			labels.Label{Name: "replica", Value: "a"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			labels.Label{Name: "foo", Value: "boo"},
-			labels.Label{Name: "replica", Value: "a"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			labels.Label{Name: "foo", Value: "boo"},
-			labels.Label{Name: "replica", Value: "b"},
-		},
-		{
-			labels.Label{Name: "__name__", Value: "test_metric_replica2"},
-			labels.Label{Name: "foo", Value: "boo"},
-			labels.Label{Name: "replica1", Value: "a"},
-		},
+		labels.FromStrings("__name__", "test_metric_replica1", "foo", "bar", "replica", "a"),
+		labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo", "replica", "a"),
+		labels.FromStrings("__name__", "test_metric_replica1", "foo", "boo", "replica", "b"),
+		labels.FromStrings("__name__", "test_metric_replica2", "foo", "boo", "replica1", "a"),
 	}
 
 	dir := t.TempDir()
@@ -706,19 +706,19 @@ func TestMetadataEndpoints(t *testing.T) {
 	var series []storage.Series
 
 	for _, lbl := range old {
-		var samples []tsdbutil.Sample
+		var samples []chunks.Sample
 
-		for i := int64(0); i < 10; i++ {
+		for i := range int64(10) {
 			samples = append(samples, sample{
 				t: i * 60_000,
-				v: float64(i),
+				f: float64(i),
 			})
 		}
 
 		series = append(series, storage.NewListSeries(lbl, samples))
 	}
 
-	_, err := tsdb.CreateBlock(series, dir, chunkRange, log.NewNopLogger())
+	_, err := tsdb.CreateBlock(series, dir, chunkRange, promslog.NewNopLogger())
 	testutil.Ok(t, err)
 
 	opts := tsdb.DefaultOptions()
@@ -733,7 +733,7 @@ func TestMetadataEndpoints(t *testing.T) {
 		app              = db.Appender(context.Background())
 	)
 	for _, lbl := range recent {
-		for i := int64(0); i < 10; i++ {
+		for i := range int64(10) {
 			_, err := app.Append(0, lbl, start+(i*60_000), float64(i)) // ms
 			testutil.Ok(t, err)
 		}
@@ -742,38 +742,40 @@ func TestMetadataEndpoints(t *testing.T) {
 
 	now := time.Now()
 	timeout := 100 * time.Second
-	qe := promql.NewEngine(promql.EngineOpts{
-		Logger:     nil,
-		Reg:        nil,
-		MaxSamples: 10000,
-		Timeout:    timeout,
-	})
 	api := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
 		},
-		queryableCreate:     query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout),
-		queryEngine:         qe,
-		lookbackDeltaCreate: func(m int64) time.Duration { return time.Duration(0) },
-		gate:                gate.New(nil, 4, gate.Queries),
+		queryableCreate:       query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout, dedup.AlgorithmPenalty, 1),
+		remoteEndpointsCreate: emptyRemoteEndpointsCreate,
+		queryCreate:           queryFactory,
+		defaultEngine:         PromqlEnginePrometheus,
+		lookbackDeltaCreate:   func(m int64) time.Duration { return time.Duration(0) },
+		gate:                  gate.New(nil, 4, gate.Queries),
 		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
 			Name: "query_range_hist",
 		}),
-		seriesStatsAggregator: &store.NoopSeriesStatsAggregator{},
+		seriesStatsAggregatorFactory: &store.NoopSeriesStatsAggregatorFactory{},
+		tenantHeader:                 "thanos-tenant",
+		defaultTenant:                "default-tenant",
 	}
 	apiWithLabelLookback := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
 		},
-		queryableCreate:          query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout),
-		queryEngine:              qe,
+		queryableCreate:          query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout, dedup.AlgorithmPenalty, 1),
+		remoteEndpointsCreate:    emptyRemoteEndpointsCreate,
+		queryCreate:              queryFactory,
+		defaultEngine:            PromqlEnginePrometheus,
 		lookbackDeltaCreate:      func(m int64) time.Duration { return time.Duration(0) },
 		gate:                     gate.New(nil, 4, gate.Queries),
 		defaultMetadataTimeRange: apiLookbackDelta,
 		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
 			Name: "query_range_hist",
 		}),
-		seriesStatsAggregator: &store.NoopSeriesStatsAggregator{},
+		seriesStatsAggregatorFactory: &store.NoopSeriesStatsAggregatorFactory{},
+		tenantHeader:                 "thanos-tenant",
+		defaultTenant:                "default-tenant",
 	}
 
 	var tests = []endpointTestCase{
@@ -893,6 +895,15 @@ func TestMetadataEndpoints(t *testing.T) {
 			},
 			response: []string{"__name__", "foo", "replica1"},
 		},
+		// With limit
+		{
+			endpoint: api.labelNames,
+			query: url.Values{
+				"match[]": []string{`test_metric_replica2`},
+				"limit":   []string{"2"},
+			},
+			response: []string{"__name__", "foo"},
+		},
 		{
 			endpoint: api.labelValues,
 			query: url.Values{
@@ -912,6 +923,18 @@ func TestMetadataEndpoints(t *testing.T) {
 				"name": "__name__",
 			},
 			response: []string{"test_metric1", "test_metric2", "test_metric_replica1", "test_metric_replica2"},
+		},
+		// With limit
+		{
+			endpoint: api.labelValues,
+			query: url.Values{
+				"match[]": []string{`{foo="bar"}`, `{foo="boo"}`},
+				"limit":   []string{"3"},
+			},
+			params: map[string]string{
+				"name": "__name__",
+			},
+			response: []string{"test_metric1", "test_metric2", "test_metric_replica1"},
 		},
 		// No matched series.
 		{
@@ -934,13 +957,13 @@ func TestMetadataEndpoints(t *testing.T) {
 			},
 			response: []string{"a"},
 		},
-		// Bad name parameter.
+		// UTF-8 label name.
 		{
 			endpoint: api.labelValues,
 			params: map[string]string{
-				"name": "not!!!allowed",
+				"name": "http.request.method",
 			},
-			errType: baseAPI.ErrorBadData,
+			response: []string{},
 		},
 		{
 			endpoint: api.series,
@@ -1212,6 +1235,32 @@ func TestMetadataEndpoints(t *testing.T) {
 			errType: baseAPI.ErrorBadData,
 			method:  http.MethodPost,
 		},
+		// With limit
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`{replica="", foo=~"b.+", replica1=""}`},
+				"limit":   []string{"2"},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric1", "foo", "bar"),
+				labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+			},
+			method: http.MethodPost,
+		},
+		// Without limit
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`{replica="", foo=~"b.+", replica1=""}`},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric1", "foo", "bar"),
+				labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+				labels.FromStrings("__name__", "test_metric2", "foo", "boo"),
+			},
+			method: http.MethodPost,
+		},
 	}
 
 	for i, test := range tests {
@@ -1244,6 +1293,8 @@ func TestStoresEndpoint(t *testing.T) {
 				},
 			}
 		},
+		tenantHeader:  "thanos-tenant",
+		defaultTenant: "default-tenant",
 	}
 	apiWithInvalidEndpoint := &QueryAPI{
 		endpointStatus: func() []query.EndpointStatus {
@@ -1528,6 +1579,16 @@ func TestParseStoreDebugMatchersParam(t *testing.T) {
 				labels.MustNewMatcher(labels.MatchEqual, "cluster", "test"),
 			}},
 		},
+		{
+			storeMatchers: `{__address__=~"localhost:.*"}`,
+			fail:          false,
+			result:        [][]*labels.Matcher{{labels.MustNewMatcher(labels.MatchRegexp, "__address__", "localhost:.*")}},
+		},
+		{
+			storeMatchers: `{__address__!~"localhost:.*"}`,
+			fail:          false,
+			result:        [][]*labels.Matcher{{labels.MustNewMatcher(labels.MatchNotRegexp, "__address__", "localhost:.*")}},
+		},
 	} {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			api := QueryAPI{
@@ -1542,12 +1603,61 @@ func TestParseStoreDebugMatchersParam(t *testing.T) {
 
 			storeMatchers, err := api.parseStoreDebugMatchersParam(r)
 			if !tc.fail {
-				testutil.Equals(t, tc.result, storeMatchers)
+				testutil.Equals(t, len(tc.result), len(storeMatchers))
+				for i, m := range tc.result {
+					testutil.Equals(t, len(m), len(storeMatchers[i]))
+					for j, n := range m {
+						testutil.Equals(t, n.String(), storeMatchers[i][j].String())
+					}
+				}
 				testutil.Equals(t, (*baseAPI.ApiError)(nil), err)
 			} else {
 				testutil.NotOk(t, err)
 			}
+
+			// We don't care about results but checking for panic.
+			for _, matchers := range storeMatchers {
+				for _, matcher := range matchers {
+					_ = matcher.Matches("")
+				}
+			}
 		})
+	}
+}
+
+func TestParseLimitParam(t *testing.T) {
+	var tests = []struct {
+		input  string
+		fail   bool
+		result int
+	}{
+		{
+			input:  "",
+			fail:   false,
+			result: 0,
+		}, {
+			input: "abc",
+			fail:  true,
+		}, {
+			input:  "10",
+			fail:   false,
+			result: 10,
+		},
+	}
+
+	for _, test := range tests {
+		res, err := parseLimitParam(test.input)
+		if err != nil && !test.fail {
+			t.Errorf("Unexpected error for %q: %s", test.input, err)
+			continue
+		}
+		if err == nil && test.fail {
+			t.Errorf("Expected error for %q but got none", test.input)
+			continue
+		}
+		if !test.fail && res != test.result {
+			t.Errorf("Expected limit %v for input %q but got %v", test.result, test.input, res)
+		}
 	}
 }
 
@@ -1578,6 +1688,7 @@ func TestRulesHandler(t *testing.T) {
 			Health:                    "x",
 			Query:                     "sum(up2) == 2",
 			DurationSeconds:           101,
+			KeepFiringForSeconds:      102,
 			Labels:                    labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: "some", Value: "label3"}}},
 			Annotations:               labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: "ann", Value: "a1"}}},
 			Alerts: []*rulespb.AlertInstance{
@@ -1608,8 +1719,20 @@ func TestRulesHandler(t *testing.T) {
 			EvaluationDurationSeconds: 122,
 			Health:                    "x",
 			DurationSeconds:           102,
+			KeepFiringForSeconds:      103,
 			Query:                     "sum(up3) == 3",
 			Labels:                    labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: "some", Value: "label4"}}},
+			State:                     rulespb.AlertState_INACTIVE,
+		}),
+		rulespb.NewAlertingRule(&rulespb.Alert{
+			Name:                      "5",
+			LastEvaluation:            time.Time{}.Add(4 * time.Minute),
+			EvaluationDurationSeconds: 122,
+			Health:                    "x",
+			DurationSeconds:           61,
+			KeepFiringForSeconds:      62,
+			Query:                     "sum(up4) == 4",
+			Labels:                    labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: "some", Value: "label5"}}},
 			State:                     rulespb.AlertState_INACTIVE,
 		}),
 	}
@@ -1664,7 +1787,7 @@ func TestRulesHandler(t *testing.T) {
 	type test struct {
 		params   map[string]string
 		query    url.Values
-		response interface{}
+		response any
 	}
 	expectedAll := []testpromcompatibility.Rule{
 		testpromcompatibility.RecordingRule{
@@ -1697,6 +1820,7 @@ func TestRulesHandler(t *testing.T) {
 			LastEvaluation: all[2].GetAlert().LastEvaluation,
 			EvaluationTime: all[2].GetAlert().EvaluationDurationSeconds,
 			Duration:       all[2].GetAlert().DurationSeconds,
+			KeepFiringFor:  all[2].GetAlert().KeepFiringForSeconds,
 			Annotations:    labelpb.ZLabelsToPromLabels(all[2].GetAlert().Annotations.Labels),
 			Alerts: []*testpromcompatibility.Alert{
 				{
@@ -1728,7 +1852,23 @@ func TestRulesHandler(t *testing.T) {
 			LastEvaluation: all[3].GetAlert().LastEvaluation,
 			EvaluationTime: all[3].GetAlert().EvaluationDurationSeconds,
 			Duration:       all[3].GetAlert().DurationSeconds,
-			Annotations:    nil,
+			KeepFiringFor:  all[3].GetAlert().KeepFiringForSeconds,
+			Annotations:    labels.EmptyLabels(),
+			Alerts:         []*testpromcompatibility.Alert{},
+			Type:           "alerting",
+		},
+		testpromcompatibility.AlertingRule{
+			State:          strings.ToLower(all[4].GetAlert().State.String()),
+			Name:           all[4].GetAlert().Name,
+			Query:          all[4].GetAlert().Query,
+			Labels:         labelpb.ZLabelsToPromLabels(all[4].GetAlert().Labels.Labels),
+			Health:         rules.RuleHealth(all[2].GetAlert().Health),
+			LastError:      all[4].GetAlert().LastError,
+			LastEvaluation: all[4].GetAlert().LastEvaluation,
+			EvaluationTime: all[4].GetAlert().EvaluationDurationSeconds,
+			Duration:       all[4].GetAlert().DurationSeconds,
+			KeepFiringFor:  all[4].GetAlert().KeepFiringForSeconds,
+			Annotations:    labels.EmptyLabels(),
 			Alerts:         []*testpromcompatibility.Alert{},
 			Type:           "alerting",
 		},
@@ -1804,7 +1944,7 @@ func TestRulesHandler(t *testing.T) {
 			}
 			res, errors, apiError, releaseResources := endpoint(req.WithContext(ctx))
 			defer releaseResources()
-			if errors != nil {
+			if len(errors) > 0 {
 				t.Fatalf("Unexpected errors: %s", errors)
 				return
 			}
@@ -1823,7 +1963,7 @@ func TestRulesHandler(t *testing.T) {
 
 func BenchmarkQueryResultEncoding(b *testing.B) {
 	var mat promql.Matrix
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		lset := labels.FromStrings(
 			"__name__", "my_test_metric_name",
 			"instance", fmt.Sprintf("abcdefghijklmnopqrstuvxyz-%d", i),
@@ -1833,16 +1973,16 @@ func BenchmarkQueryResultEncoding(b *testing.B) {
 			"namespace", "something",
 			"long-label", "34grnt83j0qxj309je9rgt9jf2jd-92jd-92jf9wrfjre",
 		)
-		var points []promql.Point
+		var points []promql.FPoint
 		for j := 0; j < b.N/1000; j++ {
-			points = append(points, promql.Point{
+			points = append(points, promql.FPoint{
 				T: int64(j * 10000),
-				V: rand.Float64(),
+				F: rand.Float64(),
 			})
 		}
 		mat = append(mat, promql.Series{
 			Metric: lset,
-			Points: points,
+			Floats: points,
 		})
 	}
 	input := &queryData{
@@ -1857,25 +1997,25 @@ func BenchmarkQueryResultEncoding(b *testing.B) {
 
 type mockedRulesClient struct {
 	g   map[rulespb.RulesRequest_Type][]*rulespb.RuleGroup
-	w   storage.Warnings
+	w   annotations.Annotations
 	err error
 }
 
-func (c mockedRulesClient) Rules(_ context.Context, req *rulespb.RulesRequest) (*rulespb.RuleGroups, storage.Warnings, error) {
+func (c mockedRulesClient) Rules(_ context.Context, req *rulespb.RulesRequest) (*rulespb.RuleGroups, annotations.Annotations, error) {
 	return &rulespb.RuleGroups{Groups: c.g[req.Type]}, c.w, c.err
 }
 
 type sample struct {
 	t int64
-	v float64
+	f float64
 }
 
 func (s sample) T() int64 {
 	return s.t
 }
 
-func (s sample) V() float64 {
-	return s.v
+func (s sample) F() float64 {
+	return s.f
 }
 
 // TODO(rabenhorst): Needs to be implemented for native histogram support.
@@ -1889,4 +2029,9 @@ func (s sample) FH() *histogram.FloatHistogram {
 
 func (s sample) Type() chunkenc.ValueType {
 	return chunkenc.ValFloat
+}
+
+func (s sample) Copy() chunks.Sample {
+	c := sample{t: s.t, f: s.f}
+	return c
 }

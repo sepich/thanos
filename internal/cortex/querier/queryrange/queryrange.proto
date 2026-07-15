@@ -42,12 +42,14 @@ message PrometheusResponse {
   string ErrorType = 3 [(gogoproto.jsontag) = "errorType,omitempty"];
   string Error = 4 [(gogoproto.jsontag) = "error,omitempty"];
   repeated PrometheusResponseHeader Headers = 5 [(gogoproto.jsontag) = "-"];
+  repeated string Warnings = 6 [(gogoproto.jsontag) = "warnings,omitempty"];
 }
 
 message PrometheusData {
   string ResultType = 1 [(gogoproto.jsontag) = "resultType"];
   repeated SampleStream Result = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "result"];
   PrometheusResponseStats stats = 3 [(gogoproto.jsontag) = "stats,omitempty"];
+  Analysis analysis = 4 [(gogoproto.jsontag) = "analysis"];
 }
 
 message PrometheusInstantQueryResponse {
@@ -56,12 +58,14 @@ message PrometheusInstantQueryResponse {
   string ErrorType = 3 [(gogoproto.jsontag) = "errorType,omitempty"];
   string Error = 4 [(gogoproto.jsontag) = "error,omitempty"];
   repeated PrometheusResponseHeader Headers = 5 [(gogoproto.jsontag) = "-"];
+  repeated string Warnings = 6 [(gogoproto.jsontag) = "warnings,omitempty"];
 }
 
 message PrometheusInstantQueryData {
   string ResultType = 1 [(gogoproto.jsontag) = "resultType"];
   PrometheusInstantQueryResult Result = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "result"];
   PrometheusResponseStats stats = 3 [(gogoproto.jsontag) = "stats,omitempty"];
+  Analysis analysis = 4 [(gogoproto.jsontag) = "analysis"];
 }
 
 message PrometheusInstantQueryResult {
@@ -88,6 +92,7 @@ message PrometheusResponseStats {
 message PrometheusResponseSamplesStats {
   int64 totalQueryableSamples = 1 [(gogoproto.jsontag) = "totalQueryableSamples"];
   repeated PrometheusResponseQueryableSamplesStatsPerStep totalQueryableSamplesPerStep = 2 [(gogoproto.jsontag) = "totalQueryableSamplesPerStep"];
+  int32 peakSamples = 3 [(gogoproto.jsontag) = "peakSamples"];
 }
 
 message PrometheusResponseQueryableSamplesStatsPerStep {
@@ -98,16 +103,37 @@ message PrometheusResponseQueryableSamplesStatsPerStep {
 message SampleStream {
   repeated cortexpb.LabelPair labels = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "metric", (gogoproto.customtype) = "github.com/thanos-io/thanos/internal/cortex/cortexpb.LabelAdapter"];
   repeated cortexpb.Sample samples = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "values"];
+  repeated SampleHistogramPair histograms = 3 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "histogram"];
 }
 
 message Sample {
   repeated cortexpb.LabelPair labels = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "metric", (gogoproto.customtype) = "github.com/thanos-io/thanos/internal/cortex/cortexpb.LabelAdapter"];
-  cortexpb.Sample sample = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "value"];
+  double sampleValue = 2 [(gogoproto.jsontag) = "value"];
+  int64 timestamp = 3;
+  SampleHistogram histogram = 4 [(gogoproto.nullable) = true, (gogoproto.jsontag) = "histogram"];
 }
 
 message StringSample {
   string value = 1;
   int64 timestamp_ms = 2;
+}
+
+message SampleHistogramPair {
+  int64 timestamp = 1;
+  SampleHistogram histogram = 2 [(gogoproto.nullable) = false];
+}
+
+message SampleHistogram {
+  double count = 1;
+  double sum = 2;
+  repeated HistogramBucket buckets = 3;
+}
+
+message HistogramBucket {
+  int32 boundaries = 1;
+  double lower = 2;
+  double upper = 3;
+  double count = 4;
 }
 
 message CachedResponse  {
@@ -128,4 +154,15 @@ message Extent  {
 
 message CachingOptions {
   bool disabled = 1;
+}
+
+message Explanation {
+  string name = 1 [(gogoproto.jsontag) = "name"];
+  repeated Explanation children = 2 [(gogoproto.jsontag) = "children"];
+}
+
+message Analysis {
+  string name = 1 [(gogoproto.jsontag) = "name"];
+  google.protobuf.Duration executionTime = 2 [(gogoproto.customtype) = "Duration", (gogoproto.nullable) = false, (gogoproto.jsontag) = "executionTime"];
+  repeated Analysis children = 3 [(gogoproto.jsontag) = "children"];
 }

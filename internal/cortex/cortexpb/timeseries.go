@@ -26,13 +26,13 @@ var (
 		is re-used. But since the slices are far far larger, we come out ahead.
 	*/
 	slicePool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return make([]PreallocTimeseries, 0, expectedTimeseries)
 		},
 	}
 
 	timeSeriesPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return &TimeSeries{
 				Labels:    make([]LabelAdapter, 0, expectedLabels),
 				Samples:   make([]Sample, 0, expectedSamplesPerSeries),
@@ -276,37 +276,8 @@ func PreallocTimeseriesSliceFromPool() []PreallocTimeseries {
 	return slicePool.Get().([]PreallocTimeseries)
 }
 
-// ReuseSlice puts the slice back into a sync.Pool for reuse.
-func ReuseSlice(ts []PreallocTimeseries) {
-	for i := range ts {
-		ReuseTimeseries(ts[i].TimeSeries)
-	}
-
-	slicePool.Put(ts[:0]) //nolint:staticcheck //see comment on slicePool for more details
-}
-
 // TimeseriesFromPool retrieves a pointer to a TimeSeries from a sync.Pool.
 // ReuseTimeseries should be called once done, unless ReuseSlice was called on the slice that contains this TimeSeries.
 func TimeseriesFromPool() *TimeSeries {
 	return timeSeriesPool.Get().(*TimeSeries)
-}
-
-// ReuseTimeseries puts the timeseries back into a sync.Pool for reuse.
-func ReuseTimeseries(ts *TimeSeries) {
-	// Name and Value may point into a large gRPC buffer, so clear the reference to allow GC
-	for i := 0; i < len(ts.Labels); i++ {
-		ts.Labels[i].Name = ""
-		ts.Labels[i].Value = ""
-	}
-	ts.Labels = ts.Labels[:0]
-	ts.Samples = ts.Samples[:0]
-	// Name and Value may point into a large gRPC buffer, so clear the reference in each exemplar to allow GC
-	for i := range ts.Exemplars {
-		for j := range ts.Exemplars[i].Labels {
-			ts.Exemplars[i].Labels[j].Name = ""
-			ts.Exemplars[i].Labels[j].Value = ""
-		}
-	}
-	ts.Exemplars = ts.Exemplars[:0]
-	timeSeriesPool.Put(ts)
 }

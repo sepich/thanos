@@ -20,7 +20,7 @@ import (
 	"github.com/prometheus/prometheus/rules"
 
 	"github.com/efficientgo/core/testutil"
-	"github.com/thanos-io/thanos/pkg/httpconfig"
+	"github.com/thanos-io/thanos/pkg/clientconfig"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/runutil"
@@ -67,11 +67,13 @@ func TestRulesAPI_Fanout(t *testing.T) {
 	)
 	testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1, prom2, sidecar2))
 
-	queryCfg := []httpconfig.Config{
+	queryCfg := []clientconfig.Config{
 		{
-			EndpointsConfig: httpconfig.EndpointsConfig{
-				StaticAddresses: []string{qBuilder.InternalEndpoint("http")},
-				Scheme:          "http",
+			HTTPConfig: clientconfig.HTTPConfig{
+				EndpointsConfig: clientconfig.HTTPEndpointsConfig{
+					StaticAddresses: []string{qBuilder.InternalEndpoint("http")},
+					Scheme:          "http",
+				},
 			},
 		},
 	}
@@ -82,10 +84,7 @@ func TestRulesAPI_Fanout(t *testing.T) {
 	testutil.Ok(t, e2e.StartAndWaitReady(r1, r2))
 
 	stores := []string{sidecar1.InternalEndpoint("grpc"), sidecar2.InternalEndpoint("grpc"), r1.InternalEndpoint("grpc"), r2.InternalEndpoint("grpc")}
-	q := qBuilder.
-		WithStoreAddresses(stores...).
-		WithRuleAddresses(stores...).
-		Init()
+	q := qBuilder.WithStoreAddresses(stores...).Init()
 	testutil.Ok(t, e2e.StartAndWaitReady(q))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
@@ -103,6 +102,7 @@ func TestRulesAPI_Fanout(t *testing.T) {
 					State: rulespb.AlertState_FIRING,
 					Query: "absent(some_metric)",
 					Labels: labelpb.ZLabelSet{Labels: []labelpb.ZLabel{
+						{Name: "foo", Value: "bar"},
 						{Name: "prometheus", Value: "ha"},
 						{Name: "severity", Value: "page"},
 					}},
@@ -119,6 +119,7 @@ func TestRulesAPI_Fanout(t *testing.T) {
 					State: rulespb.AlertState_FIRING,
 					Query: "absent(some_metric)",
 					Labels: labelpb.ZLabelSet{Labels: []labelpb.ZLabel{
+						{Name: "foo", Value: "bar"},
 						{Name: "severity", Value: "page"},
 					}},
 					Health: string(rules.HealthGood),

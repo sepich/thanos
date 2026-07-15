@@ -15,8 +15,8 @@ import (
 	"github.com/prometheus/prometheus/model/relabel"
 	"gopkg.in/yaml.v2"
 
+	"github.com/thanos-io/thanos/pkg/clientconfig"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
-	"github.com/thanos-io/thanos/pkg/httpconfig"
 )
 
 type AlertingConfig struct {
@@ -25,10 +25,10 @@ type AlertingConfig struct {
 
 // AlertmanagerConfig represents a client to a cluster of Alertmanager endpoints.
 type AlertmanagerConfig struct {
-	HTTPClientConfig httpconfig.ClientConfig    `yaml:"http_config"`
-	EndpointsConfig  httpconfig.EndpointsConfig `yaml:",inline"`
-	Timeout          model.Duration             `yaml:"timeout"`
-	APIVersion       APIVersion                 `yaml:"api_version"`
+	HTTPClientConfig clientconfig.HTTPClientConfig    `yaml:"http_config"`
+	EndpointsConfig  clientconfig.HTTPEndpointsConfig `yaml:",inline"`
+	Timeout          model.Duration                   `yaml:"timeout"`
+	APIVersion       APIVersion                       `yaml:"api_version"`
 }
 
 // APIVersion represents the API version of the Alertmanager endpoint.
@@ -44,7 +44,7 @@ var supportedAPIVersions = []APIVersion{
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
-func (v *APIVersion) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (v *APIVersion) UnmarshalYAML(unmarshal func(any) error) error {
 	var s string
 	if err := unmarshal(&s); err != nil {
 		return errors.Wrap(err, "invalid Alertmanager API version")
@@ -61,18 +61,18 @@ func (v *APIVersion) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 func DefaultAlertmanagerConfig() AlertmanagerConfig {
 	return AlertmanagerConfig{
-		EndpointsConfig: httpconfig.EndpointsConfig{
+		EndpointsConfig: clientconfig.HTTPEndpointsConfig{
 			Scheme:          "http",
 			StaticAddresses: []string{},
-			FileSDConfigs:   []httpconfig.FileSDConfig{},
+			FileSDConfigs:   []clientconfig.HTTPFileSDConfig{},
 		},
 		Timeout:    model.Duration(time.Second * 10),
-		APIVersion: APIv1,
+		APIVersion: APIv2,
 	}
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
-func (c *AlertmanagerConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (c *AlertmanagerConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	*c = DefaultAlertmanagerConfig()
 	type plain AlertmanagerConfig
 	return unmarshal((*plain)(c))
@@ -119,7 +119,7 @@ func BuildAlertmanagerConfig(address string, timeout time.Duration) (Alertmanage
 			break
 		}
 	}
-	var basicAuth httpconfig.BasicAuth
+	var basicAuth clientconfig.BasicAuth
 	if parsed.User != nil && parsed.User.String() != "" {
 		basicAuth.Username = parsed.User.Username()
 		pw, _ := parsed.User.Password()
@@ -127,16 +127,16 @@ func BuildAlertmanagerConfig(address string, timeout time.Duration) (Alertmanage
 	}
 
 	return AlertmanagerConfig{
-		HTTPClientConfig: httpconfig.ClientConfig{
+		HTTPClientConfig: clientconfig.HTTPClientConfig{
 			BasicAuth: basicAuth,
 		},
-		EndpointsConfig: httpconfig.EndpointsConfig{
+		EndpointsConfig: clientconfig.HTTPEndpointsConfig{
 			PathPrefix:      parsed.Path,
 			Scheme:          scheme,
 			StaticAddresses: []string{host},
 		},
 		Timeout:    model.Duration(timeout),
-		APIVersion: APIv1,
+		APIVersion: APIv2,
 	}, nil
 }
 
@@ -145,6 +145,11 @@ func LoadRelabelConfigs(confYaml []byte) ([]*relabel.Config, error) {
 	var cfg []*relabel.Config
 	if err := yaml.UnmarshalStrict(confYaml, &cfg); err != nil {
 		return nil, err
+	}
+	for _, c := range cfg {
+		if err := c.Validate(model.UTF8Validation); err != nil {
+			return nil, errors.Wrap(err, "validate relabel config")
+		}
 	}
 	return cfg, nil
 }

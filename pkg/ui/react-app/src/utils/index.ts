@@ -227,6 +227,15 @@ export const parseOption = (param: string): Partial<PanelOptions> => {
 
     case 'store_matches':
       return { storeMatches: JSON.parse(decodedValue) };
+
+    case 'engine':
+      return { engine: decodedValue };
+
+    case 'analyze':
+      return { analyze: decodedValue === '1' };
+
+    case 'tenant':
+      return { tenant: decodedValue };
   }
   return {};
 };
@@ -250,6 +259,9 @@ export const toQueryString = ({ key, options }: PanelMeta): string => {
     useDeduplication,
     usePartialResponse,
     storeMatches,
+    engine,
+    analyze,
+    tenant,
   } = options;
   const time = isPresent(endTime) ? formatTime(endTime) : false;
   const urlParams = [
@@ -260,7 +272,10 @@ export const toQueryString = ({ key, options }: PanelMeta): string => {
     formatWithKey('max_source_resolution', maxSourceResolution),
     formatWithKey('deduplicate', useDeduplication ? 1 : 0),
     formatWithKey('partial_response', usePartialResponse ? 1 : 0),
-    formatWithKey('store_matches', JSON.stringify(storeMatches)),
+    formatWithKey('store_matches', JSON.stringify(storeMatches, ['name'])),
+    formatWithKey('engine', engine),
+    formatWithKey('analyze', analyze ? 1 : 0),
+    formatWithKey('tenant', tenant),
     time ? `${formatWithKey('end_input', time)}&${formatWithKey('moment_input', time)}` : '',
     isPresent(resolution) ? formatWithKey('step_input', resolution) : '',
   ];
@@ -272,7 +287,8 @@ export const encodePanelOptionsToQueryString = (panels: PanelMeta[]): string => 
 };
 
 export const createExpressionLink = (expr: string): string => {
-  return `../graph?g0.expr=${encodeURIComponent(expr)}&g0.tab=1&g0.stacked=0&g0.range_input=1h`;
+  const alertSourceTemplate = '/graph?g0.expr={{.Expr}}&g0.tab=1';
+  return `${alertSourceTemplate.replace('{{.Expr}}', encodeURIComponent(expr))}&g0.stacked=0&g0.range_input=1h`;
 };
 
 export const createExternalExpressionLink = (expr: string): string => {

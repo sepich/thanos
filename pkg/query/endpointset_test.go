@@ -9,27 +9,28 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/efficientgo/core/testutil"
+	"github.com/go-kit/log"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
-
-	"github.com/prometheus/prometheus/model/labels"
-	"github.com/thanos-io/thanos/pkg/store"
-
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/efficientgo/core/testutil"
-	"github.com/pkg/errors"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/prometheus/model/labels"
+
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
 var testGRPCOpts = []grpc.DialOption{
@@ -110,39 +111,6 @@ func (c *mockedEndpoint) Info(ctx context.Context, r *infopb.InfoRequest) (*info
 	return &c.info, nil
 }
 
-type mockedStoreSrv struct {
-	infoDelay time.Duration
-	info      storepb.InfoResponse
-	err       error
-}
-
-func (s *mockedStoreSrv) setResponseError(err error) {
-	s.err = err
-}
-
-func (s *mockedStoreSrv) Info(ctx context.Context, _ *storepb.InfoRequest) (*storepb.InfoResponse, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-
-	select {
-	case <-ctx.Done():
-		return nil, context.Canceled
-	case <-time.After(s.infoDelay):
-	}
-
-	return &s.info, nil
-}
-func (s *mockedStoreSrv) Series(*storepb.SeriesRequest, storepb.Store_SeriesServer) error {
-	return nil
-}
-func (s *mockedStoreSrv) LabelNames(context.Context, *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
-	return nil, nil
-}
-func (s *mockedStoreSrv) LabelValues(context.Context, *storepb.LabelValuesRequest) (*storepb.LabelValuesResponse, error) {
-	return nil, nil
-}
-
 type APIs struct {
 	store          bool
 	metricMetadata bool
@@ -161,35 +129,14 @@ type testEndpointMeta struct {
 type testEndpoints struct {
 	srvs        map[string]*grpc.Server
 	endpoints   map[string]*mockedEndpoint
-	stores      map[string]*mockedStoreSrv
 	orderAddrs  []string
 	exposedAPIs map[string]*APIs
-}
-
-func componentTypeToStoreType(componentType string) storepb.StoreType {
-	switch componentType {
-	case component.Query.String():
-		return storepb.StoreType_QUERY
-	case component.Rule.String():
-		return storepb.StoreType_RULE
-	case component.Sidecar.String():
-		return storepb.StoreType_SIDECAR
-	case component.Store.String():
-		return storepb.StoreType_STORE
-	case component.Receive.String():
-		return storepb.StoreType_RECEIVE
-	case component.Debug.String():
-		return storepb.StoreType_DEBUG
-	default:
-		return storepb.StoreType_STORE
-	}
 }
 
 func startTestEndpoints(testEndpointMeta []testEndpointMeta) (*testEndpoints, error) {
 	e := &testEndpoints{
 		srvs:        map[string]*grpc.Server{},
 		endpoints:   map[string]*mockedEndpoint{},
-		stores:      map[string]*mockedStoreSrv{},
 		exposedAPIs: map[string]*APIs{},
 	}
 
@@ -203,20 +150,6 @@ func startTestEndpoints(testEndpointMeta []testEndpointMeta) (*testEndpoints, er
 
 		srv := grpc.NewServer()
 		addr := listener.Addr().String()
-
-		storeSrv := &mockedStoreSrv{
-			err: meta.err,
-			info: storepb.InfoResponse{
-				LabelSets: meta.extlsetFn(listener.Addr().String()),
-				StoreType: componentTypeToStoreType(meta.ComponentType),
-			},
-			infoDelay: meta.infoDelay,
-		}
-
-		if meta.Store != nil {
-			storeSrv.info.MinTime = meta.Store.MinTime
-			storeSrv.info.MaxTime = meta.Store.MaxTime
-		}
 
 		endpointSrv := &mockedEndpoint{
 			err: meta.err,
@@ -233,7 +166,6 @@ func startTestEndpoints(testEndpointMeta []testEndpointMeta) (*testEndpoints, er
 			infoDelay: meta.infoDelay,
 		}
 		infopb.RegisterInfoServer(srv, endpointSrv)
-		storepb.RegisterStoreServer(srv, storeSrv)
 		go func() {
 			_ = srv.Serve(listener)
 		}()
@@ -241,7 +173,6 @@ func startTestEndpoints(testEndpointMeta []testEndpointMeta) (*testEndpoints, er
 		e.exposedAPIs[addr] = exposedAPIs(meta.ComponentType)
 		e.srvs[addr] = srv
 		e.endpoints[addr] = endpointSrv
-		e.stores[addr] = storeSrv
 		e.orderAddrs = append(e.orderAddrs, listener.Addr().String())
 	}
 
@@ -272,7 +203,9 @@ func (e *testEndpoints) CloseOne(addr string) {
 }
 
 func TestTruncateExtLabels(t *testing.T) {
-	const testLength = 5
+	t.Parallel()
+
+	const testLength = 10
 
 	for _, tc := range []struct {
 		labelToTruncate string
@@ -283,20 +216,24 @@ func TestTruncateExtLabels(t *testing.T) {
 			expectedOutput:  "{abc}",
 		},
 		{
-			labelToTruncate: "{abcd}",
-			expectedOutput:  "{abc}",
-		},
-		{
-			labelToTruncate: "{abcde}",
-			expectedOutput:  "{abc}",
-		},
-		{
-			labelToTruncate: "{abcdef}",
-			expectedOutput:  "{abc}",
+			labelToTruncate: "{abcdefgh}",
+			expectedOutput:  "{abcdefgh}",
 		},
 		{
 			labelToTruncate: "{abcdefghij}",
-			expectedOutput:  "{abc}",
+			expectedOutput:  "{abcdefgh}",
+		},
+		{
+			labelToTruncate: "{abcde花}",
+			expectedOutput:  "{abcde花}",
+		},
+		{
+			labelToTruncate: "{abcde花朵}",
+			expectedOutput:  "{abcde花}",
+		},
+		{
+			labelToTruncate: "{abcde花fghij}",
+			expectedOutput:  "{abcde花}",
 		},
 	} {
 		t.Run(tc.labelToTruncate, func(t *testing.T) {
@@ -308,6 +245,8 @@ func TestTruncateExtLabels(t *testing.T) {
 }
 
 func TestEndpointSetUpdate(t *testing.T) {
+	t.Parallel()
+
 	const metricsMeta = `
 	# HELP thanos_store_nodes_grpc_connections Number of gRPC connection to Store APIs. Opened connection means healthy store APIs available for Querier.
 	# TYPE thanos_store_nodes_grpc_connections gauge
@@ -403,7 +342,7 @@ func TestEndpointSetUpdate(t *testing.T) {
 					// Simulate very long external labels.
 					extlsetFn: func(addr string) []labelpb.ZLabelSet {
 						sLabel := []string{}
-						for i := 0; i < 1000; i++ {
+						for range 1000 {
 							sLabel = append(sLabel, "lbl")
 							sLabel = append(sLabel, "val")
 						}
@@ -441,6 +380,8 @@ func TestEndpointSetUpdate(t *testing.T) {
 }
 
 func TestEndpointSetUpdate_DuplicateSpecs(t *testing.T) {
+	t.Parallel()
+
 	endpoints, err := startTestEndpoints([]testEndpointMeta{
 		{
 			InfoResponse: sidecarInfo,
@@ -465,6 +406,8 @@ func TestEndpointSetUpdate_DuplicateSpecs(t *testing.T) {
 }
 
 func TestEndpointSetUpdate_EndpointGoingAway(t *testing.T) {
+	t.Parallel()
+
 	endpoints, err := startTestEndpoints([]testEndpointMeta{
 		{
 			InfoResponse: sidecarInfo,
@@ -494,6 +437,8 @@ func TestEndpointSetUpdate_EndpointGoingAway(t *testing.T) {
 }
 
 func TestEndpointSetUpdate_EndpointComingOnline(t *testing.T) {
+	t.Parallel()
+
 	endpoints, err := startTestEndpoints([]testEndpointMeta{
 		{
 			err:          fmt.Errorf("endpoint unavailable"),
@@ -523,9 +468,14 @@ func TestEndpointSetUpdate_EndpointComingOnline(t *testing.T) {
 }
 
 func TestEndpointSetUpdate_StrictEndpointMetadata(t *testing.T) {
-	info := sidecarInfo
-	info.Store.MinTime = 111
-	info.Store.MaxTime = 222
+	t.Parallel()
+
+	infoCopy := *sidecarInfo
+	infoCopy.Store = &infopb.StoreInfo{
+		MinTime: 111,
+		MaxTime: 222,
+	}
+	info := &infoCopy
 	endpoints, err := startTestEndpoints([]testEndpointMeta{
 		{
 			err:          fmt.Errorf("endpoint unavailable"),
@@ -563,6 +513,8 @@ func TestEndpointSetUpdate_StrictEndpointMetadata(t *testing.T) {
 }
 
 func TestEndpointSetUpdate_PruneInactiveEndpoints(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name      string
 		endpoints []testEndpointMeta
@@ -619,7 +571,6 @@ func TestEndpointSetUpdate_PruneInactiveEndpoints(t *testing.T) {
 
 			addr := discoveredEndpointAddr[0]
 			endpoints.endpoints[addr].setResponseError(errors.New("failed info request"))
-			endpoints.stores[addr].setResponseError(errors.New("failed info request"))
 			endpointSet.Update(context.Background())
 
 			updateTime = updateTime.Add(10 * time.Minute)
@@ -631,6 +582,8 @@ func TestEndpointSetUpdate_PruneInactiveEndpoints(t *testing.T) {
 }
 
 func TestEndpointSetUpdate_AtomicEndpointAdditions(t *testing.T) {
+	t.Parallel()
+
 	numResponses := 4
 	metas := makeInfoResponses(numResponses)
 	metas[1].infoDelay = 2 * time.Second
@@ -646,14 +599,12 @@ func TestEndpointSetUpdate_AtomicEndpointAdditions(t *testing.T) {
 	defer endpointSet.Close()
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		require.Never(t, func() bool {
 			numStatuses := len(endpointSet.GetStoreClients())
 			return numStatuses != numResponses && numStatuses != 0
 		}, 3*time.Second, 100*time.Millisecond)
-	}()
+	})
 
 	endpointSet.Update(context.Background())
 	testutil.Equals(t, numResponses, len(endpointSet.GetEndpointStatus()))
@@ -662,6 +613,13 @@ func TestEndpointSetUpdate_AtomicEndpointAdditions(t *testing.T) {
 }
 
 func TestEndpointSetUpdate_AvailabilityScenarios(t *testing.T) {
+	if testing.
+		Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+
 	endpoints, err := startTestEndpoints([]testEndpointMeta{
 		{
 			InfoResponse: sidecarInfo,
@@ -727,11 +685,11 @@ func TestEndpointSetUpdate_AvailabilityScenarios(t *testing.T) {
 	endpointSet := NewEndpointSet(nowFunc, nil, nil,
 		func() (specs []*GRPCEndpointSpec) {
 			for _, addr := range discoveredEndpointAddr {
-				specs = append(specs, NewGRPCEndpointSpec(addr, false))
+				specs = append(specs, NewGRPCEndpointSpec(addr, false, testGRPCOpts...))
 			}
 			return specs
 		},
-		testGRPCOpts, time.Minute, 2*time.Second)
+		time.Minute, 2*time.Second, 10*time.Second)
 	defer endpointSet.Close()
 
 	// Initial update.
@@ -752,20 +710,20 @@ func TestEndpointSetUpdate_AvailabilityScenarios(t *testing.T) {
 
 		lset := e.LabelSets()
 		testutil.Equals(t, 2, len(lset))
-		testutil.Equals(t, "addr", lset[0][0].Name)
-		testutil.Equals(t, addr, lset[0][0].Value)
-		testutil.Equals(t, "a", lset[1][0].Name)
-		testutil.Equals(t, "b", lset[1][0].Value)
+		testutil.Equals(t, addr, lset[0].Get("addr"))
+		testutil.Equals(t, "b", lset[1].Get("a"))
 		assertRegisteredAPIs(t, endpoints.exposedAPIs[addr], e)
 	}
 
 	// Check stats.
 	expected := newEndpointAPIStats()
-	expected[component.Sidecar] = map[string]int{
-		fmt.Sprintf("{a=\"b\"},{addr=\"%s\"}", discoveredEndpointAddr[0]): 1,
-		fmt.Sprintf("{a=\"b\"},{addr=\"%s\"}", discoveredEndpointAddr[1]): 1,
-	}
-	testutil.Equals(t, expected, endpointSet.endpointsMetric.storeNodes)
+	expected = expected.append(
+		discoveredEndpointAddr[0], fmt.Sprintf("{a=\"b\"},{addr=\"%s\"}", discoveredEndpointAddr[0]), component.Sidecar.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[1], fmt.Sprintf("{a=\"b\"},{addr=\"%s\"}", discoveredEndpointAddr[1]), component.Sidecar.String(),
+	)
+	testutil.Equals(t, expected.Sort(), endpointSet.endpointsMetric.storeNodes.Sort())
 
 	// Remove address from discovered and reset last check, which should ensure cleanup of status on next update.
 	now = now.Add(3 * time.Minute)
@@ -774,7 +732,7 @@ func TestEndpointSetUpdate_AvailabilityScenarios(t *testing.T) {
 	testutil.Equals(t, 2, len(endpointSet.endpoints))
 
 	endpoints.CloseOne(discoveredEndpointAddr[0])
-	delete(expected[component.Sidecar], fmt.Sprintf("{a=\"b\"},{addr=\"%s\"}", discoveredEndpointAddr[0]))
+	expected = expected[1:]
 
 	// We expect Update to tear down store client for closed store server.
 	endpointSet.Update(context.Background())
@@ -787,11 +745,8 @@ func TestEndpointSetUpdate_AvailabilityScenarios(t *testing.T) {
 
 	lset := st.LabelSets()
 	testutil.Equals(t, 2, len(lset))
-	testutil.Equals(t, "addr", lset[0][0].Name)
-	testutil.Equals(t, addr, lset[0][0].Value)
-	testutil.Equals(t, "a", lset[1][0].Name)
-	testutil.Equals(t, "b", lset[1][0].Value)
-	testutil.Equals(t, expected, endpointSet.endpointsMetric.storeNodes)
+	testutil.Equals(t, addr, lset[0].Get("addr"))
+	testutil.Equals(t, "b", lset[1].Get("a"))
 
 	// New big batch of endpoints.
 	endpoint2, err := startTestEndpoints([]testEndpointMeta{
@@ -951,11 +906,6 @@ func TestEndpointSetUpdate_AvailabilityScenarios(t *testing.T) {
 							{Name: "l3", Value: "v4"},
 						},
 					},
-					{
-						Labels: []labelpb.ZLabel{
-							{Name: store.CompatibilityTypeLabelName, Value: "store"},
-						},
-					},
 				}
 			},
 		},
@@ -973,11 +923,6 @@ func TestEndpointSetUpdate_AvailabilityScenarios(t *testing.T) {
 					{
 						Labels: []labelpb.ZLabel{
 							{Name: "l3", Value: "v4"},
-						},
-					},
-					{
-						Labels: []labelpb.ZLabel{
-							{Name: store.CompatibilityTypeLabelName, Value: "store"},
 						},
 					},
 				}
@@ -1032,26 +977,63 @@ func TestEndpointSetUpdate_AvailabilityScenarios(t *testing.T) {
 
 	// Check stats.
 	expected = newEndpointAPIStats()
-	expected[component.Query] = map[string]int{
-		"{l1=\"v2\", l2=\"v3\"}":             1,
-		"{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}": 2,
-	}
-	expected[component.Rule] = map[string]int{
-		"{l1=\"v2\", l2=\"v3\"}": 2,
-	}
-	expected[component.Sidecar] = map[string]int{
-		fmt.Sprintf("{a=\"b\"},{addr=\"%s\"}", discoveredEndpointAddr[1]): 1,
-		"{l1=\"v2\", l2=\"v3\"}": 2,
-	}
-	expected[component.Store] = map[string]int{
-		"":                                   2,
-		"{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}": 3,
-	}
-	expected[component.Receive] = map[string]int{
-		"{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}": 2,
-	}
-	testutil.Equals(t, expected, endpointSet.endpointsMetric.storeNodes)
+	expected = expected.append(
+		discoveredEndpointAddr[6], "{l1=\"v2\", l2=\"v3\"}", component.Query.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[2], "{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}", component.Query.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[3], "{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}", component.Query.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[8], "{l1=\"v2\", l2=\"v3\"}", component.Rule.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[7], "{l1=\"v2\", l2=\"v3\"}", component.Rule.String(),
+	)
 
+	expected = expected.append(
+		discoveredEndpointAddr[1], fmt.Sprintf("{a=\"b\"},{addr=\"%s\"}", discoveredEndpointAddr[1]), component.Sidecar.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[4], "{l1=\"v2\", l2=\"v3\"}", component.Sidecar.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[5], "{l1=\"v2\", l2=\"v3\"}", component.Sidecar.String(),
+	)
+
+	expected = expected.append(
+		discoveredEndpointAddr[12], "{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}", component.Store.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[11], "{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}", component.Store.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[13], "{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}", component.Store.String(),
+	)
+
+	expected = expected.append(
+		discoveredEndpointAddr[10], "", component.Store.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[9], "", component.Store.String(),
+	)
+
+	expected = expected.append(
+		discoveredEndpointAddr[14], "{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}", component.Receive.String(),
+	)
+	expected = expected.append(
+		discoveredEndpointAddr[15], "{l1=\"v2\", l2=\"v3\"},{l3=\"v4\"}", component.Receive.String(),
+	)
+
+	expected = expected.Sort()
+	endpointSet.endpointsMetric.storeNodes = endpointSet.endpointsMetric.storeNodes.Sort()
+	testutil.Equals(t, len(expected), len(endpointSet.endpointsMetric.storeNodes))
+	for i := range expected {
+		t.Log(i)
+		testutil.Equals(t, expected[i], endpointSet.endpointsMetric.storeNodes[i])
+	}
 	// Close remaining endpoint from previous batch
 	endpoints.CloseOne(discoveredEndpointAddr[1])
 	endpointSet.Update(context.Background())
@@ -1066,6 +1048,8 @@ func TestEndpointSetUpdate_AvailabilityScenarios(t *testing.T) {
 }
 
 func TestEndpointSet_Update_NoneAvailable(t *testing.T) {
+	t.Parallel()
+
 	endpoints, err := startTestEndpoints([]testEndpointMeta{
 		{
 			InfoResponse: sidecarInfo,
@@ -1112,7 +1096,7 @@ func TestEndpointSet_Update_NoneAvailable(t *testing.T) {
 			}
 			return specs
 		},
-		testGRPCOpts, time.Minute, 2*time.Second)
+		time.Minute, 2*time.Second, 10*time.Second)
 	defer endpointSet.Close()
 
 	// Should not matter how many of these we run.
@@ -1128,6 +1112,13 @@ func TestEndpointSet_Update_NoneAvailable(t *testing.T) {
 
 // TestEndpoint_Update_QuerierStrict tests what happens when the strict mode is enabled/disabled.
 func TestEndpoint_Update_QuerierStrict(t *testing.T) {
+	if testing.
+		Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+
 	endpoints, err := startTestEndpoints([]testEndpointMeta{
 		{
 			InfoResponse: &infopb.InfoResponse{
@@ -1217,11 +1208,11 @@ func TestEndpoint_Update_QuerierStrict(t *testing.T) {
 	slowStaticEndpointAddr := discoveredEndpointAddr[2]
 	endpointSet := NewEndpointSet(time.Now, nil, nil, func() (specs []*GRPCEndpointSpec) {
 		return []*GRPCEndpointSpec{
-			NewGRPCEndpointSpec(discoveredEndpointAddr[0], true),
-			NewGRPCEndpointSpec(discoveredEndpointAddr[1], false),
-			NewGRPCEndpointSpec(discoveredEndpointAddr[2], true),
+			NewGRPCEndpointSpec(discoveredEndpointAddr[0], true, testGRPCOpts...),
+			NewGRPCEndpointSpec(discoveredEndpointAddr[1], false, testGRPCOpts...),
+			NewGRPCEndpointSpec(discoveredEndpointAddr[2], true, testGRPCOpts...),
 		}
-	}, testGRPCOpts, time.Minute, 1*time.Second)
+	}, time.Minute, 1*time.Second, 10*time.Second)
 	defer endpointSet.Close()
 
 	// Initial update.
@@ -1260,13 +1251,15 @@ func TestEndpoint_Update_QuerierStrict(t *testing.T) {
 	testutil.Equals(t, 2, len(endpointSet.GetStoreClients()), "two static clients must remain available")
 	testutil.Equals(t, curMin, endpointSet.endpoints[staticEndpointAddr].metadata.Store.MinTime, "minimum time reported by the store node is different")
 	testutil.Equals(t, curMax, endpointSet.endpoints[staticEndpointAddr].metadata.Store.MaxTime, "minimum time reported by the store node is different")
-	testutil.NotOk(t, endpointSet.endpoints[staticEndpointAddr].getStatus().LastError.originalErr)
+	testutil.NotOk(t, endpointSet.endpoints[staticEndpointAddr].status.LastError.originalErr)
 
 	testutil.Equals(t, updatedCurMin, endpointSet.endpoints[slowStaticEndpointAddr].metadata.Store.MinTime, "minimum time reported by the store node is different")
 	testutil.Equals(t, updatedCurMax, endpointSet.endpoints[slowStaticEndpointAddr].metadata.Store.MaxTime, "minimum time reported by the store node is different")
 }
 
 func TestEndpointSet_APIs_Discovery(t *testing.T) {
+	t.Parallel()
+
 	endpoints, err := startTestEndpoints([]testEndpointMeta{
 		{
 			InfoResponse: sidecarInfo,
@@ -1329,7 +1322,7 @@ func TestEndpointSet_APIs_Discovery(t *testing.T) {
 					endpointSpec: func() []*GRPCEndpointSpec {
 						endpointSpec := make([]*GRPCEndpointSpec, 0, len(endpoints.orderAddrs))
 						for _, addr := range endpoints.orderAddrs {
-							endpointSpec = append(endpointSpec, NewGRPCEndpointSpec(addr, false))
+							endpointSpec = append(endpointSpec, NewGRPCEndpointSpec(addr, false, testGRPCOpts...))
 						}
 						return endpointSpec
 					},
@@ -1353,7 +1346,7 @@ func TestEndpointSet_APIs_Discovery(t *testing.T) {
 					name: "Sidecar discovered, no Ruler discovered",
 					endpointSpec: func() []*GRPCEndpointSpec {
 						return []*GRPCEndpointSpec{
-							NewGRPCEndpointSpec(endpoints.orderAddrs[0], false),
+							NewGRPCEndpointSpec(endpoints.orderAddrs[0], false, testGRPCOpts...),
 						}
 					},
 					expectedStores:         1, // sidecar
@@ -1366,8 +1359,8 @@ func TestEndpointSet_APIs_Discovery(t *testing.T) {
 					name: "Ruler discovered",
 					endpointSpec: func() []*GRPCEndpointSpec {
 						return []*GRPCEndpointSpec{
-							NewGRPCEndpointSpec(endpoints.orderAddrs[0], false),
-							NewGRPCEndpointSpec(endpoints.orderAddrs[1], false),
+							NewGRPCEndpointSpec(endpoints.orderAddrs[0], false, testGRPCOpts...),
+							NewGRPCEndpointSpec(endpoints.orderAddrs[1], false, testGRPCOpts...),
 						}
 					},
 					expectedStores:         2, // sidecar + ruler
@@ -1380,7 +1373,7 @@ func TestEndpointSet_APIs_Discovery(t *testing.T) {
 					name: "Sidecar removed",
 					endpointSpec: func() []*GRPCEndpointSpec {
 						return []*GRPCEndpointSpec{
-							NewGRPCEndpointSpec(endpoints.orderAddrs[1], false),
+							NewGRPCEndpointSpec(endpoints.orderAddrs[1], false, testGRPCOpts...),
 						}
 					},
 					expectedStores: 1, // ruler
@@ -1400,7 +1393,7 @@ func TestEndpointSet_APIs_Discovery(t *testing.T) {
 
 					return tc.states[currentState].endpointSpec()
 				},
-				testGRPCOpts, time.Minute, 2*time.Second)
+				time.Minute, 2*time.Second, 10*time.Second)
 
 			defer endpointSet.Close()
 
@@ -1438,40 +1431,40 @@ func TestEndpointSet_APIs_Discovery(t *testing.T) {
 					t,
 					tc.states[currentState].expectedStores,
 					gotStores,
-					"unexepected discovered storeAPIs in state %q",
+					"unexpected discovered storeAPIs in state %q",
 					tc.states[currentState].name)
 				testutil.Equals(
 					t,
 					tc.states[currentState].expectedRules,
 					gotRules,
-					"unexepected discovered rulesAPIs in state %q",
+					"unexpected discovered rulesAPIs in state %q",
 					tc.states[currentState].name)
 				testutil.Equals(
 					t,
 					tc.states[currentState].expectedTarget,
 					gotTarget,
-					"unexepected discovered targetAPIs in state %q",
+					"unexpected discovered targetAPIs in state %q",
 					tc.states[currentState].name,
 				)
 				testutil.Equals(
 					t,
 					tc.states[currentState].expectedMetricMetadata,
 					gotMetricMetadata,
-					"unexepected discovered metricMetadataAPIs in state %q",
+					"unexpected discovered metricMetadataAPIs in state %q",
 					tc.states[currentState].name,
 				)
 				testutil.Equals(
 					t,
 					tc.states[currentState].expectedExemplars,
 					gotExemplars,
-					"unexepected discovered ExemplarsAPIs in state %q",
+					"unexpected discovered ExemplarsAPIs in state %q",
 					tc.states[currentState].name,
 				)
 				testutil.Equals(
 					t,
 					tc.states[currentState].expectedQueryAPIs,
 					gotQueryAPIs,
-					"unexepected discovered QueryAPIs in state %q",
+					"unexpected discovered QueryAPIs in state %q",
 					tc.states[currentState].name,
 				)
 
@@ -1486,7 +1479,7 @@ func TestEndpointSet_APIs_Discovery(t *testing.T) {
 
 func makeInfoResponses(n int) []testEndpointMeta {
 	responses := make([]testEndpointMeta, 0, n)
-	for i := 0; i < n; i++ {
+	for range n {
 		responses = append(responses, testEndpointMeta{
 			InfoResponse: sidecarInfo,
 			extlsetFn: func(addr string) []labelpb.ZLabelSet {
@@ -1516,6 +1509,8 @@ func (e *errThatMarshalsToEmptyDict) Error() string {
 
 // Test highlights that without wrapping the error, it is marshaled to empty dict {}, not its message.
 func TestEndpointStringError(t *testing.T) {
+	t.Parallel()
+
 	dictErr := &errThatMarshalsToEmptyDict{msg: "Error message"}
 	stringErr := &stringError{originalErr: dictErr}
 
@@ -1531,6 +1526,8 @@ func TestEndpointStringError(t *testing.T) {
 
 // Errors that usually marshal to empty dict should return the original error string.
 func TestUpdateEndpointStateLastError(t *testing.T) {
+	t.Parallel()
+
 	tcs := []struct {
 		InputError      error
 		ExpectedLastErr string
@@ -1550,13 +1547,15 @@ func TestUpdateEndpointStateLastError(t *testing.T) {
 
 		mockEndpointRef.update(time.Now, mockEndpointRef.metadata, tc.InputError)
 
-		b, err := json.Marshal(mockEndpointRef.getStatus().LastError)
+		b, err := json.Marshal(mockEndpointRef.status.LastError)
 		testutil.Ok(t, err)
 		testutil.Equals(t, tc.ExpectedLastErr, string(b))
 	}
 }
 
 func TestUpdateEndpointStateForgetsPreviousErrors(t *testing.T) {
+	t.Parallel()
+
 	mockEndpointRef := &endpointRef{
 		addr: "mockedStore",
 		metadata: &endpointMetadata{
@@ -1566,27 +1565,27 @@ func TestUpdateEndpointStateForgetsPreviousErrors(t *testing.T) {
 
 	mockEndpointRef.update(time.Now, mockEndpointRef.metadata, errors.New("test err"))
 
-	b, err := json.Marshal(mockEndpointRef.getStatus().LastError)
+	b, err := json.Marshal(mockEndpointRef.status.LastError)
 	testutil.Ok(t, err)
 	testutil.Equals(t, `"test err"`, string(b))
 
 	// updating status without and error should clear the previous one.
 	mockEndpointRef.update(time.Now, mockEndpointRef.metadata, nil)
 
-	b, err = json.Marshal(mockEndpointRef.getStatus().LastError)
+	b, err = json.Marshal(mockEndpointRef.status.LastError)
 	testutil.Ok(t, err)
 	testutil.Equals(t, `null`, string(b))
 }
 
 func makeEndpointSet(discoveredEndpointAddr []string, strict bool, now nowFunc, metricLabels ...string) *EndpointSet {
-	endpointSet := NewEndpointSet(now, nil, nil,
+	endpointSet := NewEndpointSet(now, log.NewLogfmtLogger(os.Stderr), nil,
 		func() (specs []*GRPCEndpointSpec) {
 			for _, addr := range discoveredEndpointAddr {
-				specs = append(specs, NewGRPCEndpointSpec(addr, strict))
+				specs = append(specs, NewGRPCEndpointSpec(addr, strict, testGRPCOpts...))
 			}
 			return specs
 		},
-		testGRPCOpts, time.Minute, time.Second, metricLabels...)
+		time.Minute, time.Second, 10*time.Second, metricLabels...)
 	return endpointSet
 }
 
@@ -1649,10 +1648,7 @@ func TestDeadlockLocking(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 
 	g.Go(func() error {
-		for {
-			if time.Now().After(deadline) {
-				break
-			}
+		for !time.Now().After(deadline) {
 			mockEndpointRef.update(time.Now, &endpointMetadata{
 				InfoResponse: &infopb.InfoResponse{},
 			}, nil)
@@ -1661,10 +1657,7 @@ func TestDeadlockLocking(t *testing.T) {
 	})
 
 	g.Go(func() error {
-		for {
-			if time.Now().After(deadline) {
-				break
-			}
+		for !time.Now().After(deadline) {
 			mockEndpointRef.HasStoreAPI()
 			mockEndpointRef.HasExemplarsAPI()
 			mockEndpointRef.HasMetricMetadataAPI()
@@ -1675,4 +1668,285 @@ func TestDeadlockLocking(t *testing.T) {
 	})
 
 	testutil.Ok(t, g.Wait())
+}
+
+func TestUpdateVsGetEndpointStatusDeadlock(t *testing.T) {
+	t.Parallel()
+
+	endpoints, err := startTestEndpoints(makeInfoResponses(10))
+	testutil.Ok(t, err)
+	defer endpoints.Close()
+
+	discoveredEndpointAddr := endpoints.EndpointAddresses()
+	endpointSet := makeEndpointSet(discoveredEndpointAddr, false, time.Now)
+	defer endpointSet.Close()
+
+	endpointSet.Update(context.Background())
+	testutil.Equals(t, 10, len(endpointSet.GetEndpointStatus()))
+
+	g := &errgroup.Group{}
+	deadline := time.Now().Add(3 * time.Second)
+
+	for range 3 {
+		g.Go(func() error {
+			for !time.Now().After(deadline) {
+				_ = endpointSet.GetEndpointStatus()
+			}
+			return nil
+		})
+	}
+
+	g.Go(func() error {
+		for !time.Now().After(deadline) {
+			endpointSet.Update(context.Background())
+		}
+		return nil
+	})
+
+	testutil.Ok(t, g.Wait())
+}
+
+func TestEndpointSet_WaitForFirstUpdate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("WaitForFirstUpdate blocks until first update", func(t *testing.T) {
+		endpoints, err := startTestEndpoints([]testEndpointMeta{
+			{
+				InfoResponse: sidecarInfo,
+				extlsetFn: func(addr string) []labelpb.ZLabelSet {
+					return labelpb.ZLabelSetsFromPromLabels(
+						labels.FromStrings("addr", addr),
+					)
+				},
+			},
+		})
+		testutil.Ok(t, err)
+		defer endpoints.Close()
+
+		discoveredEndpointAddr := endpoints.EndpointAddresses()
+		endpointSet := makeEndpointSet(discoveredEndpointAddr, false, time.Now)
+		defer endpointSet.Close()
+
+		// Track when WaitForFirstUpdate returns
+		waitReturned := make(chan struct{})
+		var waitErr error
+
+		// Start waiting in a goroutine
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			waitErr = endpointSet.WaitForFirstUpdate(ctx)
+			close(waitReturned)
+		}()
+
+		// Give some time to ensure WaitForFirstUpdate is blocking
+		select {
+		case <-waitReturned:
+			t.Fatal("WaitForFirstUpdate returned before Update was called")
+		case <-time.After(100 * time.Millisecond):
+			// Expected: still waiting
+		}
+
+		// Now trigger the update
+		endpointSet.Update(context.Background())
+
+		// WaitForFirstUpdate should return quickly after Update
+		select {
+		case <-waitReturned:
+			testutil.Ok(t, waitErr)
+		case <-time.After(1 * time.Second):
+			t.Fatal("WaitForFirstUpdate did not return after Update")
+		}
+
+		// Verify endpoints were discovered
+		testutil.Equals(t, 1, len(endpointSet.GetEndpointStatus()))
+		testutil.Equals(t, 1, len(endpointSet.GetStoreClients()))
+	})
+
+	t.Run("WaitForFirstUpdate returns immediately if update already done", func(t *testing.T) {
+		endpoints, err := startTestEndpoints([]testEndpointMeta{
+			{
+				InfoResponse: sidecarInfo,
+				extlsetFn: func(addr string) []labelpb.ZLabelSet {
+					return labelpb.ZLabelSetsFromPromLabels(
+						labels.FromStrings("addr", addr),
+					)
+				},
+			},
+		})
+		testutil.Ok(t, err)
+		defer endpoints.Close()
+
+		discoveredEndpointAddr := endpoints.EndpointAddresses()
+		endpointSet := makeEndpointSet(discoveredEndpointAddr, false, time.Now)
+		defer endpointSet.Close()
+
+		// First do an update
+		endpointSet.Update(context.Background())
+
+		// Now WaitForFirstUpdate should return immediately
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		err = endpointSet.WaitForFirstUpdate(ctx)
+		duration := time.Since(start)
+
+		testutil.Ok(t, err)
+		testutil.Assert(t, duration < 50*time.Millisecond, "WaitForFirstUpdate took too long: %v", duration)
+	})
+
+	t.Run("WaitForFirstUpdate respects context timeout", func(t *testing.T) {
+		endpoints, err := startTestEndpoints([]testEndpointMeta{
+			{
+				InfoResponse: sidecarInfo,
+				extlsetFn: func(addr string) []labelpb.ZLabelSet {
+					return labelpb.ZLabelSetsFromPromLabels(
+						labels.FromStrings("addr", addr),
+					)
+				},
+			},
+		})
+		testutil.Ok(t, err)
+		defer endpoints.Close()
+
+		discoveredEndpointAddr := endpoints.EndpointAddresses()
+		endpointSet := makeEndpointSet(discoveredEndpointAddr, false, time.Now)
+		defer endpointSet.Close()
+
+		// Use a short timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		err = endpointSet.WaitForFirstUpdate(ctx)
+		duration := time.Since(start)
+
+		// Should timeout
+		testutil.NotOk(t, err)
+		testutil.Assert(t, errors.Is(err, context.DeadlineExceeded), "expected context.DeadlineExceeded, got %v", err)
+		testutil.Assert(t, duration >= 100*time.Millisecond && duration < 200*time.Millisecond,
+			"timeout duration out of expected range: %v", duration)
+	})
+
+	t.Run("Multiple WaitForFirstUpdate calls work correctly", func(t *testing.T) {
+		endpoints, err := startTestEndpoints([]testEndpointMeta{
+			{
+				InfoResponse: sidecarInfo,
+				extlsetFn: func(addr string) []labelpb.ZLabelSet {
+					return labelpb.ZLabelSetsFromPromLabels(
+						labels.FromStrings("addr", addr),
+					)
+				},
+			},
+		})
+		testutil.Ok(t, err)
+		defer endpoints.Close()
+
+		discoveredEndpointAddr := endpoints.EndpointAddresses()
+		endpointSet := makeEndpointSet(discoveredEndpointAddr, false, time.Now)
+		defer endpointSet.Close()
+
+		// Start multiple waiters
+		var wg sync.WaitGroup
+		errors := make([]error, 3)
+
+		for i := range 3 {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				errors[idx] = endpointSet.WaitForFirstUpdate(ctx)
+			}(i)
+		}
+
+		// Give waiters time to start
+		time.Sleep(100 * time.Millisecond)
+
+		// Trigger update
+		endpointSet.Update(context.Background())
+
+		// All waiters should complete
+		wg.Wait()
+
+		// All should succeed
+		for i, err := range errors {
+			testutil.Ok(t, err, "waiter %d failed", i)
+		}
+
+		// Additional calls should still work
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		err = endpointSet.WaitForFirstUpdate(ctx)
+		testutil.Ok(t, err)
+	})
+
+	t.Run("Update called multiple times only signals once", func(t *testing.T) {
+		endpoints, err := startTestEndpoints([]testEndpointMeta{
+			{
+				InfoResponse: sidecarInfo,
+				extlsetFn: func(addr string) []labelpb.ZLabelSet {
+					return labelpb.ZLabelSetsFromPromLabels(
+						labels.FromStrings("addr", addr),
+					)
+				},
+			},
+		})
+		testutil.Ok(t, err)
+		defer endpoints.Close()
+
+		discoveredEndpointAddr := endpoints.EndpointAddresses()
+		endpointSet := makeEndpointSet(discoveredEndpointAddr, false, time.Now)
+		defer endpointSet.Close()
+
+		// Call Update multiple times
+		for range 3 {
+			endpointSet.Update(context.Background())
+		}
+
+		// WaitForFirstUpdate should still work correctly
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		err = endpointSet.WaitForFirstUpdate(ctx)
+		testutil.Ok(t, err)
+
+		// Verify only one endpoint set (no duplicates from multiple updates)
+		testutil.Equals(t, 1, len(endpointSet.GetEndpointStatus()))
+		testutil.Equals(t, 1, len(endpointSet.GetStoreClients()))
+	})
+}
+
+func TestEndpointCloseGCTime(t *testing.T) {
+	endpoints, err := startTestEndpoints([]testEndpointMeta{
+		{
+			InfoResponse: sidecarInfo,
+			extlsetFn: func(addr string) []labelpb.ZLabelSet {
+				return labelpb.ZLabelSetsFromPromLabels(
+					labels.FromStrings("addr", addr),
+				)
+			},
+		},
+	})
+	testutil.Ok(t, err)
+	t.Cleanup(endpoints.Close)
+
+	discoveredEndpointAddr := endpoints.EndpointAddresses()
+	endpointSet := makeEndpointSet(discoveredEndpointAddr, false, time.Now)
+	endpointSet.Update(context.Background())
+
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Now()
+		er := endpointSet.endpoints[discoveredEndpointAddr[0]]
+
+		endpointSet.Close()
+		time.Sleep(endpointSet.gcTimeout)
+		elapsed := time.Since(now)
+		testutil.Assert(t, elapsed == 1*time.Minute, "expected gcTimeout to be 1 minute, got %v", elapsed)
+
+		synctest.Wait()
+		state := er.cc.GetState()
+		testutil.Assert(t, state == connectivity.Shutdown, "expected connection state to be Shutdown, got %v", state)
+	})
 }

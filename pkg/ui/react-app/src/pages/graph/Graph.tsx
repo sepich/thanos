@@ -3,7 +3,7 @@ import React, { PureComponent } from 'react';
 import ReactResizeDetector from 'react-resize-detector';
 
 import { Legend } from './Legend';
-import { Metric, QueryParams } from '../../types/types';
+import { Metric, QueryParams, SampleValue, SampleHistogram } from '../../types/types';
 import { isPresent } from '../../utils';
 import { normalizeData, getOptions, toHoverColor } from './GraphHelpers';
 
@@ -11,15 +11,17 @@ require('../../vendor/flot/jquery.flot');
 require('../../vendor/flot/jquery.flot.stack');
 require('../../vendor/flot/jquery.flot.time');
 require('../../vendor/flot/jquery.flot.crosshair');
+require('../../vendor/flot/jquery.flot.selection');
 require('jquery.flot.tooltip');
 
 export interface GraphProps {
   data: {
     resultType: string;
-    result: Array<{ metric: Metric; values: [number, string][] }>;
+    result: Array<{ metric: Metric; values: SampleValue[]; histograms?: SampleHistogram[] }>;
   };
   stacked: boolean;
   useLocalTime: boolean;
+  handleTimeRangeSelection: (startTime: number, endTime: number) => void;
   queryParams: QueryParams | null;
 }
 
@@ -66,6 +68,15 @@ class Graph extends PureComponent<GraphProps, GraphState> {
 
   componentDidMount(): void {
     this.plot();
+
+    $(`.graph-chart`).bind('plotselected', (_, ranges) => {
+      if (isPresent(this.$chart)) {
+        // eslint-disable-next-line
+        // @ts-ignore Typescript doesn't think this method exists although it actually does.
+        this.$chart.clearSelection();
+        this.props.handleTimeRangeSelection(ranges.xaxis.from, ranges.xaxis.to);
+      }
+    });
   }
 
   componentWillUnmount(): void {

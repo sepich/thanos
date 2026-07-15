@@ -14,6 +14,7 @@ import {
 } from 'reactstrap';
 import PathPrefixProps from '../types/PathPrefixProps';
 import { ThemeToggle } from '../Theme';
+import logo from './images/icon-dark.png';
 
 interface NavConfig {
   name: string;
@@ -28,7 +29,7 @@ interface NavDropDown {
 const navConfig: { [component: string]: (NavConfig | NavDropDown)[] } = {
   query: [
     { name: 'Graph', uri: '/graph' },
-    { name: 'Stores', uri: '/stores' },
+    { name: 'Endpoints', uri: '/stores' },
     {
       name: 'Status',
       children: [
@@ -96,6 +97,7 @@ const Navigation: FC<PathPrefixProps & NavigationProps> = ({ pathPrefix, thanosC
     <Navbar className="mb-3" dark color="dark" expand="md" fixed="top">
       <NavbarToggler onClick={toggle} className="mr-2" />
       <Link className="navbar-brand" to={`${pathPrefix}${defaultRoute}`}>
+        <img src={logo} alt="thanos" style={{ width: '2rem', marginRight: '0.5rem' }} />
         Thanos - {thanosComponent[0].toUpperCase()}
         {thanosComponent.substr(1, thanosComponent.length)}
       </Link>
@@ -105,7 +107,7 @@ const Navigation: FC<PathPrefixProps & NavigationProps> = ({ pathPrefix, thanosC
             if ('uri' in config)
               return (
                 <NavItem key={config.uri}>
-                  <NavLink tag={Link} to={`${pathPrefix}${config.uri}`}>
+                  <NavLink tag={Link} to={`${pathPrefix}${config.uri}`} onClick={toggle}>
                     {config.name}
                   </NavLink>
                 </NavItem>
@@ -118,7 +120,7 @@ const Navigation: FC<PathPrefixProps & NavigationProps> = ({ pathPrefix, thanosC
                 </DropdownToggle>
                 <DropdownMenu>
                   {config.children.map((c) => (
-                    <DropdownItem key={c.uri} tag={Link} to={`${pathPrefix}${c.uri}`}>
+                    <DropdownItem key={c.uri} tag={Link} to={`${pathPrefix}${c.uri}`} onClick={toggle}>
                       {c.name}
                     </DropdownItem>
                   ))}

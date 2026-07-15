@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -13,11 +14,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
+	"go.uber.org/atomic"
 
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
 func TestLimiter(t *testing.T) {
+	t.Parallel()
+
 	c := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
 	l := NewLimiter(10, c)
 
@@ -35,6 +39,8 @@ func TestLimiter(t *testing.T) {
 }
 
 func TestRateLimitedServer(t *testing.T) {
+	t.Parallel()
+
 	numSamples := 60
 	series := []*storepb.SeriesResponse{
 		storeSeriesResponse(t, labels.FromStrings("series", "1"), makeSamples(numSamples)),
@@ -56,7 +62,7 @@ func TestRateLimitedServer(t *testing.T) {
 			series: series,
 		},
 		{
-			name: "series bellow limit",
+			name: "series below limit",
 			limits: SeriesSelectLimits{
 				SeriesPerRequest:  3,
 				SamplesPerRequest: 0,
@@ -73,7 +79,7 @@ func TestRateLimitedServer(t *testing.T) {
 			err:    "failed to send series: limit 2 violated (got 3)",
 		},
 		{
-			name: "chunks bellow limit",
+			name: "chunks below limit",
 			limits: SeriesSelectLimits{
 				SeriesPerRequest:  0,
 				SamplesPerRequest: uint64(3 * numSamples * MaxSamplesPerChunk),
@@ -96,8 +102,19 @@ func TestRateLimitedServer(t *testing.T) {
 			defer cancel()
 
 			store := NewLimitedStoreServer(newStoreServerStub(test.series), prometheus.NewRegistry(), test.limits)
-			seriesServer := storepb.NewInProcessStream(ctx, 10)
-			err := store.Series(&storepb.SeriesRequest{}, seriesServer)
+			client := storepb.ServerAsClient(store, atomic.Bool{})
+			seriesClient, err := client.Series(ctx, &storepb.SeriesRequest{})
+			testutil.Ok(t, err)
+			for {
+				_, err = seriesClient.Recv()
+				if err == io.EOF {
+					err = nil
+					break
+				}
+				if err != nil {
+					break
+				}
+			}
 			if test.err == "" {
 				testutil.Ok(t, err)
 			} else {

@@ -12,7 +12,8 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	amlabels "github.com/prometheus/alertmanager/pkg/labels"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
+	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
 
 	thanosblock "github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/compact"
@@ -48,7 +50,7 @@ func ParseFlagMatchers(s string) ([]*labels.Matcher, error) {
 	}
 	matchers := make([]*labels.Matcher, 0, len(amMatchers))
 	for _, a := range amMatchers {
-		if !model.LabelName.IsValid(model.LabelName(a.Name)) {
+		if !model.UTF8Validation.IsValidLabelName(a.Name) {
 			return nil, errors.Errorf("unsupported format for label %s", a.Name)
 		}
 		matchers = append(matchers, labels.MustNewMatcher(labels.MatchType(a.Type), a.Name, a.Value))
@@ -114,15 +116,17 @@ func RunReplicate(
 		return errors.New("No supported bucket was configured to replicate from")
 	}
 
-	fromBkt, err := client.NewBucket(
-		logger,
-		fromConfContentYaml,
-		prometheus.WrapRegistererWith(prometheus.Labels{"replicate": "from"}, reg),
-		component.Replicate.String(),
-	)
+	bkt, err := client.NewBucket(logger, fromConfContentYaml, component.Replicate.String(), nil)
 	if err != nil {
 		return err
 	}
+	fromBkt := objstoretracing.WrapWithTraces(
+		objstore.WrapWithMetrics(
+			bkt,
+			prometheus.WrapRegistererWithPrefix("thanos_", prometheus.WrapRegistererWith(prometheus.Labels{"replicate": "from"}, reg)),
+			bkt.Name(),
+		),
+	)
 
 	toConfContentYaml, err := toObjStoreConfig.Content()
 	if err != nil {
@@ -133,15 +137,17 @@ func RunReplicate(
 		return errors.New("No supported bucket was configured to replicate to")
 	}
 
-	toBkt, err := client.NewBucket(
-		logger,
-		toConfContentYaml,
-		prometheus.WrapRegistererWith(prometheus.Labels{"replicate": "to"}, reg),
-		component.Replicate.String(),
-	)
+	toBkt, err := client.NewBucket(logger, toConfContentYaml, component.Replicate.String(), nil)
 	if err != nil {
 		return err
 	}
+	toBkt = objstoretracing.WrapWithTraces(
+		objstore.WrapWithMetrics(
+			toBkt,
+			prometheus.WrapRegistererWithPrefix("thanos_", prometheus.WrapRegistererWith(prometheus.Labels{"replicate": "to"}, reg)),
+			toBkt.Name(),
+		),
+	)
 
 	replicationRunCounter := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "thanos_replicate_replication_runs_total",
@@ -239,10 +245,12 @@ func newMetaFetcher(
 	if ignoreMarkedForDeletion {
 		filters = append(filters, thanosblock.NewIgnoreDeletionMarkFilter(logger, fromBkt, 0, concurrency))
 	}
+	baseBlockIDsFetcher := thanosblock.NewConcurrentLister(logger, fromBkt)
 	return thanosblock.NewMetaFetcher(
 		logger,
 		concurrency,
 		fromBkt,
+		baseBlockIDsFetcher,
 		"",
 		reg,
 		filters,

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,6 +53,16 @@ func NewHintsSeriesResponse(hints *types.Any) *SeriesResponse {
 	}
 }
 
+func NewBatchResponse(batch []*Series) *SeriesResponse {
+	return &SeriesResponse{
+		Result: &SeriesResponse_Batch{
+			Batch: &SeriesBatch{
+				Series: batch,
+			},
+		},
+	}
+}
+
 func GRPCCodeFromWarn(warn string) codes.Code {
 	if strings.Contains(warn, "rpc error: code = ResourceExhausted") {
 		return codes.ResourceExhausted
@@ -65,7 +76,7 @@ func GRPCCodeFromWarn(warn string) codes.Code {
 type emptySeriesSet struct{}
 
 func (emptySeriesSet) Next() bool                       { return false }
-func (emptySeriesSet) At() (labels.Labels, []AggrChunk) { return nil, nil }
+func (emptySeriesSet) At() (labels.Labels, []AggrChunk) { return labels.EmptyLabels(), nil }
 func (emptySeriesSet) Err() error                       { return nil }
 
 // EmptySeriesSet returns a new series set that contains no series.
@@ -329,7 +340,10 @@ func (m *Chunk) Compare(b *Chunk) int {
 func (x *PartialResponseStrategy) UnmarshalJSON(entry []byte) error {
 	fieldStr, err := strconv.Unquote(string(entry))
 	if err != nil {
-		return errors.Wrapf(err, fmt.Sprintf("failed to unqote %v, in order to unmarshal as 'partial_response_strategy'. Possible values are %s", string(entry), strings.Join(PartialResponseStrategyValues, ",")))
+		return errors.Wrapf(
+			err,
+			"failed to unqote %v, in order to unmarshal as 'partial_response_strategy'. Possible values are %s", string(entry), strings.Join(PartialResponseStrategyValues, ","),
+		)
 	}
 
 	if fieldStr == "" {
@@ -340,7 +354,11 @@ func (x *PartialResponseStrategy) UnmarshalJSON(entry []byte) error {
 
 	strategy, ok := PartialResponseStrategy_value[strings.ToUpper(fieldStr)]
 	if !ok {
-		return errors.Errorf(fmt.Sprintf("failed to unmarshal %v as 'partial_response_strategy'. Possible values are %s", string(entry), strings.Join(PartialResponseStrategyValues, ",")))
+		return errors.Errorf(
+			"failed to unmarshal %v as 'partial_response_strategy'. Possible values are %s",
+			string(entry),
+			strings.Join(PartialResponseStrategyValues, ","),
+		)
 	}
 	*x = PartialResponseStrategy(strategy)
 	return nil
@@ -378,28 +396,33 @@ func PromMatchersToMatchers(ms ...*labels.Matcher) ([]LabelMatcher, error) {
 // NOTE: It allocates memory.
 func MatchersToPromMatchers(ms ...LabelMatcher) ([]*labels.Matcher, error) {
 	res := make([]*labels.Matcher, 0, len(ms))
-	for _, m := range ms {
-		var t labels.MatchType
-
-		switch m.Type {
-		case LabelMatcher_EQ:
-			t = labels.MatchEqual
-		case LabelMatcher_NEQ:
-			t = labels.MatchNotEqual
-		case LabelMatcher_RE:
-			t = labels.MatchRegexp
-		case LabelMatcher_NRE:
-			t = labels.MatchNotRegexp
-		default:
-			return nil, errors.Errorf("unrecognized label matcher type %d", m.Type)
-		}
-		m, err := labels.NewMatcher(t, m.Name, m.Value)
+	for i := range ms {
+		pm, err := MatcherToPromMatcher(ms[i])
 		if err != nil {
 			return nil, err
 		}
-		res = append(res, m)
+		res = append(res, pm)
 	}
 	return res, nil
+}
+
+// MatcherToPromMatcher converts a Thanos label matcher to Prometheus label matcher.
+func MatcherToPromMatcher(m LabelMatcher) (*labels.Matcher, error) {
+	var t labels.MatchType
+
+	switch m.Type {
+	case LabelMatcher_EQ:
+		t = labels.MatchEqual
+	case LabelMatcher_NEQ:
+		t = labels.MatchNotEqual
+	case LabelMatcher_RE:
+		t = labels.MatchRegexp
+	case LabelMatcher_NRE:
+		t = labels.MatchNotRegexp
+	default:
+		return nil, errors.Errorf("unrecognized label matcher type %d", m.Type)
+	}
+	return labels.NewMatcher(t, m.Name, m.Value)
 }
 
 // MatchersToString converts label matchers to string format.
@@ -430,6 +453,14 @@ func PromMatchersToString(ms ...*labels.Matcher) string {
 
 func (m *LabelMatcher) PromString() string {
 	return fmt.Sprintf("%s%s%q", m.Name, m.Type.PromString(), m.Value)
+}
+
+func (m *LabelMatcher) GetName() string {
+	return m.Name
+}
+
+func (m *LabelMatcher) GetValue() string {
+	return m.Value
 }
 
 func (x LabelMatcher_Type) PromString() string {
@@ -533,22 +564,140 @@ func (m *SeriesRequest) ToPromQL() string {
 	return m.QueryHints.toPromQL(m.Matchers)
 }
 
-// IsSafeToExecute returns true if the function or aggregation from the query hint
-// can be safely executed by the underlying Prometheus instance without affecting the
-// result of the query.
-func (m *QueryHints) IsSafeToExecute() bool {
-	distributiveOperations := []string{
-		"max",
-		"max_over_time",
-		"min",
-		"min_over_time",
-		"group",
+func (m *LabelMatcher) MatcherType() (labels.MatchType, error) {
+	var t labels.MatchType
+	switch m.Type {
+	case LabelMatcher_EQ:
+		t = labels.MatchEqual
+	case LabelMatcher_NEQ:
+		t = labels.MatchNotEqual
+	case LabelMatcher_RE:
+		t = labels.MatchRegexp
+	case LabelMatcher_NRE:
+		t = labels.MatchNotRegexp
+	default:
+		return 0, errors.Errorf("unrecognized label matcher type %d", m.Type)
 	}
-	for _, op := range distributiveOperations {
-		if m.Func.Name == op {
-			return true
+
+	return t, nil
+}
+
+func (m *Chunk) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowTypes
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: Chunk: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: Chunk: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Type", wireType)
+			}
+			m.Type = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTypes
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Type |= Chunk_Encoding(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Data", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTypes
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthTypes
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthTypes
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Data = dAtA[iNdEx:postIndex]
+			iNdEx = postIndex
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Hash", wireType)
+			}
+			m.Hash = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTypes
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Hash |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipTypes(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthTypes
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
 		}
 	}
 
-	return false
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
 }

@@ -79,6 +79,7 @@ type: OTLP
 config:
   client_type: ""
   service_name: ""
+  resource_attributes: {}
   reconnection_period: 0s
   compression: ""
   insecure: false
@@ -97,11 +98,13 @@ config:
     key_file: ""
     server_name: ""
     insecure_skip_verify: false
+  sampler_type: ""
+  sampler_param: ""
 ```
 
 ### Jaeger
 
-Client for https://github.com/jaegertracing/jaeger tracing. Options can be provided also via environment variables. For more details see the Jaeger [exporter specification](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/sdk-environment-variables.md#jaeger-exporter).
+Client for https://github.com/jaegertracing/jaeger tracing. Options can be provided also via environment variables. For more details see the Jaeger [exporter specification](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/configuration/sdk-environment-variables.md#jaeger-exporter).
 
 *WARNING: Options `RPC Metrics`, `Gen128Bit` and `Disabled` are now deprecated and won't have any effect when set*
 
@@ -167,7 +170,7 @@ config:
 
 ### Lightstep
 
-Client for [Lightstep](https://lightstep.com).
+Client for [Lightstep](https://www.servicenow.com/products/observability.html).
 
 In order to configure Thanos to interact with Lightstep you need to provide at least an [access token](https://docs.lightstep.com/docs/create-and-use-access-tokens) in the configuration file. The `collector` key is optional and used when you have on-premise satellites.
 

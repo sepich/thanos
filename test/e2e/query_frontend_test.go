@@ -5,25 +5,33 @@ package e2e_test
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"reflect"
-	"sort"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/efficientgo/e2e"
 	e2emon "github.com/efficientgo/e2e/monitoring"
 	"github.com/efficientgo/e2e/monitoring/matchers"
+	"github.com/go-kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
+	"github.com/prometheus/prometheus/prompb"
+	"github.com/stretchr/testify/require"
 
-	"github.com/efficientgo/core/testutil"
-	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/cacheutil"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/queryfrontend"
-	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/tenancy"
 	"github.com/thanos-io/thanos/test/e2e/e2ethanos"
 )
 
@@ -34,12 +42,13 @@ func TestQueryFrontend(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-	now := time.Now()
+	// Predefined Timestamp
+	predefTimestamp := time.Date(2023, time.December, 22, 12, 0, 0, 0, time.UTC)
 
-	prom, sidecar := e2ethanos.NewPrometheusWithSidecar(e, "1", e2ethanos.DefaultPromConfig("test", 0, "", "", e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
-	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
+	i := e2ethanos.NewReceiveBuilder(e, "ingestor-rw").WithIngestionEnabled().Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(i))
 
-	q := e2ethanos.NewQuerierBuilder(e, "1", sidecar.InternalEndpoint("grpc")).Init()
+	q := e2ethanos.NewQuerierBuilder(e, "1", i.InternalEndpoint("grpc")).Init()
 	testutil.Ok(t, e2e.StartAndWaitReady(q))
 
 	inMemoryCacheConfig := queryfrontend.CacheProviderConfig{
@@ -57,17 +66,34 @@ func TestQueryFrontend(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(cancel)
 
+	// Writing a custom Timeseries into the receiver
+	testutil.Ok(t, remoteWrite(ctx, []prompb.TimeSeries{{
+		Labels: []prompb.Label{
+			{Name: "__name__", Value: "up"},
+			{Name: "instance", Value: "localhost:9090"},
+			{Name: "job", Value: "myself"},
+			{Name: "prometheus", Value: "test"},
+			{Name: "replica", Value: "0"},
+		},
+		Samples: []prompb.Sample{
+			{Value: float64(1), Timestamp: timestamp.FromTime(predefTimestamp)},
+		}}},
+		i.Endpoint("remote-write"),
+	))
+
 	testutil.Ok(t, q.WaitSumMetricsWithOptions(e2emon.Equals(1), []string{"thanos_store_nodes_grpc_connections"}, e2emon.WaitMissingMetrics()))
 
 	// Ensure we can get the result from Querier first so that it
 	// doesn't need to retry when we send queries to the frontend later.
-	queryAndAssertSeries(t, ctx, q.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, time.Now, promclient.QueryOptions{
+	queryAndAssertSeries(t, ctx, q.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, func() time.Time { return predefTimestamp }, promclient.QueryOptions{
 		Deduplicate: false,
 	}, []model.Metric{
 		{
 			"job":        "myself",
 			"prometheus": "test",
+			"receive":    "receive-ingestor-rw",
 			"replica":    "0",
+			"tenant_id":  "default-tenant",
 		},
 	})
 
@@ -79,13 +105,15 @@ func TestQueryFrontend(t *testing.T) {
 	queryTimes := vals[0]
 
 	t.Run("query frontend works for instant query", func(t *testing.T) {
-		queryAndAssertSeries(t, ctx, queryFrontend.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, time.Now, promclient.QueryOptions{
+		queryAndAssertSeries(t, ctx, queryFrontend.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, func() time.Time { return predefTimestamp }, promclient.QueryOptions{
 			Deduplicate: false,
 		}, []model.Metric{
 			{
 				"job":        "myself",
 				"prometheus": "test",
+				"receive":    "receive-ingestor-rw",
 				"replica":    "0",
+				"tenant_id":  "default-tenant",
 			},
 		})
 
@@ -108,8 +136,8 @@ func TestQueryFrontend(t *testing.T) {
 			ctx,
 			queryFrontend.Endpoint("http"),
 			e2ethanos.QueryUpWithoutInstance,
-			timestamp.FromTime(now.Add(-time.Hour)),
-			timestamp.FromTime(now.Add(time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(-time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(time.Hour)),
 			14,
 			promclient.QueryOptions{
 				Deduplicate: true,
@@ -152,8 +180,8 @@ func TestQueryFrontend(t *testing.T) {
 			ctx,
 			queryFrontend.Endpoint("http"),
 			e2ethanos.QueryUpWithoutInstance,
-			timestamp.FromTime(now.Add(-time.Hour)),
-			timestamp.FromTime(now.Add(time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(-time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(time.Hour)),
 			14,
 			promclient.QueryOptions{
 				Deduplicate: true,
@@ -174,7 +202,7 @@ func TestQueryFrontend(t *testing.T) {
 		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(2), "cortex_cache_fetched_keys_total"))
 		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(1), "cortex_cache_hits_total"))
 		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(1), "querier_cache_added_new_total"))
-		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(2), "querier_cache_added_total"))
+		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(1), "querier_cache_added_total"))
 		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(1), "querier_cache_entries"))
 		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(2), "querier_cache_gets_total"))
 		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(1), "querier_cache_misses_total"))
@@ -185,9 +213,8 @@ func TestQueryFrontend(t *testing.T) {
 			e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "tripperware", "query_range"))),
 		)
 
-		// One more request is needed in order to satisfy the req range.
 		testutil.Ok(t, q.WaitSumMetricsWithOptions(
-			e2emon.Equals(2),
+			e2emon.Equals(1),
 			[]string{"http_requests_total"},
 			e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "handler", "query_range"))),
 		)
@@ -199,8 +226,8 @@ func TestQueryFrontend(t *testing.T) {
 			ctx,
 			queryFrontend.Endpoint("http"),
 			e2ethanos.QueryUpWithoutInstance,
-			timestamp.FromTime(now.Add(-time.Hour)),
-			timestamp.FromTime(now.Add(24*time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(-time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(24*time.Hour)),
 			14,
 			promclient.QueryOptions{
 				Deduplicate: true,
@@ -218,13 +245,13 @@ func TestQueryFrontend(t *testing.T) {
 			[]string{"thanos_query_frontend_queries_total"},
 			e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "op", "query_range"))),
 		)
-		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(3), "cortex_cache_fetched_keys_total"))
+		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(4), "cortex_cache_fetched_keys_total"))
 		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(2), "cortex_cache_hits_total"))
-		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(1), "querier_cache_added_new_total"))
+		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(2), "querier_cache_added_new_total"))
 		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(3), "querier_cache_added_total"))
-		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(1), "querier_cache_entries"))
-		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(3), "querier_cache_gets_total"))
-		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(1), "querier_cache_misses_total"))
+		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(2), "querier_cache_entries"))
+		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(4), "querier_cache_gets_total"))
+		testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(2), "querier_cache_misses_total"))
 
 		// Query is 25h so it will be split to 2 requests.
 		testutil.Ok(t, queryFrontend.WaitSumMetricsWithOptions(
@@ -233,7 +260,7 @@ func TestQueryFrontend(t *testing.T) {
 		)
 
 		testutil.Ok(t, q.WaitSumMetricsWithOptions(
-			e2emon.Equals(4),
+			e2emon.Equals(3),
 			[]string{"http_requests_total"},
 			e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "handler", "query_range"))),
 		)
@@ -241,7 +268,7 @@ func TestQueryFrontend(t *testing.T) {
 
 	t.Run("query frontend splitting works for labels names API", func(t *testing.T) {
 		// LabelNames and LabelValues API should still work via query frontend.
-		labelNames(t, ctx, queryFrontend.Endpoint("http"), nil, timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+		labelNames(t, ctx, queryFrontend.Endpoint("http"), nil, timestamp.FromTime(predefTimestamp.Add(-time.Hour)), timestamp.FromTime(predefTimestamp.Add(time.Hour)), 0, func(res []string) bool {
 			return len(res) > 0
 		})
 		testutil.Ok(t, q.WaitSumMetricsWithOptions(
@@ -260,7 +287,7 @@ func TestQueryFrontend(t *testing.T) {
 			e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "tripperware", "labels"))),
 		)
 
-		labelNames(t, ctx, queryFrontend.Endpoint("http"), nil, timestamp.FromTime(now.Add(-24*time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+		labelNames(t, ctx, queryFrontend.Endpoint("http"), nil, timestamp.FromTime(predefTimestamp.Add(-24*time.Hour)), timestamp.FromTime(predefTimestamp.Add(time.Hour)), 0, func(res []string) bool {
 			return len(res) > 0
 		})
 		testutil.Ok(t, q.WaitSumMetricsWithOptions(
@@ -281,7 +308,7 @@ func TestQueryFrontend(t *testing.T) {
 	})
 
 	t.Run("query frontend splitting works for labels values API", func(t *testing.T) {
-		labelValues(t, ctx, queryFrontend.Endpoint("http"), "instance", nil, timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+		labelValues(t, ctx, queryFrontend.Endpoint("http"), "instance", nil, timestamp.FromTime(predefTimestamp.Add(-time.Hour)), timestamp.FromTime(predefTimestamp.Add(time.Hour)), 0, func(res []string) bool {
 			return len(res) == 1 && res[0] == "localhost:9090"
 		})
 		testutil.Ok(t, q.WaitSumMetricsWithOptions(
@@ -300,7 +327,7 @@ func TestQueryFrontend(t *testing.T) {
 			e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "tripperware", "labels"))),
 		)
 
-		labelValues(t, ctx, queryFrontend.Endpoint("http"), "instance", nil, timestamp.FromTime(now.Add(-24*time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+		labelValues(t, ctx, queryFrontend.Endpoint("http"), "instance", nil, timestamp.FromTime(predefTimestamp.Add(-24*time.Hour)), timestamp.FromTime(predefTimestamp.Add(time.Hour)), 0, func(res []string) bool {
 			return len(res) == 1 && res[0] == "localhost:9090"
 		})
 		testutil.Ok(t, q.WaitSumMetricsWithOptions(
@@ -326,8 +353,9 @@ func TestQueryFrontend(t *testing.T) {
 			ctx,
 			queryFrontend.Endpoint("http"),
 			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "up")},
-			timestamp.FromTime(now.Add(-time.Hour)),
-			timestamp.FromTime(now.Add(time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(-time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(time.Hour)),
+			0,
 			func(res []map[string]string) bool {
 				if len(res) != 1 {
 					return false
@@ -338,6 +366,8 @@ func TestQueryFrontend(t *testing.T) {
 					"instance":   "localhost:9090",
 					"job":        "myself",
 					"prometheus": "test",
+					"receive":    "receive-ingestor-rw",
+					"tenant_id":  "default-tenant",
 				})
 			},
 		)
@@ -362,8 +392,9 @@ func TestQueryFrontend(t *testing.T) {
 			ctx,
 			queryFrontend.Endpoint("http"),
 			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "up")},
-			timestamp.FromTime(now.Add(-24*time.Hour)),
-			timestamp.FromTime(now.Add(time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(-24*time.Hour)),
+			timestamp.FromTime(predefTimestamp.Add(time.Hour)),
+			0,
 			func(res []map[string]string) bool {
 				if len(res) != 1 {
 					return false
@@ -374,6 +405,8 @@ func TestQueryFrontend(t *testing.T) {
 					"instance":   "localhost:9090",
 					"job":        "myself",
 					"prometheus": "test",
+					"receive":    "receive-ingestor-rw",
+					"tenant_id":  "default-tenant",
 				})
 			},
 		)
@@ -402,12 +435,13 @@ func TestQueryFrontendMemcachedCache(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-	now := time.Now()
+	// Predefined timestamp
+	predefTimestamp := time.Date(2023, time.December, 22, 12, 0, 0, 0, time.UTC)
 
-	prom, sidecar := e2ethanos.NewPrometheusWithSidecar(e, "1", e2ethanos.DefaultPromConfig("test", 0, "", "", e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
-	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
+	i := e2ethanos.NewReceiveBuilder(e, "ingestor-rw").WithIngestionEnabled().Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(i))
 
-	q := e2ethanos.NewQuerierBuilder(e, "1", sidecar.InternalEndpoint("grpc")).Init()
+	q := e2ethanos.NewQuerierBuilder(e, "1", i.InternalEndpoint("grpc")).Init()
 	testutil.Ok(t, e2e.StartAndWaitReady(q))
 
 	memcached := e2ethanos.NewMemcached(e, "1")
@@ -436,19 +470,34 @@ func TestQueryFrontendMemcachedCache(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(cancel)
 
+	testutil.Ok(t, remoteWrite(ctx, []prompb.TimeSeries{{
+		Labels: []prompb.Label{
+			{Name: "__name__", Value: "up"},
+			{Name: "instance", Value: "localhost:9090"},
+			{Name: "job", Value: "myself"},
+			{Name: "prometheus", Value: "test"},
+			{Name: "replica", Value: "0"},
+		},
+		Samples: []prompb.Sample{
+			{Value: float64(1), Timestamp: timestamp.FromTime(predefTimestamp)},
+		}}},
+		i.Endpoint("remote-write")))
+
 	testutil.Ok(t, q.WaitSumMetricsWithOptions(e2emon.Equals(1), []string{"thanos_store_nodes_grpc_connections"}, e2emon.WaitMissingMetrics()))
 
 	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(1), "cortex_memcache_client_servers"))
 
 	// Ensure we can get the result from Querier first so that it
 	// doesn't need to retry when we send queries to the frontend later.
-	queryAndAssertSeries(t, ctx, q.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, time.Now, promclient.QueryOptions{
+	queryAndAssertSeries(t, ctx, q.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, func() time.Time { return predefTimestamp }, promclient.QueryOptions{
 		Deduplicate: false,
 	}, []model.Metric{
 		{
 			"job":        "myself",
 			"prometheus": "test",
+			"receive":    "receive-ingestor-rw",
 			"replica":    "0",
+			"tenant_id":  "default-tenant",
 		},
 	})
 
@@ -462,8 +511,8 @@ func TestQueryFrontendMemcachedCache(t *testing.T) {
 		ctx,
 		queryFrontend.Endpoint("http"),
 		e2ethanos.QueryUpWithoutInstance,
-		timestamp.FromTime(now.Add(-time.Hour)),
-		timestamp.FromTime(now.Add(time.Hour)),
+		timestamp.FromTime(predefTimestamp.Add(-time.Hour)),
+		timestamp.FromTime(predefTimestamp.Add(time.Hour)),
 		14,
 		promclient.QueryOptions{
 			Deduplicate: true,
@@ -494,8 +543,8 @@ func TestQueryFrontendMemcachedCache(t *testing.T) {
 		ctx,
 		queryFrontend.Endpoint("http"),
 		e2ethanos.QueryUpWithoutInstance,
-		timestamp.FromTime(now.Add(-time.Hour)),
-		timestamp.FromTime(now.Add(time.Hour)),
+		timestamp.FromTime(predefTimestamp.Add(-time.Hour)),
+		timestamp.FromTime(predefTimestamp.Add(time.Hour)),
 		14,
 		promclient.QueryOptions{
 			Deduplicate: true,
@@ -529,34 +578,52 @@ func TestRangeQueryShardingWithRandomData(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-	promConfig := e2ethanos.DefaultPromConfig("p1", 0, "", "")
-	prom, sidecar := e2ethanos.NewPrometheusWithSidecar(e, "p1", promConfig, "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
+	i := e2ethanos.NewReceiveBuilder(e, "ingestor-rw").WithIngestionEnabled().Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(i))
 
-	now := model.Now()
+	predefTimestamp := model.TimeFromUnixNano(time.Date(2023, time.December, 22, 12, 0, 0, 0, time.UTC).UnixNano())
+
 	ctx := context.Background()
 	timeSeries := []labels.Labels{
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "1"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "1"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "2"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "2"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "3"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "3"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "4"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "4"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "5"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "5"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "6"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "6"}, {Name: "handler", Value: "/metrics"}},
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "1", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "1", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "2", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "2", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "3", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "3", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "4", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "4", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "5", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "5", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "6", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "6", "handler", "/metrics"),
 	}
 
-	startTime := now.Time().Add(-1 * time.Hour)
-	endTime := now.Time().Add(1 * time.Hour)
-	_, err = e2eutil.CreateBlock(ctx, prom.Dir(), timeSeries, 20, timestamp.FromTime(startTime), timestamp.FromTime(endTime), nil, 0, metadata.NoneFunc)
-	testutil.Ok(t, err)
-	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
+	timeSeries = sortLabels(timeSeries)
 
-	stores := []string{sidecar.InternalEndpoint("grpc")}
-	q1 := e2ethanos.NewQuerierBuilder(e, "q1", stores...).Init()
+	samplespb := make([]prompb.TimeSeries, 0, len(timeSeries))
+	for _, lbls := range timeSeries {
+		labelspb := make([]prompb.Label, 0, lbls.Len())
+		lbls.Range(func(l labels.Label) {
+			labelspb = append(labelspb, prompb.Label{
+				Name:  l.Name,
+				Value: l.Value,
+			})
+		})
+		samplespb = append(samplespb, prompb.TimeSeries{
+			Labels: labelspb,
+			Samples: []prompb.Sample{
+				{
+					Value:     float64(1),
+					Timestamp: timestamp.FromTime(predefTimestamp.Time()),
+				},
+			},
+		})
+	}
+
+	testutil.Ok(t, remoteWrite(ctx, samplespb, i.Endpoint("remote-write")))
+
+	q1 := e2ethanos.NewQuerierBuilder(e, "q1", i.InternalEndpoint("grpc")).Init()
 	testutil.Ok(t, e2e.StartAndWaitReady(q1))
 
 	inMemoryCacheConfig := queryfrontend.CacheProviderConfig{
@@ -578,13 +645,16 @@ func TestRangeQueryShardingWithRandomData(t *testing.T) {
 	qryFunc := func() string { return `sum by (pod) (http_requests_total)` }
 	queryOpts := promclient.QueryOptions{Deduplicate: true}
 
+	startTime := timestamp.FromTime(predefTimestamp.Time().Add(-1 * time.Hour))
+	endTime := timestamp.FromTime(predefTimestamp.Time().Add(1 * time.Hour))
+
 	var resultWithoutSharding model.Matrix
-	rangeQuery(t, ctx, q1.Endpoint("http"), qryFunc, timestamp.FromTime(startTime), timestamp.FromTime(endTime), 30, queryOpts, func(res model.Matrix) error {
+	rangeQuery(t, ctx, q1.Endpoint("http"), qryFunc, startTime, endTime, 30, queryOpts, func(res model.Matrix) error {
 		resultWithoutSharding = res
 		return nil
 	})
 	var resultWithSharding model.Matrix
-	rangeQuery(t, ctx, qfe.Endpoint("http"), qryFunc, timestamp.FromTime(startTime), timestamp.FromTime(endTime), 30, queryOpts, func(res model.Matrix) error {
+	rangeQuery(t, ctx, qfe.Endpoint("http"), qryFunc, startTime, endTime, 30, queryOpts, func(res model.Matrix) error {
 		resultWithSharding = res
 		return nil
 	})
@@ -599,12 +669,12 @@ func TestRangeQueryDynamicHorizontalSharding(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-	now := time.Now()
+	predefTimestamp := time.Date(2023, time.December, 22, 12, 0, 0, 0, time.UTC)
 
-	prom, sidecar := e2ethanos.NewPrometheusWithSidecar(e, "1", e2ethanos.DefaultPromConfig("test", 0, "", "", e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
-	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
+	i := e2ethanos.NewReceiveBuilder(e, "ingestor-rw").WithIngestionEnabled().Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(i))
 
-	querier := e2ethanos.NewQuerierBuilder(e, "1", sidecar.InternalEndpoint("grpc")).Init()
+	querier := e2ethanos.NewQuerierBuilder(e, "1", i.InternalEndpoint("grpc")).Init()
 	testutil.Ok(t, e2e.StartAndWaitReady(querier))
 
 	inMemoryCacheConfig := queryfrontend.CacheProviderConfig{
@@ -629,17 +699,32 @@ func TestRangeQueryDynamicHorizontalSharding(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(cancel)
 
+	testutil.Ok(t, remoteWrite(ctx, []prompb.TimeSeries{{
+		Labels: []prompb.Label{
+			{Name: "__name__", Value: "up"},
+			{Name: "instance", Value: "localhost:9090"},
+			{Name: "job", Value: "myself"},
+			{Name: "prometheus", Value: "test"},
+			{Name: "replica", Value: "0"},
+		},
+		Samples: []prompb.Sample{
+			{Value: float64(1), Timestamp: timestamp.FromTime(predefTimestamp)},
+		}}},
+		i.Endpoint("remote-write")))
+
 	testutil.Ok(t, querier.WaitSumMetricsWithOptions(e2emon.Equals(1), []string{"thanos_store_nodes_grpc_connections"}, e2emon.WaitMissingMetrics()))
 
 	// Ensure we can get the result from Querier first so that it
 	// doesn't need to retry when we send queries to the frontend later.
-	queryAndAssertSeries(t, ctx, querier.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, time.Now, promclient.QueryOptions{
+	queryAndAssertSeries(t, ctx, querier.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, func() time.Time { return predefTimestamp }, promclient.QueryOptions{
 		Deduplicate: false,
 	}, []model.Metric{
 		{
 			"job":        "myself",
 			"prometheus": "test",
+			"receive":    "receive-ingestor-rw",
 			"replica":    "0",
+			"tenant_id":  "default-tenant",
 		},
 	})
 
@@ -649,8 +734,8 @@ func TestRangeQueryDynamicHorizontalSharding(t *testing.T) {
 		ctx,
 		queryFrontend.Endpoint("http"),
 		e2ethanos.QueryUpWithoutInstance,
-		timestamp.FromTime(now.Add(-time.Hour)),
-		timestamp.FromTime(now.Add(time.Hour)),
+		timestamp.FromTime(predefTimestamp.Add(-time.Hour)),
+		timestamp.FromTime(predefTimestamp.Add(time.Hour)),
 		14,
 		promclient.QueryOptions{
 			Deduplicate: true,
@@ -670,18 +755,17 @@ func TestRangeQueryDynamicHorizontalSharding(t *testing.T) {
 	))
 
 	// make sure that we don't break cortex cache code.
-	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(3), "cortex_cache_fetched_keys_total"))
+	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(4), "cortex_cache_fetched_keys_total"))
 	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(0), "cortex_cache_hits_total"))
-	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(2), "querier_cache_added_new_total"))
-	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(3), "querier_cache_added_total"))
-	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(3), "querier_cache_misses_total"))
+	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(4), "querier_cache_added_new_total"))
+	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(4), "querier_cache_added_total"))
+	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(4), "querier_cache_misses_total"))
 
 	// Query interval is 2 hours, which is greater than min-slit-interval, query will be broken down into 4 parts
-	// + rest (of interval)
-	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(5), "thanos_frontend_split_queries_total"))
+	testutil.Ok(t, queryFrontend.WaitSumMetrics(e2emon.Equals(4), "thanos_frontend_split_queries_total"))
 
 	testutil.Ok(t, querier.WaitSumMetricsWithOptions(
-		e2emon.Equals(5),
+		e2emon.Equals(4),
 		[]string{"http_requests_total"},
 		e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "handler", "query_range")),
 	))
@@ -694,41 +778,54 @@ func TestInstantQueryShardingWithRandomData(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-	promConfig := e2ethanos.DefaultPromConfig("p1", 0, "", "")
-	prom, sidecar := e2ethanos.NewPrometheusWithSidecar(e, "p1", promConfig, "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
+	i := e2ethanos.NewReceiveBuilder(e, "ingestor-rw").WithIngestionEnabled().Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(i))
 
-	now := model.Now()
+	predefTimestamp := model.TimeFromUnixNano(time.Date(2023, time.December, 22, 12, 0, 0, 0, time.UTC).UnixNano())
 	ctx := context.Background()
+
 	timeSeries := []labels.Labels{
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "1"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "1"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "2"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "2"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "3"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "3"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "4"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "4"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "5"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "5"}, {Name: "handler", Value: "/metrics"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "6"}, {Name: "handler", Value: "/"}},
-		{{Name: labels.MetricName, Value: "http_requests_total"}, {Name: "pod", Value: "6"}, {Name: "handler", Value: "/metrics"}},
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "1", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "1", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "2", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "2", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "3", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "3", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "4", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "4", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "5", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "5", "handler", "/metrics"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "6", "handler", "/"),
+		labels.FromStrings(labels.MetricName, "http_requests_total", "pod", "6", "handler", "/metrics"),
 	}
 
-	// Ensure labels are ordered.
-	for _, ts := range timeSeries {
-		sort.Slice(ts, func(i, j int) bool {
-			return ts[i].Name < ts[j].Name
+	// Ensure lbl are ordered.
+	timeSeries = sortLabels(timeSeries)
+
+	samplespb := make([]prompb.TimeSeries, 0, len(timeSeries))
+	for _, lbl := range timeSeries {
+		labelspb := make([]prompb.Label, 0, lbl.Len())
+		lbl.Range(func(l labels.Label) {
+			labelspb = append(labelspb, prompb.Label{
+				Name:  l.Name,
+				Value: l.Value,
+			})
+		})
+		samplespb = append(samplespb, prompb.TimeSeries{
+			Labels: labelspb,
+			Samples: []prompb.Sample{
+				{
+					Value:     float64(1),
+					Timestamp: timestamp.FromTime(predefTimestamp.Time()),
+				},
+			},
 		})
 	}
 
-	startTime := now.Time().Add(-1 * time.Hour)
-	endTime := now.Time().Add(1 * time.Hour)
-	_, err = e2eutil.CreateBlock(ctx, prom.Dir(), timeSeries, 20, timestamp.FromTime(startTime), timestamp.FromTime(endTime), nil, 0, metadata.NoneFunc)
-	testutil.Ok(t, err)
-	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
+	testutil.Ok(t, remoteWrite(ctx, samplespb, i.Endpoint("remote-write")))
 
-	stores := []string{sidecar.InternalEndpoint("grpc")}
-	q1 := e2ethanos.NewQuerierBuilder(e, "q1", stores...).Init()
+	enableFeature := []string{"promql-experimental-functions"}
+	q1 := e2ethanos.NewQuerierBuilder(e, "q1", i.InternalEndpoint("grpc")).WithEnabledFeatures(enableFeature).Init()
 	testutil.Ok(t, e2e.StartAndWaitReady(q1))
 
 	inMemoryCacheConfig := queryfrontend.CacheProviderConfig{
@@ -742,7 +839,8 @@ func TestInstantQueryShardingWithRandomData(t *testing.T) {
 		QueryRangeConfig: queryfrontend.QueryRangeConfig{
 			AlignRangeWithStep: false,
 		},
-		NumShards: 2,
+		NumShards:      2,
+		EnableFeatures: enableFeature,
 	}
 	qfe := e2ethanos.NewQueryFrontend(e, "query-frontend", "http://"+q1.InternalEndpoint("http"), config, inMemoryCacheConfig)
 	testutil.Ok(t, e2e.StartAndWaitReady(qfe))
@@ -798,15 +896,264 @@ func TestInstantQueryShardingWithRandomData(t *testing.T) {
 			qryFunc:        func() string { return `max by (handler) (sum(http_requests_total) by (pod, handler))` },
 			expectedSeries: 2,
 		},
+		{
+			name:           "aggregations with parameter",
+			qryFunc:        func() string { return `topk(2, limitk by (pod) (4, http_requests_total))` },
+			expectedSeries: 2,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resultWithoutSharding := instantQuery(t, ctx, q1.Endpoint("http"), tc.qryFunc, func() time.Time {
-				return now.Time()
+				return predefTimestamp.Time()
 			}, queryOpts, tc.expectedSeries)
 			resultWithSharding := instantQuery(t, ctx, qfe.Endpoint("http"), tc.qryFunc, func() time.Time {
-				return now.Time()
+				return predefTimestamp.Time()
 			}, queryOpts, tc.expectedSeries)
 			testutil.Equals(t, resultWithoutSharding, resultWithSharding)
 		})
 	}
+}
+
+type tenantRoundTripper struct {
+	tenant       string
+	tenantHeader string
+	rt           http.RoundTripper
+}
+
+var _ http.RoundTripper = tenantRoundTripper{}
+
+// RoundTrip implements the http.RoundTripper interface.
+func (u tenantRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	if u.tenantHeader == "" {
+		u.tenantHeader = tenancy.DefaultTenantHeader
+	}
+	r.Header.Set(u.tenantHeader, u.tenant)
+	return u.rt.RoundTrip(r)
+}
+
+func TestTenantQFEHTTPMetrics(t *testing.T) {
+	t.Parallel()
+
+	e, err := e2e.NewDockerEnvironment("qfetenantmetrics")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	// scrape the local prometheus, and our querier metrics
+	prom1, sidecar1 := e2ethanos.NewPrometheusWithSidecar(e, "alone", e2ethanos.DefaultPromConfig("prom-alone", 0, "", "", e2ethanos.LocalPrometheusTarget, "qfetenantmetrics-querier-1:8080"), "", e2ethanos.DefaultPrometheusImage(), "")
+
+	q := e2ethanos.NewQuerierBuilder(e, "1", sidecar1.InternalEndpoint("grpc")).Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(q))
+
+	inMemoryCacheConfig := queryfrontend.CacheProviderConfig{
+		Type: queryfrontend.INMEMORY,
+		Config: queryfrontend.InMemoryResponseCacheConfig{
+			MaxSizeItems: 1000,
+			Validity:     time.Hour,
+		},
+	}
+
+	cfg := queryfrontend.Config{}
+	queryFrontend := e2ethanos.NewQueryFrontend(e, "1", "http://"+q.InternalEndpoint("http"), cfg, inMemoryCacheConfig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	t.Cleanup(cancel)
+
+	testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1, queryFrontend))
+
+	// Query once with default-tenant to ensure everything is ready
+	// for the following requests
+	instantQuery(t, ctx, queryFrontend.Endpoint("http"), func() string {
+		return "prometheus_remote_read_handler_queries"
+	}, time.Now, promclient.QueryOptions{
+		Deduplicate: true,
+	}, 1)
+	testutil.Ok(t, err)
+
+	// Query a few times with tenant 1
+	instantQuery(t, ctx, queryFrontend.Endpoint("http"), func() string {
+		return "prometheus_remote_read_handler_queries"
+	}, time.Now, promclient.QueryOptions{
+		Deduplicate: true,
+		HTTPHeaders: map[string][]string{"thanos-tenant": {"test-tenant-1"}},
+	}, 1)
+	testutil.Ok(t, err)
+
+	instantQuery(t, ctx, queryFrontend.Endpoint("http"), func() string {
+		return "go_goroutines"
+	}, time.Now, promclient.QueryOptions{
+		Deduplicate: true,
+		HTTPHeaders: map[string][]string{"thanos-tenant": {"test-tenant-1"}},
+	}, 2)
+	testutil.Ok(t, err)
+
+	instantQuery(t, ctx, queryFrontend.Endpoint("http"), func() string {
+		return "go_memstats_frees_total"
+	}, time.Now, promclient.QueryOptions{
+		Deduplicate: true,
+		HTTPHeaders: map[string][]string{"thanos-tenant": {"test-tenant-1"}},
+	}, 2)
+	testutil.Ok(t, err)
+
+	// query just once with tenant-2
+	instantQuery(t, ctx, queryFrontend.Endpoint("http"), func() string {
+		return "go_memstats_heap_alloc_bytes"
+	}, time.Now, promclient.QueryOptions{
+		Deduplicate: true,
+		HTTPHeaders: map[string][]string{"thanos-tenant": {"test-tenant-2"}},
+	}, 2)
+	testutil.Ok(t, err)
+
+	// check that http metrics for tenant-1 matches 3 requests, both for querier and query frontend
+	tenant1Matcher, err := matchers.NewMatcher(matchers.MatchEqual, "tenant", "test-tenant-1")
+	testutil.Ok(t, err)
+	testutil.Ok(t, q.WaitSumMetricsWithOptions(
+		e2emon.GreaterOrEqual(3),
+		[]string{"http_requests_total"}, e2emon.WithLabelMatchers(
+			tenant1Matcher,
+		),
+		e2emon.WaitMissingMetrics(),
+	))
+	testutil.Ok(t, queryFrontend.WaitSumMetricsWithOptions(
+		e2emon.GreaterOrEqual(3),
+		[]string{"http_requests_total"}, e2emon.WithLabelMatchers(
+			tenant1Matcher,
+		),
+		e2emon.WaitMissingMetrics(),
+	))
+
+	// check that http metrics for tenant-2 matches 1 requests, both for querier and query frontend
+	tenant2Matcher, err := matchers.NewMatcher(matchers.MatchEqual, "tenant", "test-tenant-2")
+	testutil.Ok(t, err)
+	testutil.Ok(t, q.WaitSumMetricsWithOptions(
+		e2emon.Equals(1),
+		[]string{"http_requests_total"}, e2emon.WithLabelMatchers(
+			tenant2Matcher,
+		),
+		e2emon.WaitMissingMetrics(),
+	))
+	testutil.Ok(t, queryFrontend.WaitSumMetricsWithOptions(
+		e2emon.Equals(1),
+		[]string{"http_requests_total"}, e2emon.WithLabelMatchers(
+			tenant2Matcher,
+		),
+		e2emon.WaitMissingMetrics(),
+	))
+}
+
+func TestQueryFrontendExplain(t *testing.T) {
+	t.Parallel()
+
+	e, err := e2e.NewDockerEnvironment("qfe-explain")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	q := e2ethanos.NewQuerierBuilder(e, "1").Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(q))
+
+	qfe := e2ethanos.NewQueryFrontend(e, "1", "http://"+q.InternalEndpoint("http"), queryfrontend.Config{}, queryfrontend.CacheProviderConfig{
+		Type: queryfrontend.INMEMORY,
+	})
+	testutil.Ok(t, e2e.StartAndWaitReady(qfe))
+
+	resp, err := http.Get(fmt.Sprintf("http://%s/api/v1/query_explain?query=time()&engine=thanos", qfe.Endpoint("http")))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, `{"status":"success","data":{"name":"[duplicateLabelCheck]","children":[{"name":"[noArgFunction]"}]}}`, strings.TrimSpace(string(body)))
+}
+
+func TestQueryFrontendAnalyze(t *testing.T) {
+	t.Parallel()
+
+	e, err := e2e.NewDockerEnvironment("qfe-analyze")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	q := e2ethanos.NewQuerierBuilder(e, "1").Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(q))
+
+	qfe := e2ethanos.NewQueryFrontend(e, "1", "http://"+q.InternalEndpoint("http"), queryfrontend.Config{}, queryfrontend.CacheProviderConfig{
+		Type: queryfrontend.INMEMORY,
+	})
+	testutil.Ok(t, e2e.StartAndWaitReady(qfe))
+
+	resp, err := http.Get(fmt.Sprintf("http://%s/api/v1/query?query=time()&engine=thanos&analyze=true", qfe.Endpoint("http")))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	r := regexp.MustCompile(
+		`{"status":"success","data":{"resultType":"scalar","result":\[.+,".+"\],"analysis":{"name":"\[duplicateLabelCheck\]","executionTime":".+","children":\[{"name":"\[noArgFunction\]","executionTime":".+","children":null}\]}}}`,
+	)
+	t.Log(strings.TrimSpace(string(body)))
+
+	require.Equal(t, true, r.MatchString(strings.TrimSpace(string(body))))
+}
+
+func TestQueryFrontendReadyOnlyIfDownstreamIsAvailable(t *testing.T) {
+	t.Parallel()
+
+	e, err := e2e.NewDockerEnvironment("qfe-analyze")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	q := e2ethanos.NewQuerierBuilder(e, "1").Init()
+	qfe := e2ethanos.NewQueryFrontend(e, "1", "http://"+q.InternalEndpoint("http"), queryfrontend.Config{}, queryfrontend.CacheProviderConfig{
+		Type: queryfrontend.INMEMORY,
+	})
+	testutil.Ok(t, qfe.Start())
+
+	l := log.NewLogfmtLogger(os.Stdout)
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	t.Cleanup(cancel)
+
+	require.NoError(t, runutil.RetryWithLog(l, 1*time.Second, timeoutCtx.Done(), func() error {
+		resp, err := http.Get(fmt.Sprintf("http://%s/-/ready", qfe.Endpoint("http")))
+		if err != nil {
+			return err
+		}
+		t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+		if resp.StatusCode/100 == 2 {
+			return fmt.Errorf("expected query frontend to be not ready, but it is ready")
+		}
+		return nil
+	}))
+
+	testutil.Ok(t, e2e.StartAndWaitReady(q))
+
+	require.NoError(t, runutil.RetryWithLog(l, 1*time.Second, timeoutCtx.Done(), func() error {
+		resp, err := http.Get(fmt.Sprintf("http://%s/-/ready", qfe.Endpoint("http")))
+		if err != nil {
+			return err
+		}
+		t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+		if resp.StatusCode/100 != 2 {
+			return fmt.Errorf("expected query frontend to be ready (%d), but it is not ready", resp.StatusCode)
+		}
+		return nil
+	}))
+
+}
+
+func sortLabels(timeSeries []labels.Labels) []labels.Labels {
+	for j, ts := range timeSeries {
+		builder := labels.NewBuilder(labels.EmptyLabels())
+		ts.Range(func(l labels.Label) {
+			builder.Set(l.Name, l.Value)
+		})
+
+		timeSeries[j] = builder.Labels()
+	}
+	return timeSeries
 }

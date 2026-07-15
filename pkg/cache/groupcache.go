@@ -134,7 +134,7 @@ func NewGroupcacheWithConfig(logger log.Logger, reg prometheus.Registerer, conf 
 
 	go func() {
 		for {
-			if err := dnsGroupcacheProvider.Resolve(context.Background(), conf.Peers); err != nil {
+			if err := dnsGroupcacheProvider.Resolve(context.Background(), conf.Peers, true); err != nil {
 				level.Error(logger).Log("msg", "failed to resolve addresses for groupcache", "err", err)
 			} else {
 				err := universe.Set(dnsGroupcacheProvider.Addresses()...)
@@ -189,6 +189,26 @@ func NewGroupcacheWithConfig(logger log.Logger, reg prometheus.Registerer, conf 
 					list = append(list, s)
 					return nil
 				}); err != nil {
+					return err
+				}
+
+				encodedList, err := json.Marshal(list)
+				if err != nil {
+					return err
+				}
+
+				return dest.UnmarshalBinary(encodedList, time.Now().Add(iterCfg.TTL))
+			case cachekey.IterRecursiveVerb:
+				_, iterCfg := cfg.FindIterConfig(parsedData.Name)
+				if iterCfg == nil {
+					panic("caching bucket layer must not call on unconfigured paths")
+				}
+
+				var list []string
+				if err := bucket.Iter(ctx, parsedData.Name, func(s string) error {
+					list = append(list, s)
+					return nil
+				}, objstore.WithRecursiveIter()); err != nil {
 					return err
 				}
 

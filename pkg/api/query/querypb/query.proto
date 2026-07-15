@@ -22,25 +22,47 @@ option (gogoproto.goproto_unkeyed_all) = false;
 option (gogoproto.goproto_unrecognized_all) = false;
 option (gogoproto.goproto_sizecache_all) = false;
 
+enum EngineType {
+  default    = 0;
+  prometheus = 1;
+  thanos     = 2;
+}
+
+message QueryStats {
+  int64 samples_total = 1;
+  int64 peak_samples = 2;
+}
+
+message TimeSeriesBatch {
+  repeated prometheus_copy.TimeSeries series = 1;
+}
+
 message QueryRequest {
   string query = 1;
+  queryPlan queryPlan = 14;
 
   int64 time_seconds = 2;
   int64 timeout_seconds = 3;
   int64 max_resolution_seconds = 4;
-    
+
   repeated string replica_labels = 5;
 
   repeated StoreMatchers storeMatchers = 6 [(gogoproto.nullable) = false];
 
   bool enableDedup = 7;
   bool enablePartialResponse = 8;
-  bool enableQueryPushdown = 9;
   bool skipChunks = 10;
 
   ShardInfo shard_info = 11;
 
   int64 lookback_delta_seconds = 12;
+  EngineType engine = 13;
+
+  // response_batch_size controls how many TimeSeries are batched per response message.
+  // If set to 0 or 1, each TimeSeries is sent as a separate response (default behavior).
+  int64 response_batch_size = 15;
+
+  reserved 9;
 }
 
 message StoreMatchers {
@@ -54,11 +76,24 @@ message QueryResponse {
 
     /// timeseries is one series from the result of the executed query.
     prometheus_copy.TimeSeries timeseries = 2;
+
+    // performance stats
+    QueryStats stats = 3;
+
+    /// timeseries_batch is a batch of series from the result of the executed query.
+    TimeSeriesBatch timeseries_batch = 4;
+  }
+}
+
+message queryPlan {
+  oneof encoding {
+    bytes json = 1;
   }
 }
 
 message QueryRangeRequest {
   string query = 1;
+  queryPlan queryPlan = 16;
 
   int64 start_time_seconds = 2;
   int64 end_time_seconds = 3;
@@ -73,11 +108,17 @@ message QueryRangeRequest {
 
   bool enableDedup = 9;
   bool enablePartialResponse = 10;
-  bool enableQueryPushdown = 11;
   bool skipChunks = 12;
 
   ShardInfo shard_info = 13;
   int64 lookback_delta_seconds = 14;
+  EngineType engine = 15;
+
+  // response_batch_size controls how many TimeSeries are batched per response message.
+  // If set to 0 or 1, each TimeSeries is sent as a separate response (default behavior).
+  int64 response_batch_size = 17;
+
+  reserved 11;
 }
 
 message QueryRangeResponse {
@@ -87,6 +128,12 @@ message QueryRangeResponse {
 
     /// timeseries is one series from the result of the executed query.
     prometheus_copy.TimeSeries timeseries = 2;
+
+    // performance stats
+    QueryStats stats = 3;
+
+    /// timeseries_batch is a batch of series from the result of the executed query.
+    TimeSeriesBatch timeseries_batch = 4;
   }
 }
 
