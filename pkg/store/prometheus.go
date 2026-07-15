@@ -470,6 +470,7 @@ func (p *PrometheusStore) startPromRemoteRead(ctx context.Context, q *prompb.Que
 	preq.Header.Set("X-Prometheus-Remote-Read-Version", "0.1.0")
 
 	preq.Header.Set("User-Agent", clientconfig.ThanosUserAgent)
+	p.client.ApplyHeaders(preq)
 	presp, err = p.client.Do(preq.WithContext(ctx))
 	if err != nil {
 		return nil, errors.Wrap(err, "send request")

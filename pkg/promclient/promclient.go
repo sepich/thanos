@@ -71,6 +71,7 @@ type Client struct {
 	HTTPClient
 	userAgent string
 	logger    log.Logger
+	Headers   map[string]string
 }
 
 // NewClient returns a new Prometheus API client.
@@ -105,6 +106,16 @@ func NewWithTracingClient(logger log.Logger, httpClient *http.Client, userAgent 
 	)
 }
 
+// ApplyHeaders adds configured client headers to req.
+func (c *Client) ApplyHeaders(req *http.Request) {
+	if c.Headers == nil {
+		return
+	}
+	for k, v := range c.Headers {
+		req.Header.Set(k, v)
+	}
+}
+
 // req2xx sends a request to the given url.URL. If method is http.MethodPost then
 // the raw query is encoded in the body and the appropriate Content-Type is set.
 func (c *Client) req2xx(ctx context.Context, u *url.URL, method string, headers http.Header) (_ []byte, _ int, err error) {
@@ -120,7 +131,7 @@ func (c *Client) req2xx(ctx context.Context, u *url.URL, method string, headers 
 		return nil, 0, errors.Wrapf(err, "create %s request", method)
 	}
 	if headers != nil {
-		req.Header = headers
+		req.Header = headers.Clone()
 	}
 
 	if c.userAgent != "" {
@@ -129,6 +140,7 @@ func (c *Client) req2xx(ctx context.Context, u *url.URL, method string, headers 
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
+	c.ApplyHeaders(req)
 
 	resp, err := c.Do(req.WithContext(ctx))
 	if err != nil {
@@ -297,6 +309,7 @@ func (c *Client) ConfiguredFlags(ctx context.Context, base *url.URL) (Flags, err
 	if err != nil {
 		return Flags{}, errors.Wrap(err, "create request")
 	}
+	c.ApplyHeaders(req)
 
 	span, ctx := tracing.StartSpan(ctx, "/prom_flags HTTP[client]")
 	defer span.Finish()
@@ -349,6 +362,7 @@ func (c *Client) Snapshot(ctx context.Context, base *url.URL, skipHead bool) (st
 		return "", errors.Wrap(err, "create request")
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	c.ApplyHeaders(req)
 
 	span, ctx := tracing.StartSpan(ctx, "/prom_snapshot HTTP[client]")
 	defer span.Finish()
@@ -706,6 +720,7 @@ func (c *Client) LowestTimestamp(ctx context.Context, base *url.URL) (int64, err
 	if err != nil {
 		return 0, errors.Wrap(err, "create request")
 	}
+	c.ApplyHeaders(req)
 
 	span, ctx := tracing.StartSpan(ctx, "/lowest_timestamp HTTP[client]")
 	defer span.Finish()

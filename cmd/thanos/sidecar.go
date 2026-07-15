@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
@@ -128,6 +129,11 @@ func runSidecar(
 
 		limitMinTime: conf.limitMinTime,
 		client:       promclient.NewWithTracingClient(logger, httpClient, "thanos-sidecar"),
+		mimir:        conf.mimirOrg != "",
+	}
+	if conf.mimirOrg != "" {
+		level.Info(logger).Log("msg", "Mimir org header is set. Sidecar will use Mimir-compatible metadata discovery.", "header", "X-Scope-OrgID")
+		m.client.Headers = map[string]string{"X-Scope-OrgID": conf.mimirOrg}
 	}
 
 	confContentYaml, err := conf.objStore.Content()
@@ -135,7 +141,7 @@ func runSidecar(
 		return errors.Wrap(err, "getting object store config")
 	}
 
-	var uploads = len(confContentYaml) != 0
+	var uploads = len(confContentYaml) != 0 && conf.mimirOrg == ""
 	if !uploads {
 		level.Info(logger).Log("msg", "no supported bucket was configured, uploads will be disabled")
 	}
@@ -252,8 +258,8 @@ func runSidecar(
 				}
 
 				level.Info(logger).Log(
-					"msg", "successfully loaded prometheus external labels",
-					"external_labels", m.Labels().String(),
+					"msg", "successfully loaded external labels",
+					"external_labels", m.LabelsLogValue(),
 				)
 				return nil
 			})
@@ -309,6 +315,9 @@ func runSidecar(
 	// Setup the gRPC server.
 	{
 		c := promclient.NewWithTracingClient(logger, httpClient, clientconfig.ThanosUserAgent)
+		if conf.mimirOrg != "" {
+			c.Headers = map[string]string{"X-Scope-OrgID": conf.mimirOrg}
+		}
 
 		promStore, err := store.NewPrometheusStore(logger, reg, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps, m.Version)
 		if err != nil {
@@ -326,17 +335,24 @@ func runSidecar(
 		infoSrv := info.NewInfoServer(
 			component.Sidecar.String(),
 			info.WithLabelSetFunc(func() []labelpb.ZLabelSet {
+				if conf.mimirOrg != "" {
+					return m.LabelSets()
+				}
 				return promStore.LabelSet()
 			}),
 			info.WithStoreInfoFunc(func() (*infopb.StoreInfo, error) {
 				if httpProbe.IsReady() {
 					mint, maxt := m.Timestamps()
+					tsdbInfos := promStore.TSDBInfos()
+					if conf.mimirOrg != "" {
+						tsdbInfos = m.TSDBInfos(mint, maxt)
+					}
 					return &infopb.StoreInfo{
 						MinTime:                      mint,
 						MaxTime:                      maxt,
 						SupportsSharding:             true,
 						SupportsWithoutReplicaLabels: true,
-						TsdbInfos:                    promStore.TSDBInfos(),
+						TsdbInfos:                    tsdbInfos,
 					}, nil
 				}
 				return nil, errors.New("Not ready")
@@ -496,28 +512,65 @@ type promMetadata struct {
 	mint         int64
 	maxt         int64
 	labels       labels.Labels
+	labelSets    []labelpb.ZLabelSet
 	promVersion  string
 	limitMinTime thanosmodel.TimeOrDurationValue
 
 	client *promclient.Client
+	mimir  bool
 }
 
 func (s *promMetadata) UpdateLabels(ctx context.Context) error {
+	if s.mimir {
+		values, err := s.client.LabelValuesInGRPC(
+			ctx,
+			s.promURL,
+			"prometheus",
+			[]*labels.Matcher{{Name: "__name__", Type: labels.MatchEqual, Value: "prometheus_build_info"}},
+			s.limitMinTime.PrometheusTimestamp(),
+			timestamp.FromTime(time.Now()),
+			0,
+		)
+		if err != nil {
+			return err
+		}
+
+		labelSets := make([]labelpb.ZLabelSet, 0, len(values))
+		for _, value := range values {
+			labelSets = append(labelSets, labelpb.ZLabelSet{
+				Labels: labelpb.ZLabelsFromPromLabels(labels.FromStrings("prometheus", value)),
+			})
+		}
+
+		s.mtx.Lock()
+		defer s.mtx.Unlock()
+
+		s.labels = labels.FromStrings("replica", "mimir")
+		s.labelSets = labelSets
+		return nil
+	}
+
 	elset, err := s.client.ExternalLabels(ctx, s.promURL)
 	if err != nil {
 		return err
 	}
-
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
 	s.labels = elset
+	s.labelSets = nil
 	return nil
 }
 
 func (s *promMetadata) UpdateTimestamps(ctx context.Context) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+
+	if s.mimir {
+		s.mint = s.limitMinTime.PrometheusTimestamp()
+		s.maxt = math.MaxInt64
+		return nil
+	}
 
 	mint, err := s.client.LowestTimestamp(ctx, s.promURL)
 	if err != nil {
@@ -537,6 +590,39 @@ func (s *promMetadata) Labels() labels.Labels {
 	return s.labels
 }
 
+func (s *promMetadata) LabelSets() []labelpb.ZLabelSet {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	labelSets := make([]labelpb.ZLabelSet, len(s.labelSets))
+	copy(labelSets, s.labelSets)
+	return labelSets
+}
+
+func (s *promMetadata) LabelsLogValue() string {
+	if s.mimir {
+		return fmt.Sprintf("%v", s.LabelSets())
+	}
+	return s.Labels().String()
+}
+
+func (s *promMetadata) TSDBInfos(mint, maxt int64) []infopb.TSDBInfo {
+	labelSets := s.LabelSets()
+	if len(labelSets) == 0 {
+		return []infopb.TSDBInfo{}
+	}
+
+	infos := make([]infopb.TSDBInfo, 0, len(labelSets))
+	for _, labelSet := range labelSets {
+		infos = append(infos, infopb.TSDBInfo{
+			Labels:  labelSet,
+			MinTime: mint,
+			MaxTime: maxt,
+		})
+	}
+	return infos
+}
+
 func (s *promMetadata) Timestamps() (mint, maxt int64) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -545,6 +631,14 @@ func (s *promMetadata) Timestamps() (mint, maxt int64) {
 }
 
 func (s *promMetadata) BuildVersion(ctx context.Context) error {
+	if s.mimir {
+		s.mtx.Lock()
+		defer s.mtx.Unlock()
+
+		s.promVersion = "2.43.0"
+		return nil
+	}
+
 	ver, err := s.client.BuildVersion(ctx, s.promURL)
 	if err != nil {
 		return err
@@ -575,6 +669,7 @@ type sidecarConfig struct {
 	shipper         shipperConfig
 	limitMinTime    thanosmodel.TimeOrDurationValue
 	storeRateLimits store.SeriesSelectLimits
+	mimirOrg        string
 }
 
 func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
@@ -589,4 +684,6 @@ func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.storeRateLimits.RegisterFlags(cmd)
 	cmd.Flag("min-time", "Start of time range limit to serve. Thanos sidecar will serve only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("0000-01-01T00:00:00Z").SetValue(&sc.limitMinTime)
+	cmd.Flag("mimir-org", "Header X-Scope-OrgID value to pass to Mimir. When set, sidecar uses Mimir-compatible metadata discovery and disables block uploads.").
+		Default("").StringVar(&sc.mimirOrg)
 }
