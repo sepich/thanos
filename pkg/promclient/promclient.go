@@ -71,6 +71,7 @@ type Client struct {
 	HTTPClient
 	userAgent string
 	logger    log.Logger
+	Headers   map[string]string
 }
 
 // NewClient returns a new Prometheus API client.
@@ -128,6 +129,11 @@ func (c *Client) req2xx(ctx context.Context, u *url.URL, method string, headers 
 	}
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if c.Headers != nil {
+		for k, v := range c.Headers {
+			req.Header.Set(k, v)
+		}
 	}
 
 	resp, err := c.Do(req.WithContext(ctx))
