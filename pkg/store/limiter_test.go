@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"testing"
 	"time"
 
@@ -169,6 +170,147 @@ func TestRateLimitedServer(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLimitedServerBuffered(t *testing.T) {
+	t.Parallel()
+
+	numSamples := 60
+	tests := []struct {
+		name   string
+		limits SeriesSelectLimits
+		err    string
+	}{
+		{
+			name:   "series at limit",
+			limits: SeriesSelectLimits{SeriesPerRequest: 3, SamplesPerRequest: uint64(3 * MaxSamplesPerChunk)},
+		},
+		{
+			name:   "series over limit",
+			limits: SeriesSelectLimits{SeriesPerRequest: 2},
+			err:    "failed to send series: limit 2 violated (got 3)",
+		},
+		{
+			name:   "chunks over limit",
+			limits: SeriesSelectLimits{SamplesPerRequest: uint64(2 * MaxSamplesPerChunk)},
+			err:    "failed to send samples: limit 240 violated (got 360)",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
+
+			stub := &bufferingStoreServer{responses: []*storepb.SeriesResponse{
+				storeSeriesResponse(t, labels.FromStrings("series", "3"), makeSamples(numSamples)),
+				storeSeriesResponse(t, labels.FromStrings("series", "1"), makeSamples(numSamples)),
+				storeSeriesResponse(t, labels.FromStrings("series", "2"), makeSamples(numSamples)),
+			}}
+			store := NewLimitedStoreServer(NewInstrumentedStoreServer(prometheus.NewRegistry(), stub), prometheus.NewRegistry(), test.limits)
+			received, err := receiveSeries(ctx, t, store)
+			if test.err == "" {
+				testutil.Ok(t, err)
+				testutil.Equals(t, 3, received)
+				return
+			}
+			testutil.NotOk(t, err)
+			testutil.Equals(t, test.err, err.Error())
+			testutil.Equals(t, 0, received)
+			testutil.Equals(t, 2, stub.buffered)
+		})
+	}
+}
+
+func TestMemoryBudget(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		budget *memoryBudget
+		err    bool
+	}{
+		{name: "disabled", budget: nil},
+		{name: "below budget", budget: &memoryBudget{limit: math.MaxUint64}},
+		{name: "over budget", budget: &memoryBudget{limit: 1}, err: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testutil.Equals(t, test.err, test.budget.check() != nil)
+			testutil.Equals(t, test.err, test.budget.check() != nil)
+		})
+	}
+}
+
+func TestLimitedServerMemoryRatio(t *testing.T) {
+	defer func(f func() (uint64, error)) { memoryLimit = f }(memoryLimit)
+
+	tests := []struct {
+		name  string
+		limit uint64
+		err   string
+	}{
+		{name: "below budget", limit: math.MaxUint32 * 1024},
+		{name: "over budget", limit: 1, err: "failed to send series: memory budget of 0 bytes exceeded"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
+
+			memoryLimit = func() (uint64, error) { return test.limit, nil }
+			reg := prometheus.NewRegistry()
+			stub := newStoreServerStub([]*storepb.SeriesResponse{storeSeriesResponse(t, labels.FromStrings("series", "1"), makeSamples(60))})
+			store := NewLimitedStoreServer(stub, reg, SeriesSelectLimits{MemoryRatio: 0.5})
+			_, err := receiveSeries(ctx, t, store)
+			if test.err == "" {
+				testutil.Ok(t, err)
+				return
+			}
+			testutil.NotOk(t, err)
+			testutil.Equals(t, test.err, err.Error())
+			testutil.Equals(t, float64(1), prom_testutil.ToFloat64(store.(*limitedStoreServer).failedRequestsCounter.WithLabelValues("memory")))
+		})
+	}
+}
+
+func receiveSeries(ctx context.Context, t *testing.T, store storepb.StoreServer) (int, error) {
+	client := storepb.ServerAsClient(store, atomic.Bool{})
+	seriesClient, err := client.Series(ctx, &storepb.SeriesRequest{})
+	testutil.Ok(t, err)
+	received := 0
+	for {
+		resp, err := seriesClient.Recv()
+		if err == io.EOF {
+			return received, nil
+		}
+		if err != nil {
+			return received, err
+		}
+		if resp.GetSeries() != nil {
+			received++
+		}
+		if batch := resp.GetBatch(); batch != nil {
+			received += len(batch.Series)
+		}
+	}
+}
+
+// bufferingStoreServer buffers and resorts series before sending, like PrometheusStore.
+type bufferingStoreServer struct {
+	storepb.StoreServer
+	responses []*storepb.SeriesResponse
+	buffered  int
+}
+
+func (m *bufferingStoreServer) Series(_ *storepb.SeriesRequest, server storepb.Store_SeriesServer) error {
+	srv := newFlushableServer(newBatchableServer(server, DefaultResponseBatchSize), sortingStrategyStore)
+	for _, r := range m.responses {
+		if err := srv.Send(r); err != nil {
+			return err
+		}
+		m.buffered++
+	}
+	return srv.Flush()
 }
 
 func makeSamples(numSamples int) []sample {

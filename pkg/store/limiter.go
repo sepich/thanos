@@ -4,8 +4,12 @@
 package store
 
 import (
+	"runtime"
+	"runtime/metrics"
 	"sync"
+	"time"
 
+	"github.com/KimMachineGun/automemlimit/memlimit"
 	"github.com/alecthomas/units"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -108,11 +112,17 @@ func NewBytesLimiterFactory(limit units.Base2Bytes) BytesLimiterFactory {
 type SeriesSelectLimits struct {
 	SeriesPerRequest  uint64
 	SamplesPerRequest uint64
+	MemoryRatio       float64
 }
 
 func (l *SeriesSelectLimits) RegisterFlags(cmd extkingpin.FlagClause) {
 	cmd.Flag("store.limits.request-series", "The maximum series allowed for a single Series request. The Series call fails if this limit is exceeded. 0 means no limit.").Default("0").Uint64Var(&l.SeriesPerRequest)
 	cmd.Flag("store.limits.request-samples", "The maximum samples allowed for a single Series request, The Series call fails if this limit is exceeded. 0 means no limit. NOTE: For efficiency the limit is internally implemented as 'chunks limit' considering each chunk contains a maximum of 120 samples.").Default("0").Uint64Var(&l.SamplesPerRequest)
+}
+
+// RegisterMemoryFlag registers the memory limit, applied by NewLimitedStoreServer.
+func (l *SeriesSelectLimits) RegisterMemoryFlag(cmd extkingpin.FlagClause) {
+	cmd.Flag("store.limits.memory-ratio", "Series calls fail once memory used by the process exceeds this ratio of the detected container (cgroup) or system memory. 0 means no limit.").Default("0").FloatVar(&l.MemoryRatio)
 }
 
 var _ storepb.StoreServer = &limitedStoreServer{}
@@ -122,12 +132,16 @@ type limitedStoreServer struct {
 	storepb.StoreServer
 	newSeriesLimiter      SeriesLimiterFactory
 	newSamplesLimiter     ChunksLimiterFactory
+	memoryBudget          *memoryBudget
 	failedRequestsCounter *prometheus.CounterVec
 }
 
+// memoryLimit detects the memory available to the process.
+var memoryLimit = memlimit.ApplyFallback(memlimit.FromCgroup, memlimit.FromSystem)
+
 // NewLimitedStoreServer creates a new limitedStoreServer.
 func NewLimitedStoreServer(store storepb.StoreServer, reg prometheus.Registerer, selectLimits SeriesSelectLimits) storepb.StoreServer {
-	return &limitedStoreServer{
+	s := &limitedStoreServer{
 		StoreServer:       store,
 		newSeriesLimiter:  NewSeriesLimiterFactory(selectLimits.SeriesPerRequest),
 		newSamplesLimiter: NewChunksLimiterFactory(selectLimits.SamplesPerRequest),
@@ -136,12 +150,25 @@ func NewLimitedStoreServer(store storepb.StoreServer, reg prometheus.Registerer,
 			Help: "Number of select queries that were dropped due to configured limits.",
 		}, []string{"reason"}),
 	}
+	budget := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+		Name: "thanos_store_limits_memory_budget_bytes",
+		Help: "Memory used by the process after which Series calls are rejected, 0 if disabled.",
+	})
+	if selectLimits.MemoryRatio > 0 {
+		if limit, err := memoryLimit(); err == nil {
+			s.memoryBudget = &memoryBudget{limit: uint64(float64(limit) * selectLimits.MemoryRatio)}
+			budget.Set(float64(s.memoryBudget.limit))
+		}
+	}
+	return s
 }
 
 func (s *limitedStoreServer) Series(req *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
 	seriesLimiter := s.newSeriesLimiter(s.failedRequestsCounter.WithLabelValues("series"))
 	chunksLimiter := s.newSamplesLimiter(s.failedRequestsCounter.WithLabelValues("chunks"))
 	limitedSrv := newLimitedServer(srv, seriesLimiter, chunksLimiter)
+	limitedSrv.memoryBudget = s.memoryBudget
+	limitedSrv.memoryFailures = s.failedRequestsCounter.WithLabelValues("memory")
 	if err := s.StoreServer.Series(req, limitedSrv); err != nil {
 		return err
 	}
@@ -156,6 +183,10 @@ type limitedServer struct {
 	storepb.Store_SeriesServer
 	seriesLimiter  SeriesLimiter
 	samplesLimiter ChunksLimiter
+	memoryBudget   *memoryBudget
+	memoryFailures prometheus.Counter
+	// reserved is set once series were reserved while buffered, so they are not counted again on Send.
+	reserved bool
 }
 
 func newLimitedServer(upstream storepb.Store_SeriesServer, seriesLimiter SeriesLimiter, chunksLimiter ChunksLimiter) *limitedServer {
@@ -167,6 +198,10 @@ func newLimitedServer(upstream storepb.Store_SeriesServer, seriesLimiter SeriesL
 }
 
 func (i *limitedServer) Send(response *storepb.SeriesResponse) error {
+	if i.reserved {
+		return i.Store_SeriesServer.Send(response)
+	}
+
 	var seriesCount, chunksCount uint64
 	if series := response.GetSeries(); series != nil {
 		seriesCount = 1
@@ -183,12 +218,87 @@ func (i *limitedServer) Send(response *storepb.SeriesResponse) error {
 		return i.Store_SeriesServer.Send(response)
 	}
 
+	if err := i.reserve(seriesCount, chunksCount); err != nil {
+		return err
+	}
+	return i.Store_SeriesServer.Send(response)
+}
+
+func (i *limitedServer) reserveBuffered(series *storepb.Series) error {
+	i.reserved = true
+	return i.reserve(1, uint64(len(series.Chunks)))
+}
+
+func (i *limitedServer) reserve(seriesCount, chunksCount uint64) error {
+	if err := i.memoryBudget.check(); err != nil {
+		i.memoryFailures.Inc()
+		return errors.Wrapf(err, "failed to send series")
+	}
 	if err := i.seriesLimiter.Reserve(seriesCount); err != nil {
 		return errors.Wrapf(err, "failed to send series")
 	}
 	if err := i.samplesLimiter.Reserve(chunksCount * MaxSamplesPerChunk); err != nil {
 		return errors.Wrapf(err, "failed to send samples")
 	}
+	return nil
+}
 
-	return i.Store_SeriesServer.Send(response)
+// bufferedSeriesReserver is implemented by servers enforcing limits and by wrappers forwarding to them.
+// Servers buffering series before sending (see resortingServer) use it to enforce limits
+// before series are held in memory, instead of only when they are sent upstream.
+type bufferedSeriesReserver interface {
+	reserveBuffered(series *storepb.Series) error
+}
+
+func reserveBuffered(upstream storepb.Store_SeriesServer, series *storepb.Series) error {
+	if r, ok := upstream.(bufferedSeriesReserver); ok {
+		return r.reserveBuffered(series)
+	}
+	return nil
+}
+
+const (
+	// memoryCheckInterval limits how often memory usage is read, keeping reservations cheap.
+	memoryCheckInterval = 10 * time.Millisecond
+	// memoryGCInterval limits how often garbage is collected to tell it apart from live memory.
+	memoryGCInterval = time.Second
+)
+
+// memoryBudget rejects reservations once memory used by the process exceeds the limit.
+type memoryBudget struct {
+	limit     uint64
+	lastCheck atomic.Int64
+	lastGC    atomic.Int64
+	exceeded  atomic.Bool
+}
+
+func (b *memoryBudget) check() error {
+	if b == nil {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	if last := b.lastCheck.Load(); now-last >= int64(memoryCheckInterval) && b.lastCheck.CompareAndSwap(last, now) {
+		exceeded := memoryInUse() > b.limit
+		if exceeded && now-b.lastGC.Load() >= int64(memoryGCInterval) {
+			b.lastGC.Store(now)
+			runtime.GC()
+			exceeded = memoryInUse() > b.limit
+		}
+		b.exceeded.Store(exceeded)
+	}
+	if b.exceeded.Load() {
+		return errors.Errorf("memory budget of %d bytes exceeded", b.limit)
+	}
+	return nil
+}
+
+// memoryInUse returns memory mapped by the Go runtime, excluding free heap retained or released to the OS.
+func memoryInUse() uint64 {
+	s := []metrics.Sample{
+		{Name: "/memory/classes/total:bytes"},
+		{Name: "/memory/classes/heap/free:bytes"},
+		{Name: "/memory/classes/heap/released:bytes"},
+	}
+	metrics.Read(s)
+	return s[0].Value.Uint64() - s[1].Value.Uint64() - s[2].Value.Uint64()
 }

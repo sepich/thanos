@@ -50,6 +50,10 @@ type passthroughServer struct {
 	storepb.Store_SeriesServer
 }
 
+func (p *passthroughServer) reserveBuffered(series *storepb.Series) error {
+	return reserveBuffered(p.Store_SeriesServer, series)
+}
+
 func (p *passthroughServer) Flush() error {
 	// If the underlying server is also flushable, flush it
 	if f, ok := p.Store_SeriesServer.(flushableServer); ok {
@@ -76,6 +80,9 @@ func (r *resortingServer) Send(response *storepb.SeriesResponse) error {
 	}
 
 	series := response.GetSeries()
+	if err := reserveBuffered(r.Store_SeriesServer, series); err != nil {
+		return err
+	}
 	r.series = append(r.series, series)
 	return nil
 }

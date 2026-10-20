@@ -216,3 +216,7 @@ func (i *instrumentedServer) Send(response *storepb.SeriesResponse) error {
 	}
 	return nil
 }
+
+func (i *instrumentedServer) reserveBuffered(series *storepb.Series) error {
+	return reserveBuffered(i.Store_SeriesServer, series)
+}

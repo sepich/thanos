@@ -32,6 +32,10 @@ type batchableServer struct {
 	series    []*storepb.Series
 }
 
+func (b *batchableServer) reserveBuffered(series *storepb.Series) error {
+	return reserveBuffered(b.Store_SeriesServer, series)
+}
+
 func (b *batchableServer) Flush() error {
 	if len(b.series) != 0 {
 		if err := b.Store_SeriesServer.Send(storepb.NewBatchResponse(b.series)); err != nil {

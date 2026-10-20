@@ -682,6 +682,11 @@ Flags:
                                  NOTE: For efficiency the limit is internally
                                  implemented as 'chunks limit' considering each
                                  chunk contains a maximum of 120 samples.
+      --store.limits.memory-ratio=0
+                                 Series calls fail once memory used by the
+                                 process exceeds this ratio of the detected
+                                 container (cgroup) or system memory. 0 means no
+                                 limit.
 
 ```
 

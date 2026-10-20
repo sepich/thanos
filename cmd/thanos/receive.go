@@ -980,6 +980,7 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 	rc.httpBindAddr, rc.httpGracePeriod, rc.httpTLSConfig = extkingpin.RegisterHTTPFlags(cmd)
 	rc.grpcConfig.registerFlag(cmd)
 	rc.storeRateLimits.RegisterFlags(cmd)
+	rc.storeRateLimits.RegisterMemoryFlag(cmd)
 
 	cmd.Flag("remote-write.address", "Address to listen on for remote write requests.").
 		Default("0.0.0.0:19291").StringVar(&rc.rwAddress)

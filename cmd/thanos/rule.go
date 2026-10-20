@@ -133,6 +133,7 @@ func (rc *ruleConfig) registerFlag(cmd extkingpin.FlagClause) {
 	rc.query.registerFlag(cmd)
 	rc.alertmgr.registerFlag(cmd)
 	rc.storeRateLimits.RegisterFlags(cmd)
+	rc.storeRateLimits.RegisterMemoryFlag(cmd)
 }
 
 // registerRule registers a rule command.
